@@ -1,4 +1,4 @@
--- Fusion Reactor Controller (Mit automatischer UI-Skalierung für große Monitore)
+-- Fusion Reactor Controller (Mit Anti-Ping-Pong & Low-Signal-Schutz)
 local reactor = nil
 local monitor = nil
 
@@ -54,7 +54,6 @@ if not reactor then
 end
 
 if monitor then
-    -- Schriftgröße kleiner stellen, damit EXTREM viel auf den Monitor passt
     monitor.setTextScale(0.5) 
     monitor.clear()
 end
@@ -104,12 +103,11 @@ local function sendPulse(side, strength)
     end)
 end
 
--- Helper zum Ausgeben in Konsole UND Monitor (falls vorhanden)
 local function logPrint(msg)
     print(msg)
 end
 
--- 5. Intelligenter Regelkreis mit Anti-Ping-Pong-Schutz
+-- 5. Intelligenter Regelkreis
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, startEff, errorLevel = getReactorData()
@@ -145,4 +143,147 @@ local function runControlLoop()
         return
     end
 
-    if currentSignal >= 15 and controlDirection == 1
+    -- KORRIGIERTER ANSCHLAG-SCHUTZ MIT 'THEN'
+    if currentSignal >= 15 and controlDirection == 1 then
+        controlDirection = -1
+        stepSize = 1
+    elseif currentSignal <= 1 and controlDirection == -1 then
+        controlDirection = 1
+        stepSize = 1
+    end
+
+    local oldSignal = currentSignal
+    currentSignal = currentSignal + (controlDirection * stepSize)
+    if currentSignal > 15 then 
+        currentSignal = 15 
+        controlDirection = -1 
+    elseif currentSignal < 1 then 
+        currentSignal = 1 
+        controlDirection = 1 
+    end
+
+    local sideName = (controlDirection == 1) and "Links (+)" or "Rechts (-)"
+    sendPulse(controlDirection == 1 and "left" or "right", stepSize)
+
+    stuckReason = "Cooldown: Ticks sammeln..."
+
+    local efficiencyReadings = { startEff }
+    for i = 1, 5 do
+        sleep(1.0)
+        local _, _, currentEff = getReactorData()
+        table.insert(efficiencyReadings, currentEff)
+    end
+
+    local endEff = efficiencyReadings[#efficiencyReadings]
+    local trendDiff = endEff - startEff
+    local actionType = ""
+
+    if trendDiff < -0.5 then
+        controlDirection = -controlDirection
+        stepSize = 1
+        recoveryCounter = 4 
+        actionType = string.format("STURZ (%.2f) -> Sperre (1)", trendDiff)
+    else
+        if recoveryCounter > 0 then
+            recoveryCounter = recoveryCounter - 1
+            stepSize = 1 
+            actionType = string.format("Erholung (%d) -> Schritt 1", recoveryCounter)
+        else
+            if currentSignal <= 4 then
+                stepSize = 1
+                actionType = string.format("Low-Signal Safe (%.2f)", trendDiff)
+            else
+                actionType = string.format("Stabil (%.2f) -> Formel", trendDiff)
+                local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
+                stepSize = math.floor(effDistance * 0.3) + 1
+                if stepSize > 15 then stepSize = 15 end
+                if stepSize < 1 then stepSize = 1 end
+            end
+        end
+    end
+
+    logPrint(string.format("--- [LOG Zyklus #%d] ---", logCounter))
+    logPrint(string.format("  Start EF: %.2f%% | End EF: %.2f%% | Diff: %.2f%%", startEff, endEff, trendDiff))
+    logPrint(string.format("  Aktion: %s", actionType))
+    logPrint(string.format("  Impuls-Seite: %s | Schrittweite: %d", sideName, stepSize))
+    logPrint(string.format("  Signal: %d -> Neu: %d", oldSignal, currentSignal))
+    logPrint("------------------------")
+
+    stuckReason = string.format("Diff:%.1f | %s", trendDiff, actionType)
+end
+
+-- 6. Grafik auf Monitor zeichnen
+local function drawUI()
+    if not monitor then return end
+
+    local logicMode, caseTemp, efficiency, errorLevel = getReactorData()
+    updateStats(efficiency, errorLevel, caseTemp)
+
+    local statusText = "STANDBY"
+    if efficiency > 0 then
+        statusText = "RUN"
+    elseif efficiency == 0 then
+        statusText = "CRUSH"
+    else
+        statusText = "STANDBY"
+    end
+
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write(" === FUSION REACTOR CONTROL === ")
+    monitor.setBackgroundColor(colors.black)
+
+    monitor.setCursorPos(1, 3)
+    monitor.clearLine()
+    monitor.write("Modus: ")
+    if statusText == "RUN" then
+        monitor.setTextColor(colors.green)
+    elseif statusText == "CRUSH" then
+        monitor.setTextColor(colors.red)
+    else
+        monitor.setTextColor(colors.orange)
+    end
+    monitor.write(statusText .. "    ")
+    monitor.setTextColor(colors.white)
+
+    monitor.setCursorPos(1, 5)
+    monitor.clearLine()
+    monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
+
+    monitor.setCursorPos(1, 7)
+    monitor.clearLine()
+    monitor.setTextColor(colors.yellow)
+    monitor.write(string.format("EF (Eff):  %.2f%% (Min:%.2f Max:%.2f)", efficiency, stats.minEff == math.huge and 0 or stats.minEff, stats.maxEff))
+    monitor.setTextColor(colors.white)
+
+    monitor.setCursorPos(1, 8)
+    monitor.clearLine()
+    if errorLevel > 50 then monitor.setTextColor(colors.red) end
+    monitor.write(string.format("ER (Err):  %.2f%% (Min:%.2f Max:%.2f)", errorLevel, stats.minErr == math.huge and 0 or stats.minErr, stats.maxErr))
+    monitor.setTextColor(colors.white)
+
+    monitor.setCursorPos(1, 10)
+    monitor.clearLine()
+    monitor.write("Fuel Type: D-T Fuel")
+
+    monitor.setCursorPos(1, 11)
+    monitor.clearLine()
+    local signText = (controlDirection == 1) and "+" or "-"
+    local sideText = (controlDirection == 1) and "Links" or "Rechts"
+    monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
+
+    monitor.setCursorPos(1, 13)
+    monitor.clearLine()
+    monitor.setTextColor(colors.cyan)
+    monitor.write("Diag: " .. string.sub(stuckReason, 1, 30))
+
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.lightGray)
+end
+
+-- 7. Hauptschleife
+while true do
+    runControlLoop()
+    drawUI()
+end
