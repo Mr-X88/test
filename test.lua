@@ -1,4 +1,4 @@
--- Fusion Reactor Controller (Fester Fix für die Trend-Auswertung bei Sturz)
+-- Fusion Reactor Controller (Mit Anschlag-Schutz für Signal 1 und 15)
 local reactor = nil
 local monitor = nil
 
@@ -9,7 +9,7 @@ local TARGET_EFFICIENCY = 70   -- Dein gewünschter Ziel-EF-Wert
 local currentSignal = 8        -- Startwert in der Mitte (1-15)
 local controlDirection = 1     -- 1 = Links (+ / Erhöhen), -1 = Rechts (- / Senken)
 local stepSize = 2             -- Startet im sicheren Suchmodus
-local maxEfficiencySeen = 0    
+local recoveryCounter = 0      -- Zählt Zyklen nach einem Sturz ab
 
 -- Diagnose- & Log-Variablen
 local stuckReason = "Warte auf Reaktor..."
@@ -103,7 +103,7 @@ local function sendPulse(side, strength)
     end)
 end
 
--- 5. Zuverlässiger Regelkreis mit strikter Trend-Prüfung
+-- 5. Intelligenter Regelkreis mit Anschlag-Schutz
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, startEff, errorLevel = getReactorData()
@@ -117,14 +117,10 @@ local function runControlLoop()
         return
     end
 
-    if startEff > maxEfficiencySeen then
-        maxEfficiencySeen = startEff
-    end
-
     local statusText = "STANDBY"
     if startEff > 0 then
         statusText = "RUN"
-    elseif maxEfficiencySeen > 0 and startEff == 0 then
+    elseif startEff == 0 then
         statusText = "CRUSH"
     else
         statusText = "STANDBY"
@@ -139,8 +135,20 @@ local function runControlLoop()
         currentSignal = 8
         controlDirection = 1
         stepSize = 2
+        recoveryCounter = 0
         stuckReason = "Reaktor in " .. statusText
         return
+    end
+
+    -- WICHTIG: ANSCHLAG-SCHUTZ VOR DEM IMPULS
+    -- Wenn das Signal bereits am Maximum (15) ist und wir nach links (+) wollen -> Sofort umdrehen!
+    if currentSignal >= 15 and controlDirection == 1 then
+        controlDirection = -1
+        stepSize = 2
+    -- Wenn das Signal bereits am Minimum (1) ist und wir nach rechts (-) wollen -> Sofort umdrehen!
+    elseif currentSignal <= 1 and controlDirection == -1 then
+        controlDirection = 1
+        stepSize = 2
     end
 
     -- Schritt 1: Signalwert mathematisch aktualisieren und begrenzen
@@ -170,22 +178,29 @@ local function runControlLoop()
 
     local endEff = efficiencyReadings[#efficiencyReadings]
     
-    -- Schritt 4: STRIKTER TREND-VERGLEICH
+    -- Schritt 4: STRIKTER TREND-VERGLEICH & STURZ-SCHUTZ
     local trendDiff = endEff - startEff
     local actionType = ""
 
     if trendDiff < -0.2 then
-        -- WERT IST GESUNKEN -> Zwingend Richtung umkehren und Suchschritt erzwingen!
+        -- WERT IST GESUNKEN -> Sturz erkannt! Richtung umkehren und Erholungssperre aktivieren
         controlDirection = -controlDirection
         stepSize = 2
-        actionType = string.format("STURZ (%.2f) -> Gedreht (±2)", trendDiff)
+        recoveryCounter = 3 -- Zwingt das Skript für die nächsten 3 Zyklen zu kleinen Schritten
+        actionType = string.format("STURZ (%.2f) -> Sperre aktiv (±2)", trendDiff)
     else
-        -- WERT IST GESTIEGEN ODER STABIL -> Formel-Schritt anwenden
-        actionType = string.format("Stabil/Steigt (%.2f) -> Formel", trendDiff)
-        local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
-        stepSize = math.floor(effDistance * 0.4) + 2
-        if stepSize > 15 then stepSize = 15 end
-        if stepSize < 2 then stepSize = 2 end
+        -- WERT IST STABIL ODER GESTIEGEN
+        if recoveryCounter > 0 then
+            recoveryCounter = recoveryCounter - 1
+            stepSize = 3
+            actionType = string.format("Erholung läuft (%d) -> Schritt 3", recoveryCounter)
+        else
+            actionType = string.format("Stabil/Steigt (%.2f) -> Formel", trendDiff)
+            local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
+            stepSize = math.floor(effDistance * 0.4) + 2
+            if stepSize > 15 then stepSize = 15 end
+            if stepSize < 2 then stepSize = 2 end
+        end
     end
 
     -- Terminal-Log für die Fehlerverfolgung
@@ -209,7 +224,7 @@ local function drawUI()
     local statusText = "STANDBY"
     if efficiency > 0 then
         statusText = "RUN"
-    elseif maxEfficiencySeen > 0 and efficiency == 0 then
+    elseif efficiency == 0 then
         statusText = "CRUSH"
     else
         statusText = "STANDBY"
