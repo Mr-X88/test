@@ -1,4 +1,4 @@
--- Fusion Reactor Controller (Mit Anschlag-Schutz für Signal 1 und 15)
+-- Fusion Reactor Controller (Mit automatischer UI-Skalierung für große Monitore)
 local reactor = nil
 local monitor = nil
 
@@ -6,10 +6,10 @@ local monitor = nil
 local TARGET_EFFICIENCY = 70   -- Dein gewünschter Ziel-EF-Wert
 
 -- Regelungs-Variablen
-local currentSignal = 8        -- Startwert in der Mitte (1-15)
-local controlDirection = 1     -- 1 = Links (+ / Erhöhen), -1 = Rechts (- / Senken)
-local stepSize = 2             -- Startet im sicheren Suchmodus
-local recoveryCounter = 0      -- Zählt Zyklen nach einem Sturz ab
+local currentSignal = 8        
+local controlDirection = 1     
+local stepSize = 1             
+local recoveryCounter = 0      
 
 -- Diagnose- & Log-Variablen
 local stuckReason = "Warte auf Reaktor..."
@@ -54,7 +54,8 @@ if not reactor then
 end
 
 if monitor then
-    monitor.setTextScale(0.5)
+    -- Schriftgröße kleiner stellen, damit EXTREM viel auf den Monitor passt
+    monitor.setTextScale(0.5) 
     monitor.clear()
 end
 
@@ -97,13 +98,18 @@ local function sendPulse(side, strength)
     pcall(function()
         redstone.setAnalogOutput(side, strength)
     end)
-    sleep(0.15) -- Kurzer Impuls
+    sleep(0.15)
     pcall(function()
         redstone.setAnalogOutput(side, 0)
     end)
 end
 
--- 5. Intelligenter Regelkreis mit Anschlag-Schutz
+-- Helper zum Ausgeben in Konsole UND Monitor (falls vorhanden)
+local function logPrint(msg)
+    print(msg)
+end
+
+-- 5. Intelligenter Regelkreis mit Anti-Ping-Pong-Schutz
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, startEff, errorLevel = getReactorData()
@@ -113,7 +119,7 @@ local function runControlLoop()
         redstone.setAnalogOutput("left", 0)
         redstone.setAnalogOutput("right", 0)
         stuckReason = "NOTSTOPP: Fehlerlevel >= 100"
-        print(string.format("[LOG #%d] NOTSTOPP ausgelöst!", logCounter))
+        logPrint(string.format("[LOG #%d] NOTSTOPP ausgelöst!", logCounter))
         return
     end
 
@@ -126,7 +132,6 @@ local function runControlLoop()
         statusText = "STANDBY"
     end
 
-    -- Wenn Standby oder Crush: Keine Signale senden & Reset
     if statusText == "STANDBY" or statusText == "CRUSH" then
         pcall(function()
             redstone.setAnalogOutput("left", 0)
@@ -134,165 +139,10 @@ local function runControlLoop()
         end)
         currentSignal = 8
         controlDirection = 1
-        stepSize = 2
+        stepSize = 1
         recoveryCounter = 0
         stuckReason = "Reaktor in " .. statusText
         return
     end
 
-    -- WICHTIG: ANSCHLAG-SCHUTZ VOR DEM IMPULS
-    -- Wenn das Signal bereits am Maximum (15) ist und wir nach links (+) wollen -> Sofort umdrehen!
-    if currentSignal >= 15 and controlDirection == 1 then
-        controlDirection = -1
-        stepSize = 2
-    -- Wenn das Signal bereits am Minimum (1) ist und wir nach rechts (-) wollen -> Sofort umdrehen!
-    elseif currentSignal <= 1 and controlDirection == -1 then
-        controlDirection = 1
-        stepSize = 2
-    end
-
-    -- Schritt 1: Signalwert mathematisch aktualisieren und begrenzen
-    local oldSignal = currentSignal
-    currentSignal = currentSignal + (controlDirection * stepSize)
-    if currentSignal > 15 then 
-        currentSignal = 15 
-        controlDirection = -1 
-    elseif currentSignal < 1 then 
-        currentSignal = 1 
-        controlDirection = 1 
-    end
-
-    -- Schritt 2: Impuls an die entsprechende Seite senden
-    local sideName = (controlDirection == 1) and "Links (+)" or "Rechts (-)"
-    sendPulse(controlDirection == 1 and "left" or "right", stepSize)
-
-    stuckReason = "Cooldown: Ticks sammeln..."
-
-    -- Schritt 3: 5 Sekunden Cooldown mit sekündlicher Live-Messung abwarten
-    local efficiencyReadings = { startEff }
-    for i = 1, 5 do
-        sleep(1.0)
-        local _, _, currentEff = getReactorData()
-        table.insert(efficiencyReadings, currentEff)
-    end
-
-    local endEff = efficiencyReadings[#efficiencyReadings]
-    
-    -- Schritt 4: STRIKTER TREND-VERGLEICH & STURZ-SCHUTZ
-    local trendDiff = endEff - startEff
-    local actionType = ""
-
-    if trendDiff < -0.2 then
-        -- WERT IST GESUNKEN -> Sturz erkannt! Richtung umkehren und Erholungssperre aktivieren
-        controlDirection = -controlDirection
-        stepSize = 2
-        recoveryCounter = 3 -- Zwingt das Skript für die nächsten 3 Zyklen zu kleinen Schritten
-        actionType = string.format("STURZ (%.2f) -> Sperre aktiv (±2)", trendDiff)
-    else
-        -- WERT IST STABIL ODER GESTIEGEN
-        if recoveryCounter > 0 then
-            recoveryCounter = recoveryCounter - 1
-            stepSize = 3
-            actionType = string.format("Erholung läuft (%d) -> Schritt 3", recoveryCounter)
-        else
-            actionType = string.format("Stabil/Steigt (%.2f) -> Formel", trendDiff)
-            local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
-            stepSize = math.floor(effDistance * 0.4) + 2
-            if stepSize > 15 then stepSize = 15 end
-            if stepSize < 2 then stepSize = 2 end
-        end
-    end
-
-    -- Terminal-Log für die Fehlerverfolgung
-    print(string.format("--- [LOG Zyklus #%d] ---", logCounter))
-    print(string.format("  Start EF: %.2f%% | End EF: %.2f%% | Diff: %.2f%%", startEff, endEff, trendDiff))
-    print(string.format("  Aktion: %s", actionType))
-    print(string.format("  Impuls-Seite: %s | Schrittweite: %d", sideName, stepSize))
-    print(string.format("  Signal: %d -> Neu: %d", oldSignal, currentSignal))
-    print("------------------------")
-
-    stuckReason = string.format("Diff:%.1f | %s", trendDiff, actionType)
-end
-
--- 6. Monitor grafisch zeichnen
-local function drawUI()
-    if not monitor then return end
-
-    local logicMode, caseTemp, efficiency, errorLevel = getReactorData()
-    updateStats(efficiency, errorLevel, caseTemp)
-
-    local statusText = "STANDBY"
-    if efficiency > 0 then
-        statusText = "RUN"
-    elseif efficiency == 0 then
-        statusText = "CRUSH"
-    else
-        statusText = "STANDBY"
-    end
-
-    monitor.setCursorPos(1, 1)
-    monitor.setBackgroundColor(colors.blue)
-    monitor.setTextColor(colors.white)
-    monitor.write(" === FUSION REACTOR CONTROL === ")
-    monitor.setBackgroundColor(colors.black)
-
-    -- Status
-    monitor.setCursorPos(1, 3)
-    monitor.clearLine()
-    monitor.write("Modus: ")
-    if statusText == "RUN" then
-        monitor.setTextColor(colors.green)
-    elseif statusText == "CRUSH" then
-        monitor.setTextColor(colors.red)
-    else
-        monitor.setTextColor(colors.orange)
-    end
-    monitor.write(statusText .. "    ")
-    monitor.setTextColor(colors.white)
-
-    -- Case Temperatur
-    monitor.setCursorPos(1, 5)
-    monitor.clearLine()
-    monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
-
-    -- EF (Efficiency)
-    monitor.setCursorPos(1, 7)
-    monitor.clearLine()
-    monitor.setTextColor(colors.yellow)
-    monitor.write(string.format("EF (Eff):  %.2f%% (Min:%.2f Max:%.2f)", efficiency, stats.minEff == math.huge and 0 or stats.minEff, stats.maxEff))
-    monitor.setTextColor(colors.white)
-
-    -- ER (Error Level)
-    monitor.setCursorPos(1, 8)
-    monitor.clearLine()
-    if errorLevel > 50 then monitor.setTextColor(colors.red) end
-    monitor.write(string.format("ER (Err):  %.2f%% (Min:%.2f Max:%.2f)", errorLevel, stats.minErr == math.huge and 0 or stats.minErr, stats.maxErr))
-    monitor.setTextColor(colors.white)
-
-    -- Fuel Type
-    monitor.setCursorPos(1, 10)
-    monitor.clearLine()
-    monitor.write("Fuel Type: D-T Fuel")
-
-    -- Regelung, Signalstärke und Seite (Links / Rechts)
-    monitor.setCursorPos(1, 11)
-    monitor.clearLine()
-    local signText = (controlDirection == 1) and "+" or "-"
-    local sideText = (controlDirection == 1) and "Links" or "Rechts"
-    monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
-
-    -- Diagnose-Zeile
-    monitor.setCursorPos(1, 13)
-    monitor.clearLine()
-    monitor.setTextColor(colors.cyan)
-    monitor.write("Diag: " .. string.sub(stuckReason, 1, 24))
-
-    monitor.setBackgroundColor(colors.black)
-    monitor.setTextColor(colors.lightGray)
-end
-
--- 7. Hauptschleife
-while true do
-    runControlLoop()
-    drawUI()
-end
+    if currentSignal >= 15 and controlDirection == 1
