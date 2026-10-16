@@ -1,4 +1,4 @@
--- Fusion Reactor Controller (Mit detailliertem Berechnungs-Log im Terminal)
+-- Fusion Reactor Controller (Korrigierte Logik-Reihenfolge & Trend-Auswertung)
 local reactor = nil
 local monitor = nil
 
@@ -29,7 +29,6 @@ local function scanPeripherals()
     monitor = nil
     
     print("--- Suche Peripherie ---")
-    print("[INIT] Starte Peripherie-Scan...")
     for _, name in ipairs(peripheral.getNames()) do
         local pType = peripheral.getType(name)
         local lName = name:lower()
@@ -105,7 +104,7 @@ local function sendPulse(side, strength)
     end)
 end
 
--- 5. Intelligenter Regelkreis mit detailliertem Terminal-Log
+-- 5. Korrigierter und synchronisierter Regelkreis
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, efficiency, errorLevel = getReactorData()
@@ -115,7 +114,7 @@ local function runControlLoop()
         redstone.setAnalogOutput("left", 0)
         redstone.setAnalogOutput("right", 0)
         stuckReason = "NOTSTOPP: Fehlerlevel >= 100"
-        print(string.format("[LOG #%d] NOTSTOPP ausgelöst! ErrorLevel: %.2f", logCounter, errorLevel))
+        print(string.format("[LOG #%d] NOTSTOPP ausgelöst!", logCounter))
         return
     end
 
@@ -139,58 +138,37 @@ local function runControlLoop()
             redstone.setAnalogOutput("right", 0)
         end)
         lastEfficiency = 0
+        currentSignal = 8
+        controlDirection = 1
         stuckReason = "Reaktor in " .. statusText
         return
     end
 
-    -- Vor dem Impuls den Startwert merken
     local startEff = efficiency
 
-    -- Schritt 1: Impuls für die aktuelle Richtung und Schrittweite abfeuern
-    local sideName = (controlDirection == 1) and "Links (+)" or "Rechts (-)"
-    sendPulse(controlDirection == 1 and "left" or "right", stepSize)
-
-    stuckReason = "Cooldown: Sammle Ticks..."
-
-    -- Schritt 2: 5 Sekunden Cooldown mit sekündlicher Live-Messung (Trend-Erkennung)
-    local efficiencyReadings = { startEff }
-    for i = 1, 5 do
-        sleep(1.0)
-        local _, _, currentEff = getReactorData()
-        table.insert(efficiencyReadings, currentEff)
-    end
-
-    -- Schritt 3: Auswertung der Trend-Ticks
-    local endEff = efficiencyReadings[#efficiencyReadings]
-    local trendDiff = endEff - startEff
-
-    local isConsistentlyIncreasing = true
-    for i = 2, #efficiencyReadings do
-        if efficiencyReadings[i] < efficiencyReadings[i-1] - 0.05 then
-            isConsistentlyIncreasing = false
-            break
+    -- WICHTIG: Wenn wir einen historischen Vorgänger haben, werten wir ZUERST aus und korrigieren DIE RICHTUNG, BEVOR wir einen Impuls senden!
+    local actionType = "Init / Start"
+    if lastEfficiency > 0 then
+        local diff = startEff - lastEfficiency
+        if diff < -0.2 then
+            -- Wert ist gesunken -> Sofort Richtung umkehren!
+            controlDirection = -controlDirection
+            stepSize = 2
+            actionType = "Trend Sinkt -> Richtung gedreht (±2)"
+        elseif diff >= 0 then
+            -- Wert ist gestiegen oder stabil -> Richtung behalten, Formel anwenden
+            actionType = "Trend OK -> Formel-Schritt"
+            local effDistance = math.abs(TARGET_EFFICIENCY - startEff)
+            stepSize = math.floor(effDistance * 0.4) + 2
+            if stepSize > 15 then stepSize = 15 end
+            if stepSize < 2 then stepSize = 2 end
+        else
+            stepSize = 2
+            actionType = "Trend Unklar -> Test ±2"
         end
-    end
-
-    -- Schritt 4: Richtungs- und Formel-Entscheidung basierend auf den Ticks
-    local actionType = ""
-    if trendDiff > 0.1 and isConsistentlyIncreasing then
-        -- Trend steigt positiv -> Richtung behalten, Formel anwenden
-        actionType = "Trend OK -> Formel-Schritt"
-        local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
-        stepSize = math.floor(effDistance * 0.4) + 2
-        if stepSize > 15 then stepSize = 15 end
-        if stepSize < 2 then stepSize = 2 end
-
-    elseif trendDiff < -0.1 then
-        -- Trend sinkt -> Richtung sofort umkehren, Suchschritt 2
-        controlDirection = -controlDirection
-        stepSize = 2
-        actionType = "Trend Sinkt -> Richtung gedreht (±2)"
     else
-        -- Unklarer Trend -> Fallback auf ±2
-        actionType = "Trend Unklar -> Test ±2"
         stepSize = 2
+        actionType = "Erster Start-Durchlauf"
     end
 
     -- Signalwert berechnen und Grenzen sichern
@@ -205,12 +183,26 @@ local function runControlLoop()
         controlDirection = 1 
     end
 
-    -- AUSFÜHRLICHES TERMINAL-LOG (Deine Fehler-Nachverfolgung)
+    -- Schritt 1: Erst JETZT den Impuls in der korrigierten Richtung abfeuern
+    local sideName = (controlDirection == 1) and "Links (+)" or "Rechts (-)"
+    sendPulse(controlDirection == 1 and "left" or "right", stepSize)
+
+    stuckReason = "Cooldown: Sammle Ticks..."
+
+    -- Schritt 2: 5 Sekunden Cooldown mit sekündlicher Live-Messung (Trend-Beobachtung)
+    local efficiencyReadings = { startEff }
+    for i = 1, 5 do
+        sleep(1.0)
+        local _, _, currentEff = getReactorData()
+        table.insert(efficiencyReadings, currentEff)
+    end
+
+    local endEff = efficiencyReadings[#efficiencyReadings]
+    local trendDiff = endEff - startEff
+
+    -- TERMINAL-LOG für die Fehlersuche
     print(string.format("--- [LOG Zyklus #%d] ---", logCounter))
     print(string.format("  Start EF: %.2f%% | End EF: %.2f%% | Diff: %.2f%%", startEff, endEff, trendDiff))
-    print(string.format("  Ticks-Verlauf: %.1f -> %.1f -> %.1f -> %.1f -> %.1f -> %.1f", 
-        efficiencyReadings[1], efficiencyReadings[2], efficiencyReadings[3], 
-        efficiencyReadings[4], efficiencyReadings[5], efficiencyReadings[6]))
     print(string.format("  Aktion: %s", actionType))
     print(string.format("  Impuls-Seite: %s | Schrittweite: %d", sideName, stepSize))
     print(string.format("  Signal: %d -> Neu: %d", oldSignal, currentSignal))
