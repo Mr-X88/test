@@ -1,4 +1,4 @@
--- Fusion Reactor Controller (Korrigierter Echtzeit-Vergleich: Start vs. End EF)
+-- Fusion Reactor Controller (Fester Fix für die Trend-Auswertung bei Sturz)
 local reactor = nil
 local monitor = nil
 
@@ -103,7 +103,7 @@ local function sendPulse(side, strength)
     end)
 end
 
--- 5. Korrigierter Regelkreis mit direktem Start-zu-End-Vergleich
+-- 5. Zuverlässiger Regelkreis mit strikter Trend-Prüfung
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, startEff, errorLevel = getReactorData()
@@ -170,18 +170,18 @@ local function runControlLoop()
 
     local endEff = efficiencyReadings[#efficiencyReadings]
     
-    -- Schritt 4: DIREKTER VERGLEICH (Was hat der Impuls in DIESEM Zyklus bewirkt?)
+    -- Schritt 4: STRIKTER TREND-VERGLEICH
     local trendDiff = endEff - startEff
     local actionType = ""
 
     if trendDiff < -0.2 then
-        -- Wert ist gesunken -> Impuls ging in die FALSCHE Richtung!
-        controlDirection = -controlDirection -- Richtung für den NÄCHSTEN Zyklus umkehren
-        stepSize = 2                        -- Auf sicheren Suchschritt zurückfallen
-        actionType = "Sinkt! Richtung gedreht (±2)"
+        -- WERT IST GESUNKEN -> Zwingend Richtung umkehren und Suchschritt erzwingen!
+        controlDirection = -controlDirection
+        stepSize = 2
+        actionType = string.format("STURZ (%.2f) -> Gedreht (±2)", trendDiff)
     else
-        -- Wert ist gestiegen oder stabil -> Richtung war korrekt, Formel anwenden
-        actionType = "Steigt/Stabil -> Formel-Schritt"
+        -- WERT IST GESTIEGEN ODER STABIL -> Formel-Schritt anwenden
+        actionType = string.format("Stabil/Steigt (%.2f) -> Formel", trendDiff)
         local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
         stepSize = math.floor(effDistance * 0.4) + 2
         if stepSize > 15 then stepSize = 15 end
