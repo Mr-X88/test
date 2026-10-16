@@ -1,4 +1,4 @@
--- Fusion Reactor Controller (Fester Signal-Fix & stabile Trend-Regelung)
+-- Fusion Reactor Controller (Korrigierter Echtzeit-Vergleich: Start vs. End EF)
 local reactor = nil
 local monitor = nil
 
@@ -9,7 +9,6 @@ local TARGET_EFFICIENCY = 70   -- Dein gewünschter Ziel-EF-Wert
 local currentSignal = 8        -- Startwert in der Mitte (1-15)
 local controlDirection = 1     -- 1 = Links (+ / Erhöhen), -1 = Rechts (- / Senken)
 local stepSize = 2             -- Startet im sicheren Suchmodus
-local lastEfficiency = 0
 local maxEfficiencySeen = 0    
 
 -- Diagnose- & Log-Variablen
@@ -104,10 +103,10 @@ local function sendPulse(side, strength)
     end)
 end
 
--- 5. Synchronisierter und fehlerfreier Regelkreis
+-- 5. Korrigierter Regelkreis mit direktem Start-zu-End-Vergleich
 local function runControlLoop()
     logCounter = logCounter + 1
-    local _, caseTemp, efficiency, errorLevel = getReactorData()
+    local _, caseTemp, startEff, errorLevel = getReactorData()
 
     if (errorLevel >= 100) then
         pcall(function() reactor.stop() end)
@@ -118,14 +117,14 @@ local function runControlLoop()
         return
     end
 
-    if efficiency > maxEfficiencySeen then
-        maxEfficiencySeen = efficiency
+    if startEff > maxEfficiencySeen then
+        maxEfficiencySeen = startEff
     end
 
     local statusText = "STANDBY"
-    if efficiency > 0 then
+    if startEff > 0 then
         statusText = "RUN"
-    elseif maxEfficiencySeen > 0 and efficiency == 0 then
+    elseif maxEfficiencySeen > 0 and startEff == 0 then
         statusText = "CRUSH"
     else
         statusText = "STANDBY"
@@ -137,41 +136,14 @@ local function runControlLoop()
             redstone.setAnalogOutput("left", 0)
             redstone.setAnalogOutput("right", 0)
         end)
-        lastEfficiency = 0
         currentSignal = 8
         controlDirection = 1
+        stepSize = 2
         stuckReason = "Reaktor in " .. statusText
         return
     end
 
-    local startEff = efficiency
-
-    -- Richtungs- und Schrittweiten-Entscheidung basierend auf dem letzten Trend
-    local actionType = "Init / Start"
-    if lastEfficiency > 0 then
-        local diff = startEff - lastEfficiency
-        if diff < -0.2 then
-            -- Wert gesunken -> Richtung sofort umkehren
-            controlDirection = -controlDirection
-            stepSize = 2
-            actionType = "Trend Sinkt -> Richtung gedreht (±2)"
-        elseif diff >= 0 then
-            -- Wert stabil oder gestiegen -> Richtung behalten, Formel nutzen
-            actionType = "Trend OK -> Formel-Schritt"
-            local effDistance = math.abs(TARGET_EFFICIENCY - startEff)
-            stepSize = math.floor(effDistance * 0.4) + 2
-            if stepSize > 15 then stepSize = 15 end
-            if stepSize < 2 then stepSize = 2 end
-        else
-            stepSize = 2
-            actionType = "Trend Unklar -> Test ±2"
-        end
-    else
-        stepSize = 2
-        actionType = "Erster Start-Durchlauf"
-    end
-
-    -- WICHTIG: Signalwert jetzt mathematisch korrekt aktualisieren und begrenzen
+    -- Schritt 1: Signalwert mathematisch aktualisieren und begrenzen
     local oldSignal = currentSignal
     currentSignal = currentSignal + (controlDirection * stepSize)
     if currentSignal > 15 then 
@@ -182,13 +154,13 @@ local function runControlLoop()
         controlDirection = 1 
     end
 
-    -- Impuls an die entsprechende Seite senden
+    -- Schritt 2: Impuls an die entsprechende Seite senden
     local sideName = (controlDirection == 1) and "Links (+)" or "Rechts (-)"
     sendPulse(controlDirection == 1 and "left" or "right", stepSize)
 
     stuckReason = "Cooldown: Ticks sammeln..."
 
-    -- 5 Sekunden Cooldown mit sekündlicher Live-Messung
+    -- Schritt 3: 5 Sekunden Cooldown mit sekündlicher Live-Messung abwarten
     local efficiencyReadings = { startEff }
     for i = 1, 5 do
         sleep(1.0)
@@ -197,7 +169,24 @@ local function runControlLoop()
     end
 
     local endEff = efficiencyReadings[#efficiencyReadings]
+    
+    -- Schritt 4: DIREKTER VERGLEICH (Was hat der Impuls in DIESEM Zyklus bewirkt?)
     local trendDiff = endEff - startEff
+    local actionType = ""
+
+    if trendDiff < -0.2 then
+        -- Wert ist gesunken -> Impuls ging in die FALSCHE Richtung!
+        controlDirection = -controlDirection -- Richtung für den NÄCHSTEN Zyklus umkehren
+        stepSize = 2                        -- Auf sicheren Suchschritt zurückfallen
+        actionType = "Sinkt! Richtung gedreht (±2)"
+    else
+        -- Wert ist gestiegen oder stabil -> Richtung war korrekt, Formel anwenden
+        actionType = "Steigt/Stabil -> Formel-Schritt"
+        local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
+        stepSize = math.floor(effDistance * 0.4) + 2
+        if stepSize > 15 then stepSize = 15 end
+        if stepSize < 2 then stepSize = 2 end
+    end
 
     -- Terminal-Log für die Fehlerverfolgung
     print(string.format("--- [LOG Zyklus #%d] ---", logCounter))
@@ -208,7 +197,6 @@ local function runControlLoop()
     print("------------------------")
 
     stuckReason = string.format("Diff:%.1f | %s", trendDiff, actionType)
-    lastEfficiency = endEff
 end
 
 -- 6. Monitor grafisch zeichnen
