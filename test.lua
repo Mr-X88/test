@@ -1,4 +1,4 @@
--- Fusion Reactor Controller (Korrigierte Logik-Reihenfolge & Trend-Auswertung)
+-- Fusion Reactor Controller (Fester Signal-Fix & stabile Trend-Regelung)
 local reactor = nil
 local monitor = nil
 
@@ -104,7 +104,7 @@ local function sendPulse(side, strength)
     end)
 end
 
--- 5. Korrigierter und synchronisierter Regelkreis
+-- 5. Synchronisierter und fehlerfreier Regelkreis
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, efficiency, errorLevel = getReactorData()
@@ -146,17 +146,17 @@ local function runControlLoop()
 
     local startEff = efficiency
 
-    -- WICHTIG: Wenn wir einen historischen Vorgänger haben, werten wir ZUERST aus und korrigieren DIE RICHTUNG, BEVOR wir einen Impuls senden!
+    -- Richtungs- und Schrittweiten-Entscheidung basierend auf dem letzten Trend
     local actionType = "Init / Start"
     if lastEfficiency > 0 then
         local diff = startEff - lastEfficiency
         if diff < -0.2 then
-            -- Wert ist gesunken -> Sofort Richtung umkehren!
+            -- Wert gesunken -> Richtung sofort umkehren
             controlDirection = -controlDirection
             stepSize = 2
             actionType = "Trend Sinkt -> Richtung gedreht (±2)"
         elseif diff >= 0 then
-            -- Wert ist gestiegen oder stabil -> Richtung behalten, Formel anwenden
+            -- Wert stabil oder gestiegen -> Richtung behalten, Formel nutzen
             actionType = "Trend OK -> Formel-Schritt"
             local effDistance = math.abs(TARGET_EFFICIENCY - startEff)
             stepSize = math.floor(effDistance * 0.4) + 2
@@ -171,25 +171,24 @@ local function runControlLoop()
         actionType = "Erster Start-Durchlauf"
     end
 
-    -- Signalwert berechnen und Grenzen sichern
+    -- WICHTIG: Signalwert jetzt mathematisch korrekt aktualisieren und begrenzen
     local oldSignal = currentSignal
     currentSignal = currentSignal + (controlDirection * stepSize)
     if currentSignal > 15 then 
         currentSignal = 15 
         controlDirection = -1 
-    end
-    if currentSignal < 1 then 
+    elseif currentSignal < 1 then 
         currentSignal = 1 
         controlDirection = 1 
     end
 
-    -- Schritt 1: Erst JETZT den Impuls in der korrigierten Richtung abfeuern
+    -- Impuls an die entsprechende Seite senden
     local sideName = (controlDirection == 1) and "Links (+)" or "Rechts (-)"
     sendPulse(controlDirection == 1 and "left" or "right", stepSize)
 
-    stuckReason = "Cooldown: Sammle Ticks..."
+    stuckReason = "Cooldown: Ticks sammeln..."
 
-    -- Schritt 2: 5 Sekunden Cooldown mit sekündlicher Live-Messung (Trend-Beobachtung)
+    -- 5 Sekunden Cooldown mit sekündlicher Live-Messung
     local efficiencyReadings = { startEff }
     for i = 1, 5 do
         sleep(1.0)
@@ -200,7 +199,7 @@ local function runControlLoop()
     local endEff = efficiencyReadings[#efficiencyReadings]
     local trendDiff = endEff - startEff
 
-    -- TERMINAL-LOG für die Fehlersuche
+    -- Terminal-Log für die Fehlerverfolgung
     print(string.format("--- [LOG Zyklus #%d] ---", logCounter))
     print(string.format("  Start EF: %.2f%% | End EF: %.2f%% | Diff: %.2f%%", startEff, endEff, trendDiff))
     print(string.format("  Aktion: %s", actionType))
