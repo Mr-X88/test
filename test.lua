@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.57 (Entkoppelte Brain-Arm Architektur & Angepasste Step-Formel)
+-- SCRIPT VERSION 2.59 (Mit nicht-linearer Kurvenformel & ohne Full-Power-Distance)
 -- ==========================================
-local SCRIPT_VERSION = "v2.57"
+local SCRIPT_VERSION = "v2.59"
 
 local reactor = nil
 local monitor = nil
@@ -12,9 +12,7 @@ local relay = nil
 -- ==========================================
 local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
-local FULL_POWER_DISTANCE = 43       -- Volle Power ab 43 Punkten Restabstand
 local POLL_INTERVAL_TICKS = 4        -- Sensor-Intervall (0.2 Sekunden)
-local EXECUTION_INTERVAL_TICKS = 20  -- (Wird durch EF-Stabilität ersetzt)
 local JUMP_THRESHOLD = 3.0           -- Schwellenwert für Tick-Sprünge/-Einbrüche
 local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
 
@@ -34,7 +32,6 @@ local monitorWidth, monitorHeight = 39, 25
 local currentSignal = 8              
 local controlDirection = 1      -- 1 = Erhöhen (+), -1 = Senken (-)
 local stepSize = 4               
-local lastEfficiency = 0
 local maxEfficiencySeen = 0     
 local hasEverRun = false        
 local logCounter = 0
@@ -216,17 +213,18 @@ local function applyControlAction(direction, strength)
     end
 end
 
--- 3. DYNAMISCHE FORMEL (Berechnet die Schrittgröße abgerundet ohne +1)
+-- 3. NEUE NICHT-LINEARE KURVEN-FORMEL (Basierend auf deinen Messwerten)
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
 
-    if effDiff >= FULL_POWER_DISTANCE then
-        return 15
-    elseif effDiff <= 0 then
+    if effDiff <= 0 then
         return 1
     end
 
-    local calculatedStep = math.floor((effDiff / FULL_POWER_DISTANCE) * 15)
+    -- Kurvenformel aus den Messpunkten
+    local crNeeded = (0.0927 * effDiff) + (0.00464 * (effDiff ^ 2))
+    local calculatedStep = math.floor(crNeeded)
+
     if calculatedStep > 15 then 
         calculatedStep = 15 
     elseif calculatedStep < 1 then 
@@ -236,7 +234,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung, Sekundenzähler & Go-Trigger)
+-- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung, Sekundenzähler & EF-Stabilitäts-Go)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -262,7 +260,7 @@ local function backgroundSensorLoop()
         end
 
         -- Go-Signal, wenn sich der EF-Wert innerhalb von 2 4-Ticken nicht ändert
-        if lastPollEF >= 0 and eff == lastPollEF then
+        if lastPollEF >= 0 and math.abs(eff - lastPollEF) < 0.1 then
             unchangedPollCount = unchangedPollCount + 1
             if unchangedPollCount >= 2 then
                 executionGo = true
@@ -310,172 +308,3 @@ local function backgroundSensorLoop()
                     else
                         controlDirection = -controlDirection
                         stuckReason = "Stillstand -> Wechsel"
-                    end
-                end
-            else
-                stuckReason = "Init"
-            end
-        end
-
-        if eff > 0 then
-            lastSensorEF = eff
-        end
-
-        updateStats(eff, err, caseT)
-        sleep(pollSeconds)
-    end
-end
-
--- 5. AUSFÜHRUNGS-SCHLEIFE (Der "Arm" & Protokoll, wartet auf Go)
-local function executionLoop()
-    while true do
-        -- Solange kein Go vorliegt, wird gewartet (währenddessen zählt der Sekundenzähler weiter)
-        while not executionGo do
-            sleep(0.05)
-        end
-        
-        -- Go sofort wieder verlieren
-        executionGo = false
-
-        -- Gesammelte Sekunden sichern und Zähler auf 0 zurücksetzen
-        local logSeconds = secondsSinceLastGo
-        secondsSinceLastGo = 0
-
-        local currentEfficiency = liveEF
-        local errorLevel = liveER
-
-        if previousLoggedEff < 0 then
-            previousLoggedEff = currentEfficiency
-        end
-
-        local startEffForLog = previousLoggedEff
-
-        if liveIsRunning and currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD then
-            if currentEfficiency > maxEfficiencySeen then
-                maxEfficiencySeen = currentEfficiency
-            end
-
-            -- Schrittgröße per Formel berechnen
-            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
-
-            -- Befehl an Reaktor / Relay ausführen
-            applyControlAction(controlDirection, stepSize)
-
-            currentSignal = currentSignal + (controlDirection * stepSize)
-            if currentSignal > 15 then currentSignal = 15 elseif currentSignal < 1 then currentSignal = 1 end
-
-            logCounter = logCounter + 1
-
-            if ENABLE_MONITOR_LOGS then
-                local signChar = (controlDirection == 1) and "+" or "-"
-                local shortDiag = string.sub(stuckReason, 1, 10) 
-                local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s", 
-                    logCounter, signChar, stepSize, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
-                
-                table.insert(logHistory, 1, compactLog)
-                local maxLogLines = math.max(5, monitorHeight - 7)
-                if #logHistory > maxLogLines then
-                    table.remove(logHistory)
-                end
-            end
-        else
-            -- Bei Stillstand oder Idle alle Relays/Signale sicher auf 0 setzen
-            pcall(function()
-                if relay then
-                    for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
-                else
-                    for _, side in ipairs(sides) do redstone.setAnalogOutput(side, 0) end
-                end
-            end)
-        end
-
-        -- EF-Wert für den nächsten Log-Vergleich sichern
-        previousLoggedEff = currentEfficiency
-    end
-end
-
--- 6. MONITOR-UI SCHLEIFE (Anzeige)
-local function uiLoop()
-    while true do
-        if monitor then
-            local efficiency = liveEF
-            local caseTemp = liveCaseTemp
-            local errorLevel = liveER
-
-            local statusText = "STANDBY"
-            if efficiency > 0 then
-                statusText = "RUN"
-            elseif hasEverRun and efficiency == 0 then
-                statusText = "CRUSH"
-            else
-                statusText = "STANDBY"
-            end
-
-            monitor.setBackgroundColor(colors.black)
-            
-            monitor.setCursorPos(1, 1)
-            monitor.setBackgroundColor(colors.blue)
-            monitor.setTextColor(colors.white)
-            monitor.write(string.format("=== FUSION CONTROL %s ===", SCRIPT_VERSION))
-            monitor.setBackgroundColor(colors.black)
-
-            monitor.setCursorPos(1, 2)
-            monitor.clearLine()
-            monitor.write("Modus: ")
-            if efficiency >= IDLE_THRESHOLD then
-                monitor.setTextColor(colors.cyan)
-                monitor.write("IDLE ")
-            elseif statusText == "RUN" then
-                monitor.setTextColor(colors.green)
-                monitor.write("RUN  ")
-            elseif statusText == "CRUSH" then
-                monitor.setTextColor(colors.red)
-                monitor.write("CRUSH")
-            else
-                monitor.setTextColor(colors.orange)
-                monitor.write("STAND")
-            end
-            monitor.setTextColor(colors.white)
-            monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
-
-            monitor.setCursorPos(1, 3)
-            monitor.clearLine()
-            monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
-            monitor.write(" | ER: ")
-            if errorLevel > 50 then monitor.setTextColor(colors.red) end
-            monitor.write(string.format("%.1f%%", errorLevel))
-            monitor.setTextColor(colors.white)
-
-            monitor.setCursorPos(1, 4)
-            monitor.clearLine()
-            local signText = (controlDirection == 1) and "+" or "-"
-            local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
-            monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
-
-            monitor.setCursorPos(1, 5)
-            monitor.clearLine()
-            monitor.setTextColor(colors.cyan)
-            monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
-            monitor.setTextColor(colors.white)
-
-            if ENABLE_MONITOR_LOGS then
-                monitor.setCursorPos(1, 7)
-                monitor.setTextColor(colors.lightGray)
-                monitor.write("--- ZYKLEN-LOGS ---")
-
-                local maxLogLines = math.max(5, monitorHeight - 7)
-                for i = 1, maxLogLines do
-                    monitor.setCursorPos(1, 7 + i)
-                    monitor.clearLine()
-                    if logHistory[i] then
-                        monitor.write(logHistory[i])
-                    end
-                end
-            end
-        end
-        sleep(0.25)
-    end
-end
-
--- 7. Parallele Ausführung aller Prozesse
-parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
