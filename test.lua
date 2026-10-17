@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.22 (Typo behoben & Echtzeit-Sprungerkennung)
+-- SCRIPT VERSION 2.31 (Echtzeit-Sprungerkennung im 4-Ticks-Takt + 5s Pausensicherung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.22"
+local SCRIPT_VERSION = "v2.31"
 
 local reactor = nil
 local monitor = nil
@@ -13,8 +13,8 @@ local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
-local MIN_CYCLE_WAIT = 5.0      -- Mindestwartezeit pro Zyklus in Sekunden
-local FAST_JUMP_THRESHOLD = 2.5 -- Sprung-Schwelle im 4-Ticks-Takt
+local MIN_CYCLE_WAIT = 5.0      -- Verbindliche Mindestwartezeit für normale Regel-Zyklen
+local FAST_JUMP_THRESHOLD = 3.0 -- Sensibler Schwellenwert im 4-Ticks-Takt für echte TR-Drifts
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
@@ -37,6 +37,7 @@ local liveCaseTemp = 0
 local liveIsRunning = false
 local instantJumpDetected = false
 local instantJumpDelta = 0
+local ignoreJumpsUntil = 0      -- Schutz-Timer, damit eigene Befehle keinen Sprung auslösen
 
 -- Diagnose-Variable
 local stuckReason = "Warte auf Reaktor..."
@@ -154,6 +155,9 @@ local function applyControlAction(direction, strength)
         local sideName = (direction == 1) and "left" or "right"
         sendPulse(sideName, strength)
     end
+    
+    -- Sobald wir einen Befehl senden, ignorieren wir kurz die Hintergrund-Sprüngen (Sperrfrist 2.0 Sek)
+    ignoreJumpsUntil = os.clock() + 2.0
 end
 
 redstone.setAnalogOutput("left", 0)
@@ -177,7 +181,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- PARALLELE HINTERGRUND-ÜBERWACHUNG (Prüft alle 4 Ticks in Echtzeit auf TR-Sprünge)
+-- PARALLELE HINTERGRUND-ÜBERWACHUNG (Prüft alle 4 Ticks in Echtzeit auf TR-Drifts)
 local function backgroundSensorLoop()
     local pollSeconds = POLL_INTERVAL_TICKS / 20 
     local lastRecordedEF = 0
@@ -194,7 +198,8 @@ local function backgroundSensorLoop()
 
         if not isFirstRun and running and eff > 0 then
             local pollDelta = eff - lastRecordedEF
-            if math.abs(pollDelta) >= FAST_JUMP_THRESHOLD then
+            -- Wenn außerhalb der eigenen Befehls-Sperrfrist ein abrupter Sprung passiert: Alarm!
+            if math.abs(pollDelta) >= FAST_JUMP_THRESHOLD and os.clock() > ignoreJumpsUntil then
                 instantJumpDetected = true
                 instantJumpDelta = pollDelta
             end
@@ -207,7 +212,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit Echtzeit-Sprung-Auswertung
+-- 6. Haupt-Regelungsschleife
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -239,6 +244,7 @@ local function controlLoop()
             local startEffForLog = efficiency
             local cycleStartTime = os.clock() 
 
+            -- Prüfen, ob der Hintergrundsensor einen echten Spontansprung gemeldet hat
             local jumpDetectedThisCycle = instantJumpDetected
             local jumpDeltaThisCycle = instantJumpDelta
             instantJumpDetected = false 
@@ -253,6 +259,7 @@ local function controlLoop()
                     stuckReason = "Sprung (+) Boost"
                 end
             else
+                -- Normaler geregelter Schritt
                 applyControlAction(controlDirection, stepSize)
                 currentSignal = currentSignal + (controlDirection * stepSize)
                 if currentSignal > 15 then 
@@ -264,13 +271,15 @@ local function controlLoop()
                 end
             end
 
+            -- PAUSEN-SICHERUNG: Der Zyklus wartet sauber seine Mindestwartezeit (MIN_CYCLE_WAIT = 5s),
+            -- bricht aber sofort ab, falls währenddessen im Hintergrund ein echter Reaktor-Sprung reinzuckt!
             local elapsedWait = 0
             local lastObservedEF = liveEF
-            local stableTicksCount = 0 -- KORRIGIERT: Sauber auf 0 initialisiert!
+            local stableTicksCount = 0
             
             while elapsedWait < 20.0 do
                 if instantJumpDetected then
-                    break
+                    break -- Sofortige Reaktion auf den Echtzeit-Sprung aus der Hintergrundschleife!
                 end
 
                 sleep(0.3)
