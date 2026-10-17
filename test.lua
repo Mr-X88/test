@@ -1,4 +1,4 @@
--- Version: 1.7 (Ohne redundanten Turbo-Modus, reine Tabellen-Formel & Impulssteuerung)
+-- Version: 1.8 (Mit Spontan-Sprung-Erkennung bei TR/EF-Schwankungen & Cooldown-Schutz)
 local reactor = nil
 local monitor = nil
 
@@ -8,6 +8,7 @@ local monitor = nil
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden
+local JUMP_THRESHOLD = 4.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
@@ -128,7 +129,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Hill-Climbing Regelung mit Cooldown & linearer Formel
+-- 6. Hill-Climbing Regelung mit Sprung-Erkennung & Cooldown-Schutz
 local function runControlLoop()
     local _, caseTemp, efficiency, errorLevel = getReactorData()
 
@@ -180,24 +181,46 @@ local function runControlLoop()
         controlDirection = 1 
     end
 
-    -- Cooldown abwarten (auch bei Richtungswechsel)
+    -- WICHTIG: Voller Cooldown wird strikt abgewartet (egal ob Sprung oder nicht)
     stuckReason = string.format("Cooldown (%.1fs)...", COOLDOWN_WAIT)
     sleep(COOLDOWN_WAIT)
 
     -- Erst nach dem Cooldown den neuen Wert abfragen
     local _, _, newEfficiency = getReactorData()
 
-    -- Auswertung & Anwendung der linearen Tabellen-Formel[cite: 2]
+    -- Auswertung mit Spontan-Sprung-Erkennung (TR/EF-Schwankungen abfangen)
     if lastEfficiency > 0 then
-        if newEfficiency < lastEfficiency then
-            -- Wert wurde schlechter -> Richtung wechseln und Schritt verkleinern
-            controlDirection = -controlDirection
-            stepSize = 1
-            stuckReason = "Schlechter -> Richtung gewechselt"
+        local effDelta = newEfficiency - lastEfficiency
+        local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
+
+        if isSpontaneousJump then
+            -- EF hat sich während des Cooldowns sprunghaft geändert (z.B. durch TR-Änderung)
+            -- Wir prüfen, ob wir trotz des Sprungs näher am Ziel (100%) sind als vorher
+            local oldDistance = math.abs(TARGET_EFFICIENCY - lastEfficiency)
+            local newDistance = math.abs(TARGET_EFFICIENCY - newEfficiency)
+
+            if newDistance < oldDistance then
+                -- Obwohl ein Sprung stattfand, sind wir dem Ziel näher gekommen -> Kurs halten!
+                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                stuckReason = string.format("Sprung (+), aber Ziel näher -> Step %d", stepSize)
+            else
+                -- Der Sprung hat uns weiter weg gebracht -> Vorsichtig reagieren und Richtung anpassen
+                controlDirection = -controlDirection
+                stepSize = 1
+                stuckReason = "Sprung (-), weg vom Ziel -> Richtung gewechselt"
+            end
         else
-            -- Wert wurde besser oder gleich -> Richtung beibehalten und über Formel anpassen!
-            stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-            stuckReason = string.format("Tabellen-Formel -> Step %d", stepSize)
+            -- Kein extremer Sprung: Normale Hill-Climbing / Tabellen-Auswertung
+            if newEfficiency < lastEfficiency then
+                -- Wert wurde schlechter -> Richtung wechseln
+                controlDirection = -controlDirection
+                stepSize = 1
+                stuckReason = "Schlechter -> Richtung gewechselt"
+            else
+                -- Wert wurde besser oder gleich -> Tabellen-Formel nutzen[cite: 2]
+                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                stuckReason = string.format("Tabellen-Formel -> Step %d", stepSize)
+            end
         end
     else
         stepSize = 2
