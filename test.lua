@@ -1,5 +1,5 @@
 -- ==========================================
--- SCRIPT VERSION 2.41 (Konfigurierbarer Voll-Power-Abstand & Tick-Intelligenz)
+-- SCRIPT VERSION 2.411 (Konfigurierbarer Voll-Power-Abstand & Tick-Intelligenz)
 -- ==========================================
 local SCRIPT_VERSION = "v2.41"
 
@@ -11,7 +11,7 @@ local monitor = nil
 -- ==========================================
 local TARGET_EFFICIENCY = 100       -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0         -- Ab hier direkt Idle & Stopp
-local FULL_POWER_DISTANCE = 33      -- Ab wie viel Restabstand zum Ziel volle Power (+15) gefahren wird
+local FULL_POWER_DISTANCE = 43      -- Ab wie viel Restabstand zum Ziel volle Power (+15) gefahren wird
 local POLL_INTERVAL_TICKS = 4       -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0          -- Strikte Mindestwartezeit pro Zyklus in Sekunden
 local JUMP_THRESHOLD = 3.0          -- Schwellenwert für Tick-Sprünge/-Einbrüche
