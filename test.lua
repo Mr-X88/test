@@ -387,7 +387,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("--- ZYKLEN-LOGS ---")
 
-                let maxLogLines = math.max(5, monitorHeight - 7)
+                local maxLogLines = math.max(5, monitorHeight - 7)
                 for i = 1, maxLogLines do
                     monitor.setCursorPos(1, 7 + i)
                     monitor.clearLine()
