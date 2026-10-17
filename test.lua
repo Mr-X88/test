@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.36 (Tick-basierter Sprung-Check & Schwelle 3.0)
+-- SCRIPT VERSION 2.37 (Tick-basierte Richtungs-Intelligenz & Fallback)
 -- ==========================================
-local SCRIPT_VERSION = "v2.36"
+local SCRIPT_VERSION = "v2.37"
 
 local reactor = nil
 local monitor = nil
@@ -14,7 +14,7 @@ local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0      -- Strikte Mindestwartezeit pro Zyklus in Sekunden
-local JUMP_THRESHOLD = 3.0      -- Zurückgesetzt auf 3.0 für echte Tick-Sprünge
+local JUMP_THRESHOLD = 3.0      -- Schwellenwert für Tick-Sprünge
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
@@ -177,9 +177,10 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks / 0.2s Takt mit Tick-Sprung-Erkennung)
+-- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks / 0.2s Takt mit Tick-Sprung-Analyse)
 local lastTickEF = 0
-local tickJumpDetected = false
+local tickJumpOccurred = false
+local tickJumpDelta = 0
 
 local function backgroundSensorLoop()
     local pollSeconds = POLL_INTERVAL_TICKS / 20 
@@ -187,10 +188,11 @@ local function backgroundSensorLoop()
     while true do
         local _, caseT, eff, err, running = getReactorData()
         
-        -- Prüfe Sprung direkt zum vorherigen 0.2s-Tick
         if lastTickEF > 0 and eff > 0 then
-            if math.abs(eff - lastTickEF) >= JUMP_THRESHOLD then
-                tickJumpDetected = true
+            local delta = eff - lastTickEF
+            if math.abs(delta) >= JUMP_THRESHOLD then
+                tickJumpOccurred = true
+                tickJumpDelta = delta
             end
         end
         if eff > 0 then
@@ -207,7 +209,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit strikter 5-Sekunden-Pause & Tick-Auswertung
+-- 6. Haupt-Regelungsschleife mit intelligenter Tick-Sprung Auswertung
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -238,8 +240,9 @@ local function controlLoop()
             local startEffForLog = efficiency
             local cycleStartTime = os.clock() 
 
-            -- Reset Flag vor dem Zyklus
-            tickJumpDetected = false
+            -- Flags vor dem Zyklus zurücksetzen
+            tickJumpOccurred = false
+            tickJumpDelta = 0
 
             -- Befehl an den Reaktor senden
             applyControlAction(controlDirection, stepSize)
@@ -252,7 +255,7 @@ local function controlLoop()
                 currentSignal = 1 
             end
 
-            -- UNUMSTÖSSLICHE PAUSENSICHERUNG: Volle 5 Sekunden warten (währenddessen prüft der Background-Loop die 0.2s-Ticks)
+            -- UNUMSTÖSSLICHE PAUSENSICHERUNG: Volle 5 Sekunden warten
             local elapsedWait = 0
             while elapsedWait < MIN_CYCLE_WAIT do
                 sleep(0.25)
@@ -264,23 +267,19 @@ local function controlLoop()
             local recordedER = liveER 
 
             if lastEfficiency > 0 then
-                local effDelta = newEfficiency - lastEfficiency
-                local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
-
-                if tickJumpDetected then
-                    -- Tick-Sprung erkannt: Sanfter +2 Fallback zur Sicherheit
-                    stepSize = 2
-                    stuckReason = "Tick-Sprung (+2)"
-                elseif isSpontaneousJump then
-                    if effDelta < 0 then
-                        controlDirection = 1   
-                        stepSize = 12          
-                        stuckReason = "Sprung (-) Einbruch"
-                    else
+                if tickJumpOccurred then
+                    if tickJumpDelta > 0 then
+                        -- Positiver Tick-Sprung: Richtung beibehalten & per Formel beschleunigen!
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = "Sprung (+) Boost"
+                        stuckReason = "Tick-Sprung (+)"
+                    else
+                        -- Negativer Tick-Sprung (Einbruch): Sofortige Richtungs-Umkehr, wenn Richtung bekannt
+                        controlDirection = -controlDirection
+                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                        stuckReason = "Tick-Einbruch (Wechsel)"
                     end
                 else
+                    -- Standard-Logik ohne Tick-Sprung
                     if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
                         controlDirection = -controlDirection
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
@@ -294,8 +293,15 @@ local function controlLoop()
                     end
                 end
             else
-                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = "Init"
+                -- Fall, wenn keine Historie da ist (Init) und ein Tick-Einbruch passiert
+                if tickJumpOccurred and tickJumpDelta < 0 then
+                    controlDirection = -controlDirection
+                    stepSize = 2
+                    stuckReason = "Init Einbruch (+2)"
+                else
+                    stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                    stuckReason = "Init"
+                end
             end
 
             lastEfficiency = newEfficiency
