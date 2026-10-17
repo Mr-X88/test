@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.13 (Start-Sperre behoben)
+-- SCRIPT VERSION 2.14 (Standby-Log-Spam behoben)
 -- ==========================================
-local SCRIPT_VERSION = "v2.13"
+local SCRIPT_VERSION = "v2.14"
 
 local reactor = nil
 local monitor = nil
@@ -213,14 +213,15 @@ local function controlLoop()
         local efficiency = liveEF
         local errorLevel = liveER
 
-        -- KORRIGIERT: Blockiert nur noch, wenn der Reaktor wirklich aus ist oder nach einem Lauf auf 0 steht (Crush)
-        if not liveIsRunning or (efficiency == 0 and maxEfficiencySeen > 0) then
+        -- ECHTER STANDBY-SCHUTZ: Solange EF 0 ist oder der Reaktor aus ist, passiert absolut gar nichts (kein Log-Spam!)
+        if not liveIsRunning or efficiency == 0 then
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
                 redstone.setAnalogOutput("right", 0)
             end)
             lastEfficiency = 0 
-            stuckReason = "Reaktor STANDBY/CRUSH"
+            maxEfficiencySeen = 0 -- Reset für den nächsten Start
+            stuckReason = "Reaktor in Standby"
             sleep(1.0)
         elseif efficiency >= HARD_STOP_EF or efficiency >= IDLE_THRESHOLD then
             -- Harter Stopp kurz vor dem Ziel
