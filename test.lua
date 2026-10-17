@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.80 (Mit intelligentem Deadlock-Nudge in der 4t-Schleife)
+-- SCRIPT VERSION 2.81 (Trend-Richtungsumkehr bei fallender Effizienz in der 4t-Schleife)
 -- ==========================================
-local SCRIPT_VERSION = "v2.80"
+local SCRIPT_VERSION = "v2.81"
 
 local reactor = nil
 local monitor = nil
@@ -327,7 +327,7 @@ local function touchListenerLoop()
     end
 end
 
--- 6. ADAPTIVE SENSOR-SCHLEIFE (Die EINZIGE Stelle für Richtungsänderungen & Deadlock-Nudge)
+-- 6. ADAPTIVE SENSOR-SCHLEIFE (Exklusive Richtungsänderung + Trend-Erkennung)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -346,18 +346,23 @@ local function backgroundSensorLoop()
             hasEverRun = true
         end
 
-        -- Standard-Zielprüfung: Wenn Ziel erreicht/überschritten -> Senken (-)
+        -- Dynamische Trend-Erkennung:
         if eff >= TARGET_EFFICIENCY then
-            controlDirection = -1
+            controlDirection = -1 -- Ziel erreicht -> Senken (-)
+        elseif lastSensorEF > 0 then
+            -- Wenn die Effizienz nach dem letzten Schritt sinkt -> Richtung umkehren
+            if (eff - lastSensorEF) < -EFF_TOLERANCE then
+                controlDirection = -controlDirection
+            end
         end
 
-        -- 10-Iteration Stillstand-Erkennung mit temporärem Deadlock-Nudge (Bonus +1)
+        -- 10-Iteration Stillstand-Erkennung mit Deadlock-Nudge (Bonus +1)
         if lastSensorEFForStuck >= 0 and math.abs(eff - lastSensorEFForStuck) < 0.1 then
             stuckPollCount = stuckPollCount + 1
             if stuckPollCount >= 10 then
                 stuckNudgeActive = true
-                stuckNudgeCounter = 2   -- Wirkt für 2 Sensor-Zyklen
-                stuckNudgeBonus = 1     -- Fügt einen temporären Schub von +1 hinzu
+                stuckNudgeCounter = 2   
+                stuckNudgeBonus = 1     
                 stuckPollCount = 0
             end
         else
@@ -438,7 +443,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 7. AUSFÜHRUNGS-SCHLEIFE (Berücksichtigt den Deadlock-Nudge bei der Schrittberechnung)
+-- 7. AUSFÜHRUNGS-SCHLEIFE
 local function executionLoop()
     while true do
         while not executionGo do
@@ -474,11 +479,10 @@ local function executionLoop()
             -- Schrittweite über die Kurventabelle berechnen
             stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
 
-            -- Wenn der Deadlock-Nudge aktiv ist, fügen wir den temporären Bonus hinzu
+            -- Falls Deadlock-Nudge aktiv ist, temporären Bonus addieren
             local effectiveStep = stepSize + stuckNudgeBonus
             if effectiveStep > 15 then effectiveStep = 15 end
 
-            -- Führt den Befehl mit der Richtung und dem eventuellen Nudge-Schub aus
             applyControlAction(controlDirection, effectiveStep)
 
             currentSignal = currentSignal + (controlDirection * effectiveStep)
