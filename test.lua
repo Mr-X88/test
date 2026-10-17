@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.5 (Ultrakompaktes Layout für Max-Logs)
+-- SCRIPT VERSION 2.8 (Ohne Notstopp, mit Blitz-Recovery)
 -- ==========================================
-local SCRIPT_VERSION = "v2.5"
+local SCRIPT_VERSION = "v2.8"
 
 local reactor = nil
 local monitor = nil
@@ -10,11 +10,11 @@ local monitor = nil
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 95.0     -- EF-Schwelle: Ab hier stoppt die Regelung
+local IDLE_THRESHOLD = 90.0     -- Sicherer Idle-Punkt bei 90% (verhindert 95%-Crashs)
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
-local JUMP_THRESHOLD = 8.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
-local EFF_TOLERANCE = 0.5       -- Toleranz-Schwelle für kleine Drops
+local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
+local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
 local ENABLE_MONITOR_LOGS = true -- true = Logs auf Monitor anzeigen, false = Aus
@@ -23,7 +23,7 @@ local monitorWidth, monitorHeight = 39, 25
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
 local controlDirection = 1      -- 1 = Links / Erhöhen (+), -1 = Rechts / Senken (-)
-local stepSize = 2              -- Start-Suchschrittweite
+local stepSize = 5              -- Start-Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
 local logCounter = 0
@@ -60,8 +60,8 @@ local function scanPeripherals()
             local m = peripheral.wrap(name)
             if m and m.isColor and m.isColor() then
                 monitor = m
-                monitorWidth, monitorHeight = monitor.getSize()
-                monitor.setTextScale(0.5) -- Kleinste Schrift für maximale Auflösung
+                monitorWidth, monitorHeight = m.getSize()
+                m.setTextScale(0.5)
                 print(" -> Farb-Monitor gefunden: " .. name .. " (" .. monitorWidth .. "x" .. monitorHeight .. ")")
             end
         end
@@ -150,10 +150,14 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. Natürliche Formel-Steuerung
+-- 5. Intelligente Formel mit dynamischer Skalierung
 local function calculateStepFromTable(currentEff, targetEff)
+    if currentEff >= 85.0 then
+        return 1
+    end
+
     local effDiff = targetEff - currentEff
-    local calculatedStep = math.floor(math.abs(effDiff) * 0.12) + 1
+    local calculatedStep = math.floor(math.abs(effDiff) * 0.18) + 1
     
     if calculatedStep > 15 then
         calculatedStep = 15
@@ -164,18 +168,10 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Regelungsschleife
+-- 6. Regelungsschleife mit BLITZ-RECOVERY (ohne erzwungenen Notstopp)
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, efficiency, errorLevel = getReactorData()
-
-    if (errorLevel >= 100) then
-        pcall(function() reactor.stop() end)
-        redstone.setAnalogOutput("left", 0)
-        redstone.setAnalogOutput("right", 0)
-        stuckReason = "NOTSTOPP: Err>=100"
-        return
-    end
 
     if efficiency > maxEfficiencySeen then
         maxEfficiencySeen = efficiency
@@ -235,22 +231,20 @@ local function runControlLoop()
         local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
 
         if isSpontaneousJump then
-            local oldDistance = math.abs(TARGET_EFFICIENCY - lastEfficiency)
-            local newDistance = math.abs(TARGET_EFFICIENCY - newEfficiency)
-
-            if newDistance < oldDistance then
+            if effDelta < 0 then
+                -- EINBRUCH durch TR-Drift! -> BLITZ-RECOVERY EINLEITEN!
+                controlDirection = 1   
+                stepSize = 14          
+                stuckReason = "TR-Drift Einbruch! BLITZ-REC (+14)"
+            else
                 stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                 stuckReason = string.format("Sprung+, Ziel nah (Step %d)", stepSize)
-            else
-                controlDirection = -controlDirection
-                stepSize = 1
-                stuckReason = "Sprung-, weg -> Richtungsel."
             end
         else
             if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
                 controlDirection = -controlDirection
-                stepSize = 1
-                stuckReason = "Schlechter (>Tol) -> Wechsel"
+                stepSize = math.max(3, calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY))
+                stuckReason = "Sinkt (>Tol) -> Aggressiver Wechsel"
             elseif newEfficiency >= lastEfficiency then
                 stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                 stuckReason = string.format("Stabil/Besser -> Step %d", stepSize)
@@ -260,7 +254,7 @@ local function runControlLoop()
             end
         end
     else
-        stepSize = 2
+        stepSize = 3
         stuckReason = "Initialisierung"
     end
 
@@ -272,7 +266,6 @@ local function runControlLoop()
     local compactLog = string.format("#%03d|%s%d|EF:%.1f->%.1f|%s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, shortDiag)
     table.insert(logHistory, 1, compactLog)
     
-    -- Dynamische Anzahl an Log-Zeilen (nutzt den gesamten Platz ab Zeile 9 bis zum Bildschirmende)
     local maxLogLines = math.max(5, monitorHeight - 9)
     if #logHistory > maxLogLines then
         table.remove(logHistory)
@@ -347,7 +340,7 @@ local function drawUI()
     monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
     monitor.setTextColor(colors.white)
 
-    -- Zeile 7+: MONITOR-LOGS (Füllt den Rest des Bildschirms komplett aus!)
+    -- Zeile 7+: MONITOR-LOGS
     if ENABLE_MONITOR_LOGS then
         monitor.setCursorPos(1, 7)
         monitor.setTextColor(colors.lightGray)
