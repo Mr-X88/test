@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.1
+-- SCRIPT VERSION 2.3 (Reine Formel-Steuerung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.1"
+local SCRIPT_VERSION = "v2.3"
 
 local reactor = nil
 local monitor = nil
@@ -13,11 +13,11 @@ local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- EF-Schwelle: Ab hier stoppt die Regelung, bis es wieder sinkt
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
-local JUMP_THRESHOLD = 4.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
+local JUMP_THRESHOLD = 8.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 
 -- MONITOR LOG EINSTELLUNGEN
-local ENABLE_MONITOR_LOGS = true -- true (oder 1) = Logs auf Monitor anzeigen, false (oder 0) = Aus
-local MAX_LOG_LINES = 10        -- Maximale Anzahl an gleichzeitigen Log-Zeilen auf dem Monitor
+local ENABLE_MONITOR_LOGS = true -- true = Logs auf Monitor anzeigen, false = Aus
+local MAX_LOG_LINES = 10        -- Maximale Anzahl an Log-Zeilen
 
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
@@ -129,6 +129,7 @@ end
 
 -- Steuerungs-Funktion: Versucht adjustReactivity, nutzt Redstone als Fallback
 local function applyControlAction(direction, strength)
+    if strength > 15 then strength = 15 end
     local success = false
     
     if reactor and type(reactor.adjustReactivity) == "function" then
@@ -148,11 +149,16 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. Lineare Formel basierend auf den Tabellendaten (CR zu EF)[cite: 2]
+-- 5. Natürliche Formel-Steuerung (Proportional-Anpassung ohne künstlichen Deckel)
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
-    local calculatedStep = math.floor(math.abs(effDiff) / 5.0) + 1
     
+    -- Faktor 0.12 skaliert den Schritt organisch:
+    -- Bei 70% Differenz -> 70 * 0.12 = 8.4 -> Schritt von ca. 9 (sicher und effektiv)
+    -- Bei 10% Differenz -> 10 * 0.12 = 1.2 -> Schritt von 2 (feinfühlig)
+    local calculatedStep = math.floor(math.abs(effDiff) * 0.12) + 1
+    
+    -- Physikalische Signal-Obergrenze des Ports (1 bis 15)
     if calculatedStep > 15 then
         calculatedStep = 15
     elseif calculatedStep < 1 then
@@ -162,7 +168,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Hill-Climbing Regelung mit adjustReactivity & Fallback
+-- 6. Hill-Climbing Regelung mit reiner Formel-Dynamik
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, efficiency, errorLevel = getReactorData()
@@ -171,7 +177,7 @@ local function runControlLoop()
         pcall(function() reactor.stop() end)
         redstone.setAnalogOutput("left", 0)
         redstone.setAnalogOutput("right", 0)
-        stuckReason = "NOTSTOPP: Fehlerlevel >= 100"
+        stuckReason = "NOTSTOPP: Err>=100"
         return
     end
 
@@ -194,7 +200,7 @@ local function runControlLoop()
             redstone.setAnalogOutput("right", 0)
         end)
         lastEfficiency = 0 
-        stuckReason = "Reaktor in " .. statusText
+        stuckReason = "Reaktor " .. statusText
         sleep(1.0)
         return
     end
@@ -205,15 +211,14 @@ local function runControlLoop()
             redstone.setAnalogOutput("right", 0)
         end)
         lastEfficiency = efficiency
-        stuckReason = string.format("Ziel erreicht (>=%.1f%%) -> Pausiert", IDLE_THRESHOLD)
+        stuckReason = string.format("Ziel erreicht (>=%.1f%%)", IDLE_THRESHOLD)
         sleep(1.0)
         return
     end
 
-    -- Vor dem Befehl merken wir uns den Start-EF für das Log
     local startEffForLog = efficiency
 
-    -- Regelungsbefehl senden
+    -- Regelungsbefehl direkt über die Formel-Schrittweite senden
     applyControlAction(controlDirection, stepSize)
 
     currentSignal = currentSignal + (controlDirection * stepSize)
@@ -240,39 +245,40 @@ local function runControlLoop()
 
             if newDistance < oldDistance then
                 stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Sprung (+), Ziel näher -> Step %d", stepSize)
+                stuckReason = string.format("Sprung+, Ziel nah (Step %d)", stepSize)
             else
                 controlDirection = -controlDirection
                 stepSize = 1
-                stuckReason = "Sprung (-), weg -> Richtung gewechselt"
+                stuckReason = "Sprung-, weg -> Richtungsel."
             end
         else
             if newEfficiency < lastEfficiency then
                 controlDirection = -controlDirection
                 stepSize = 1
-                stuckReason = "Schlechter -> Richtung gewechselt"
+                stuckReason = "Schlechter -> Richtungswechsel"
             else
                 stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Tabellen-Formel -> Step %d", stepSize)
+                stuckReason = string.format("Formel -> Step %d", stepSize)
             end
         end
     else
         stepSize = 2
-        stuckReason = "Initialisierung (Suche)"
+        stuckReason = "Initialisierung"
     end
 
-    -- Kompakten Log-Eintrag erstellen und ganz oben in die Liste einfügen
+    lastEfficiency = newEfficiency
+
+    -- Kompakten und auf Monitorbreite optimierten Log-Eintrag erstellen
     local signChar = (controlDirection == 1) and "+" or "-"
-    local compactLog = string.format("#%03d | %s%d | EF:%.1f->%.1f | %s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, stuckReason)
+    local shortDiag = string.sub(stuckReason, 1, 16)
+    local compactLog = string.format("#%03d|%s%d|EF:%.1f->%.1f|%s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, shortDiag)
     table.insert(logHistory, 1, compactLog)
     if #logHistory > MAX_LOG_LINES then
         table.remove(logHistory)
     end
-
-    lastEfficiency = newEfficiency
 end
 
--- 7. Monitor grafisch zeichnen (mit kompakten Logs, falls aktiviert)
+-- 7. Monitor grafisch zeichnen
 local function drawUI()
     if not monitor then return end
 
@@ -350,11 +356,11 @@ local function drawUI()
     monitor.setTextColor(colors.cyan)
     monitor.write("Diag: " .. string.sub(stuckReason, 1, 24))
 
-    -- KOMPAKTE MONITOR-LOGS (Falls in den Einstellungen aktiviert)
+    -- MONITOR-LOGS (Auf Bildschirmbreite optimiert und gekürzt)
     if ENABLE_MONITOR_LOGS then
         monitor.setCursorPos(1, 15)
         monitor.setTextColor(colors.lightGray)
-        monitor.write("--- LETZTE ZYKLEN-LOGS ---")
+        monitor.write("--- ZYKLEN-LOGS ---")
 
         for i = 1, MAX_LOG_LINES do
             monitor.setCursorPos(1, 15 + i)
