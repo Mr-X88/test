@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.9 (Mit Ticks-Polling & Auto-Zyklus-Erkennung)
+-- SCRIPT VERSION 2.10 (Mit paralleler Hintergrund-Überwachung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.9"
+local SCRIPT_VERSION = "v2.10"
 
 local reactor = nil
 local monitor = nil
@@ -11,8 +11,7 @@ local monitor = nil
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 90.0     -- Sicherer Idle-Punkt bei 90%
-local POLL_INTERVAL_TICKS = 4  -- Abfrage-Intervall in Ticks (20 Ticks = 1 Sekunde). 10 Ticks = 0.5s
-local MAX_WAIT_TIME = 20.0      -- Sicherheits-Timeout in Sekunden, falls der Reaktor trödelt
+local POLL_INTERVAL_TICKS = 4  -- Abfrage-Intervall in Ticks (20 Ticks = 1s). 10 Ticks = 0.5s
 local STABILITY_EPSILON = 0.03  -- Ab welcher EF-Änderung gilt der Wert als "stabil"
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
@@ -30,6 +29,13 @@ local lastEfficiency = 0
 local maxEfficiencySeen = 0     
 local logCounter = 0
 local logHistory = {}           -- Speicher für die Monitor-Logs
+
+-- Live-Daten für den Hintergrund-Prozess
+local liveEF = 0
+local liveER = 0
+local liveCaseTemp = 0
+local liveIsRunning = false
+local cycleIsComplete = false
 
 -- Diagnose-Variable
 local stuckReason = "Warte auf Reaktor..."
@@ -170,229 +176,224 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- NEU: Dynamisches Polling in Ticks (wartet, bis sich der Reaktor-Wert eingependelt hat)
-local function waitForCycleCompletion()
-    local elapsedSeconds = 0
-    local pollSeconds = POLL_INTERVAL_TICKS / 20 -- Umrechnung Ticks in Sekunden (20 Ticks = 1s)
-    local _, _, initialEff = getReactorData()
-    local lastCheckedEff = initialEff
-    local stableChecksCount = 0
-    
-    while elapsedSeconds < MAX_WAIT_TIME do
-        sleep(pollSeconds)
-        elapsedSeconds = elapsedSeconds + pollSeconds
+-- PARALLELE HINTERGRUND-ÜBERWACHUNG (Läuft permanent im Ticks-Takt)
+local function backgroundSensorLoop()
+    local pollSeconds = POLL_INTERVAL_TICKS / 20 -- Umrechnung Ticks in Sekunden
+    local lastRecordedEF = 0
+    local stableCount = 0
+
+    while true do
+        local _, caseT, eff, err, running = getReactorData()
+        liveCaseTemp = caseT
+        liveEF = eff
+        liveER = err
+        liveIsRunning = running
         
-        local _, _, currentEff = getReactorData()
-        local diff = math.abs(currentEff - lastCheckedEff)
-        
-        -- Wenn sich der Wert kaum noch verändert hat (stabil ist)
+        updateStats(eff, err, caseT)
+
+        -- Prüfen ob sich der Wert eingependelt hat (Zyklus-Erkennung)
+        local diff = math.abs(eff - lastRecordedEF)
         if diff < STABILITY_EPSILON then
-            stableChecksCount = stableChecksCount + 1
-            -- Wenn er 3 Abfragen in Folge stabil geblieben ist, ist der Zyklus fertig!
-            if stableChecksCount >= 3 then
-                stuckReason = string.format("Zyklus fertig (%.1fs)", elapsedSeconds)
-                return currentEff
+            stableCount = stableCount + 1
+            if stableCount >= 3 then
+                cycleIsComplete = true
             end
         else
-            stableChecksCount = 0 -- Reset, falls er sich noch bewegt
+            stableCount = 0
         end
-        
-        lastCheckedEff = currentEff
-    end
-    
-    stuckReason = "Timeout (Max Wartezeit)"
-    local _, _, finalEff = getReactorData()
-    return finalEff
-end
+        lastRecordedEF = eff
 
--- 6. Regelungsschleife mit Auto-Zyklus-Erkennung
-local function runControlLoop()
-    logCounter = logCounter + 1
-    local _, caseTemp, efficiency, errorLevel = getReactorData()
-
-    if efficiency > maxEfficiencySeen then
-        maxEfficiencySeen = efficiency
-    end
-
-    local statusText = "STANDBY"
-    if efficiency > 0 then
-        statusText = "RUN"
-    elseif maxEfficiencySeen > 0 and efficiency == 0 then
-        statusText = "CRUSH"
-    else
-        statusText = "STANDBY"
-    end
-
-    if statusText == "STANDBY" or statusText == "CRUSH" then
-        pcall(function()
-            redstone.setAnalogOutput("left", 0)
-            redstone.setAnalogOutput("right", 0)
-        end)
-        lastEfficiency = 0 
-        stuckReason = "Reaktor " .. statusText
-        sleep(1.0)
-        return
-    end
-
-    if efficiency >= IDLE_THRESHOLD then
-        pcall(function()
-            redstone.setAnalogOutput("left", 0)
-            redstone.setAnalogOutput("right", 0)
-        end)
-        lastEfficiency = efficiency
-        stuckReason = string.format("Ziel erreicht (>=%.1f%%)", IDLE_THRESHOLD)
-        sleep(1.0)
-        return
-    end
-
-    local startEffForLog = efficiency
-
-    applyControlAction(controlDirection, stepSize)
-
-    currentSignal = currentSignal + (controlDirection * stepSize)
-    if currentSignal > 15 then 
-        currentSignal = 15 
-        controlDirection = -1 
-    elseif currentSignal < 1 then 
-        currentSignal = 1 
-        controlDirection = 1 
-    end
-
-    -- Warten per dynamischem Ticks-Polling, bis der Reaktor-Zyklus abgeschlossen ist
-    local newEfficiency = waitForCycleCompletion()
-
-    if lastEfficiency > 0 then
-        local effDelta = newEfficiency - lastEfficiency
-        local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
-
-        if isSpontaneousJump then
-            if effDelta < 0 then
-                controlDirection = 1   
-                stepSize = 14          
-                stuckReason = "TR-Drift Einbruch! BLITZ-REC (+14)"
-            else
-                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Sprung+, Ziel nah (Step %d)", stepSize)
-            end
-        else
-            if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
-                controlDirection = -controlDirection
-                stepSize = math.max(3, calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY))
-                stuckReason = "Sinkt (>Tol) -> Aggressiver Wechsel"
-            elseif newEfficiency >= lastEfficiency then
-                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Stabil/Besser -> Step %d", stepSize)
-            else
-                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Im Toleranzbereich -> Halte")
-            end
-        end
-    else
-        stepSize = 3
-        stuckReason = "Initialisierung"
-    end
-
-    lastEfficiency = newEfficiency
-
-    -- Log-Eintrag hinzufügen
-    local signChar = (controlDirection == 1) and "+" or "-"
-    local shortDiag = string.sub(stuckReason, 1, 18)
-    local compactLog = string.format("#%03d|%s%d|EF:%.1f->%.1f|%s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, shortDiag)
-    table.insert(logHistory, 1, compactLog)
-    
-    local maxLogLines = math.max(5, monitorHeight - 9)
-    if #logHistory > maxLogLines then
-        table.remove(logHistory)
+        sleep(pollSeconds)
     end
 end
 
--- 7. Monitor im Ultrakompakt-Layout zeichnen
-local function drawUI()
-    if not monitor then return end
+-- 6. Haupt-Regelungsschleife (Steuert den Reaktor im Hintergrund)
+local function controlLoop()
+    while true do
+        local efficiency = liveEF
+        local errorLevel = liveER
 
-    local logicMode, caseTemp, efficiency, errorLevel = getReactorData()
-    updateStats(efficiency, errorLevel, caseTemp)
+        if not liveIsRunning or efficiency == 0 and maxEfficiencySeen > 0 then
+            pcall(function()
+                redstone.setAnalogOutput("left", 0)
+                redstone.setAnalogOutput("right", 0)
+            end)
+            lastEfficiency = 0 
+            stuckReason = "Reaktor STANDBY/CRUSH"
+            sleep(1.0)
+        elseif efficiency >= IDLE_THRESHOLD then
+            pcall(function()
+                redstone.setAnalogOutput("left", 0)
+                redstone.setAnalogOutput("right", 0)
+            end)
+            lastEfficiency = efficiency
+            stuckReason = string.format("Ziel erreicht (>=%.1f%%)", IDLE_THRESHOLD)
+            sleep(1.0)
+        else
+            if efficiency > maxEfficiencySeen then
+                maxEfficiencySeen = efficiency
+            end
 
-    local statusText = "STANDBY"
-    if efficiency > 0 then
-        statusText = "RUN"
-    elseif maxEfficiencySeen > 0 and efficiency == 0 then
-        statusText = "CRUSH"
-    else
-        statusText = "STANDBY"
+            local startEffForLog = efficiency
+
+            -- Befehl senden
+            applyControlAction(controlDirection, stepSize)
+
+            currentSignal = currentSignal + (controlDirection * stepSize)
+            if currentSignal > 15 then 
+                currentSignal = 15 
+                controlDirection = -1 
+            elseif currentSignal < 1 then 
+                currentSignal = 1 
+                controlDirection = 1 
+            end
+
+            -- Warten, bis der Hintergrund-Sensor signalisiert, dass der Zyklus fertig ist
+            cycleIsComplete = false
+            local waitTimer = 0
+            while not cycleIsComplete and waitTimer < 20.0 do
+                sleep(0.2)
+                waitTimer = waitTimer + 0.2
+            end
+
+            local newEfficiency = liveEF
+
+            if lastEfficiency > 0 then
+                local effDelta = newEfficiency - lastEfficiency
+                local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
+
+                if isSpontaneousJump then
+                    if effDelta < 0 then
+                        controlDirection = 1   
+                        stepSize = 14          
+                        stuckReason = "TR-Drift Einbruch! BLITZ-REC (+14)"
+                    else
+                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                        stuckReason = string.format("Sprung+, Ziel nah (Step %d)", stepSize)
+                    end
+                else
+                    if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
+                        controlDirection = -controlDirection
+                        stepSize = math.max(3, calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY))
+                        stuckReason = "Sinkt (>Tol) -> Aggressiver Wechsel"
+                    elseif newEfficiency >= lastEfficiency then
+                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                        stuckReason = string.format("Stabil/Besser -> Step %d", stepSize)
+                    else
+                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                        stuckReason = string.format("Im Toleranzbereich -> Halte")
+                    end
+                end
+            else
+                stepSize = 3
+                stuckReason = "Initialisierung"
+            end
+
+            lastEfficiency = newEfficiency
+            logCounter = logCounter + 1
+
+            -- Log-Eintrag hinzufügen
+            local signChar = (controlDirection == 1) and "+" or "-"
+            local shortDiag = string.sub(stuckReason, 1, 18)
+            local compactLog = string.format("#%03d|%s%d|EF:%.1f->%.1f|%s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, shortDiag)
+            table.insert(logHistory, 1, compactLog)
+            
+            local maxLogLines = math.max(5, monitorHeight - 9)
+            if #logHistory > maxLogLines then
+                table.remove(logHistory)
+            end
+        end
     end
+end
 
-    monitor.setBackgroundColor(colors.black)
-    
-    -- Zeile 1: Titelleiste
-    monitor.setCursorPos(1, 1)
-    monitor.setBackgroundColor(colors.blue)
-    monitor.setTextColor(colors.white)
-    monitor.write(string.format("=== FUSION CONTROL %s ===", SCRIPT_VERSION))
-    monitor.setBackgroundColor(colors.black)
+-- 7. Monitor-UI Schleife (Aktualisiert den Monitor reibungslos)
+local function uiLoop()
+    while true do
+        if monitor then
+            local efficiency = liveEF
+            local caseTemp = liveCaseTemp
+            local errorLevel = liveER
 
-    -- Zeile 2: Status & EF
-    monitor.setCursorPos(1, 2)
-    monitor.clearLine()
-    monitor.write("Modus: ")
-    if efficiency >= IDLE_THRESHOLD then
-        monitor.setTextColor(colors.cyan)
-        monitor.write("IDLE ")
-    elseif statusText == "RUN" then
-        monitor.setTextColor(colors.green)
-        monitor.write("RUN  ")
-    elseif statusText == "CRUSH" then
-        monitor.setTextColor(colors.red)
-        monitor.write("CRUSH")
-    else
-        monitor.setTextColor(colors.orange)
-        monitor.write("STAND")
-    end
-    monitor.setTextColor(colors.white)
-    monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
+            local statusText = "STANDBY"
+            if efficiency > 0 then
+                statusText = "RUN"
+            elseif maxEfficiencySeen > 0 and efficiency == 0 then
+                statusText = "CRUSH"
+            else
+                statusText = "STANDBY"
+            end
 
-    -- Zeile 3: Case Temperatur & Error Level
-    monitor.setCursorPos(1, 3)
-    monitor.clearLine()
-    monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
-    monitor.write(" | ER: ")
-    if errorLevel > 50 then monitor.setTextColor(colors.red) end
-    monitor.write(string.format("%.1f%%", errorLevel))
-    monitor.setTextColor(colors.white)
+            monitor.setBackgroundColor(colors.black)
+            
+            -- Zeile 1: Titelleiste
+            monitor.setCursorPos(1, 1)
+            monitor.setBackgroundColor(colors.blue)
+            monitor.setTextColor(colors.white)
+            monitor.write(string.format("=== FUSION CONTROL %s ===", SCRIPT_VERSION))
+            monitor.setBackgroundColor(colors.black)
 
-    -- Zeile 4: Regelung & Signal
-    monitor.setCursorPos(1, 4)
-    monitor.clearLine()
-    local signText = (controlDirection == 1) and "+" or "-"
-    local sideText = (reactor and type(reactor.adjustReactivity) == "function") and "API" or ((controlDirection == 1) and "L" or "R")
-    monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
-
-    -- Zeile 5: Diagnose
-    monitor.setCursorPos(1, 5)
-    monitor.clearLine()
-    monitor.setTextColor(colors.cyan)
-    monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
-    monitor.setTextColor(colors.white)
-
-    -- Zeile 7+: MONITOR-LOGS
-    if ENABLE_MONITOR_LOGS then
-        monitor.setCursorPos(1, 7)
-        monitor.setTextColor(colors.lightGray)
-        monitor.write("--- ZYKLEN-LOGS ---")
-
-        local maxLogLines = math.max(5, monitorHeight - 8)
-        for i = 1, maxLogLines do
-            monitor.setCursorPos(1, 7 + i)
+            -- Zeile 2: Status & EF
+            monitor.setCursorPos(1, 2)
             monitor.clearLine()
-            if logHistory[i] then
-                monitor.write(logHistory[i])
+            monitor.write("Modus: ")
+            if efficiency >= IDLE_THRESHOLD then
+                monitor.setTextColor(colors.cyan)
+                monitor.write("IDLE ")
+            elseif statusText == "RUN" then
+                monitor.setTextColor(colors.green)
+                monitor.write("RUN  ")
+            elseif statusText == "CRUSH" then
+                monitor.setTextColor(colors.red)
+                monitor.write("CRUSH")
+            else
+                monitor.setTextColor(colors.orange)
+                monitor.write("STAND")
+            end
+            monitor.setTextColor(colors.white)
+            monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
+
+            -- Zeile 3: Case Temperatur & Error Level
+            monitor.setCursorPos(1, 3)
+            monitor.clearLine()
+            monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
+            monitor.write(" | ER: ")
+            if errorLevel > 50 then monitor.setTextColor(colors.red) end
+            monitor.write(string.format("%.1f%%", errorLevel))
+            monitor.setTextColor(colors.white)
+
+            -- Zeile 4: Regelung & Signal
+            monitor.setCursorPos(1, 4)
+            monitor.clearLine()
+            local signText = (controlDirection == 1) and "+" or "-"
+            local sideText = (reactor and type(reactor.adjustReactivity) == "function") and "API" or ((controlDirection == 1) and "L" or "R")
+            monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
+
+            -- Zeile 5: Diagnose
+            monitor.setCursorPos(1, 5)
+            monitor.clearLine()
+            monitor.setTextColor(colors.cyan)
+            monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
+            monitor.setTextColor(colors.white)
+
+            -- Zeile 7+: MONITOR-LOGS
+            if ENABLE_MONITOR_LOGS then
+                monitor.setCursorPos(1, 7)
+                monitor.setTextColor(colors.lightGray)
+                monitor.write("--- ZYKLEN-LOGS ---")
+
+                local maxLogLines = math.max(5, monitorHeight - 8)
+                for i = 1, maxLogLines do
+                    monitor.setCursorPos(1, 7 + i)
+                    monitor.clearLine()
+                    if logHistory[i] then
+                        monitor.write(logHistory[i])
+                    end
+                end
             end
         end
+        sleep(0.25) -- UI aktualisiert sich 4x pro Sekunde butterweich
     end
 end
 
--- 8. Hauptschleife
-while true do
-    runControlLoop()
-    drawUI()
-end
+-- 8. Parallele Ausführung aller drei Prozesse
+parallel.waitForAll(backgroundSensorLoop, controlLoop, uiLoop)
