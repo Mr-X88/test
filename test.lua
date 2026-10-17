@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.591 (Mit nicht-linearer Kurvenformel & ohne Full-Power-Distance)
+-- SCRIPT VERSION 2.61 (Log-Diagnose direkt aus Vorher/Nachher-Werten)
 -- ==========================================
-local SCRIPT_VERSION = "v2.591"
+local SCRIPT_VERSION = "v2.61"
 
 local reactor = nil
 local monitor = nil
@@ -213,7 +213,7 @@ local function applyControlAction(direction, strength)
     end
 end
 
--- 3. NEUE NICHT-LINEARE KURVEN-FORMEL (Basierend auf deinen Messwerten)
+-- 3. NICHT-LINEARE KURVEN-FORMEL (Basierend auf den Messwerten)
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
 
@@ -221,7 +221,6 @@ local function calculateStepFromTable(currentEff, targetEff)
         return 1
     end
 
-    -- Kurvenformel aus den Messpunkten
     local crNeeded = (0.0927 * effDiff) + (0.00464 * (effDiff ^ 2))
     local calculatedStep = math.floor(crNeeded)
 
@@ -234,7 +233,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung, Sekundenzähler & EF-Stabilitäts-Go)
+-- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn")
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -252,14 +251,12 @@ local function backgroundSensorLoop()
             hasEverRun = true
         end
 
-        -- Sekundenzähler läuft kontinuierlich im Hintergrund hoch
         secondCounter = secondCounter + POLL_INTERVAL_TICKS
         if secondCounter >= 20 then
             secondCounter = secondCounter - 20
             secondsSinceLastGo = secondsSinceLastGo + 1
         end
 
-        -- Go-Signal, wenn sich der EF-Wert innerhalb von 2 4-Ticken nicht ändert
         if lastPollEF >= 0 and math.abs(eff - lastPollEF) < 0.1 then
             unchangedPollCount = unchangedPollCount + 1
             if unchangedPollCount >= 2 then
@@ -271,7 +268,6 @@ local function backgroundSensorLoop()
         end
         lastPollEF = eff
 
-        -- Weckruf-Prüfung bei absolutem Stillstand
         if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
             wakeupTickCounter = wakeupTickCounter + POLL_INTERVAL_TICKS
             if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS then
@@ -282,7 +278,6 @@ local function backgroundSensorLoop()
             wakeupTickCounter = 0
         end
 
-        -- Trend- und Richtungs-Erkennung
         if not running or eff == 0 then
             stuckReason = (hasEverRun and eff == 0) and "CRASH erkannt!" or "Standby"
         elseif eff >= IDLE_THRESHOLD then
@@ -291,23 +286,18 @@ local function backgroundSensorLoop()
             if lastSensorEF > 0 then
                 local delta = eff - lastSensorEF
                 if math.abs(delta) >= JUMP_THRESHOLD then
-                    tickJumpOccurred = true
-                    tickJumpDelta = delta
                     if delta < 0 then
-                        controlDirection = -controlDirection
-                        stuckReason = "Tick-Einbruch (Wechsel)"
+                        stuckReason = "Einbruch"
                     else
-                        stuckReason = "Tick-Sprung (+)"
+                        stuckReason = "Sprung (+)"
                     end
                 else
                     if eff > lastSensorEF then
-                        stuckReason = string.format("Steigt (Richtung %d)", controlDirection)
+                        stuckReason = "Steigt"
                     elseif eff < (lastSensorEF - EFF_TOLERANCE) then
-                        controlDirection = -controlDirection
-                        stuckReason = "Sinkt -> Wechsel"
+                        stuckReason = "Sinkt"
                     else
-                        controlDirection = -controlDirection
-                        stuckReason = "Stillstand -> Wechsel"
+                        stuckReason = "Stillstand"
                     end
                 end
             else
@@ -327,15 +317,12 @@ end
 -- 5. AUSFÜHRUNGS-SCHLEIFE (Der "Arm" & Protokoll, wartet auf Go)
 local function executionLoop()
     while true do
-        -- Solange kein Go vorliegt, wird gewartet (währenddessen zählt der Sekundenzähler weiter)
         while not executionGo do
             sleep(0.05)
         end
         
-        -- Go sofort wieder verlieren
         executionGo = false
 
-        -- Gesammelte Sekunden sichern und Zähler auf 0 zurücksetzen
         local logSeconds = secondsSinceLastGo
         secondsSinceLastGo = 0
 
@@ -353,10 +340,7 @@ local function executionLoop()
                 maxEfficiencySeen = currentEfficiency
             end
 
-            -- Schrittgröße per Kurvenformel berechnen
             stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
-
-            -- Befehl an Reaktor / Relay ausführen
             applyControlAction(controlDirection, stepSize)
 
             currentSignal = currentSignal + (controlDirection * stepSize)
@@ -364,9 +348,27 @@ local function executionLoop()
 
             logCounter = logCounter + 1
 
+            -- Diagnostik & Logging basierend auf echtem Vorher/Nachher-Vergleich (nur wenn Logs aktiv)
             if ENABLE_MONITOR_LOGS then
+                local effDelta = currentEfficiency - startEffForLog
+                local cycleDiag = "Stillstand"
+
+                if math.abs(effDelta) >= JUMP_THRESHOLD then
+                    if effDelta > 0 then
+                        cycleDiag = "Sprung (+)"
+                    else
+                        cycleDiag = "Sprung (-)"
+                    end
+                elseif effDelta > EFF_TOLERANCE then
+                    cycleDiag = "Steigt"
+                elseif effDelta < -EFF_TOLERANCE then
+                    cycleDiag = "Sinkt"
+                else
+                    cycleDiag = "Stillstand"
+                end
+
                 local signChar = (controlDirection == 1) and "+" or "-"
-                local shortDiag = string.sub(stuckReason, 1, 10) 
+                local shortDiag = string.sub(cycleDiag, 1, 10) 
                 local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s", 
                     logCounter, signChar, stepSize, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
                 
@@ -377,7 +379,6 @@ local function executionLoop()
                 end
             end
         else
-            -- Bei Stillstand oder Idle alle Relays/Signale sicher auf 0 setzen
             pcall(function()
                 if relay then
                     for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
@@ -387,7 +388,6 @@ local function executionLoop()
             end)
         end
 
-        -- EF-Wert für den nächsten Log-Vergleich sichern
         previousLoggedEff = currentEfficiency
     end
 end
