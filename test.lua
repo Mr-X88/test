@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.38 (Vereinigter Idle/Stop & Intelligente Crash-Erkennung)
+-- SCRIPT VERSION 2.39 (Präzise Tick-Einbruchs-Erkennung & Formel-Regelung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.38"
+local SCRIPT_VERSION = "v2.39"
 
 local reactor = nil
 local monitor = nil
@@ -10,10 +10,10 @@ local monitor = nil
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 95.0     -- Ab hier direkt Idle & Stopp (ersetzt Hard-Stop)
+local IDLE_THRESHOLD = 95.0     -- Ab hier direkt Idle & Stopp
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0      -- Strikte Mindestwartezeit pro Zyklus in Sekunden
-local JUMP_THRESHOLD = 3.0      -- Schwellenwert für Tick-Sprünge
+local JUMP_THRESHOLD = 3.0      -- Schwellenwert für Tick-Sprünge/-Einbrüche
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
@@ -26,7 +26,7 @@ local controlDirection = 1      -- 1 = Links / Erhöhen (+), -1 = Rechts / Senke
 local stepSize = 4              -- Start-Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
-local hasEverRun = false        -- Merker, ob der Reaktor schon mal lief (für Crash-Erkennung)
+local hasEverRun = false        -- Merker für Crash-Erkennung
 local logCounter = 0
 local logHistory = {}           -- Speicher für die Monitor-Logs
 
@@ -177,7 +177,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks / 0.2s Takt mit Tick-Sprung-Analyse)
+-- VERBESSERTE PARALLELE HINTERGRUND-ÜBERWACHUNG (Erkennt abrupte Ticksprünge & -einbrüche sofort)
 local lastTickEF = 0
 local tickJumpOccurred = false
 local tickJumpDelta = 0
@@ -209,13 +209,12 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit vereinheitlichtem Idle-Stopp
+-- 6. Haupt-Regelungsschleife mit präziser Fallback- und Formel-Logik
 local function controlLoop()
     while true do
         local efficiency = liveEF
         local errorLevel = liveER
 
-        -- Crash-Erkennung & Status-Tracker im Hintergrund
         if efficiency > 0 then
             hasEverRun = true
         end
@@ -278,8 +277,9 @@ local function controlLoop()
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Sprung (+)"
                     else
-                        -- Negativer Tick-Sprung (Einbruch): Sofortige Richtungs-Umkehr
+                        -- Negativer Tick-Sprung (Einbruch): Richtung umkehren
                         controlDirection = -controlDirection
+                        -- Da wir die Richtung kennen, nutzen wir die normale Formel zur Berechnung statt starrem Fallback!
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Einbruch (Wechsel)"
                     end
@@ -298,6 +298,7 @@ local function controlLoop()
                     end
                 end
             else
+                -- Nur wenn wir im absoluten Init-Blindflug sind und ein Einbruch passiert, greift der +2 Fallback
                 if tickJumpOccurred and tickJumpDelta < 0 then
                     controlDirection = -controlDirection
                     stepSize = 2
@@ -328,7 +329,7 @@ local function controlLoop()
     end
 end
 
--- 7. Monitor-UI Schleife mit intelligenter CRASH-Anzeige
+-- 7. Monitor-UI Schleife
 local function uiLoop()
     while true do
         if monitor then
@@ -340,7 +341,7 @@ local function uiLoop()
             if efficiency > 0 then
                 statusText = "RUN"
             elseif hasEverRun and efficiency == 0 then
-                statusText = "CRUSH"  -- Neuer Crash-Status
+                statusText = "CRUSH"
             else
                 statusText = "STANDBY"
             end
