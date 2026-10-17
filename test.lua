@@ -250,4 +250,81 @@ local function uiRoutine()
                 monitor.write("PAUSIERT      ")
             elseif statusText == "RUN" then
                 monitor.setTextColor(colors.green)
-                monitor.write("
+                monitor.write("RUN           ")
+            elseif statusText == "CRUSH" then
+                monitor.setTextColor(colors.red)
+                monitor.write("CRUSH         ")
+            else
+                monitor.setTextColor(colors.yellow)
+                monitor.write("STANDBY       ")
+            end
+            monitor.setTextColor(colors.white)
+
+            monitor.setCursorPos(1, 5)
+            monitor.clearLine()
+            monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
+
+            monitor.setCursorPos(1, 7)
+            monitor.clearLine()
+            monitor.setTextColor(colors.yellow)
+            monitor.write(string.format("EF (Eff):  %.2f%% (Min:%.2f Max:%.2f)", efficiency, stats.minEff == math.huge and 0 or stats.minEff, stats.maxEff))
+            monitor.setTextColor(colors.white)
+
+            monitor.setCursorPos(1, 8)
+            monitor.clearLine()
+            if errorLevel > 50 then monitor.setTextColor(colors.red) end
+            monitor.write(string.format("ER (Err):  %.2f%% (Min:%.2f Max:%.2f)", errorLevel, stats.minErr == math.huge and 0 or stats.minErr, stats.maxErr))
+            monitor.setTextColor(colors.white)
+
+            monitor.setCursorPos(1, 10)
+            monitor.clearLine()
+            monitor.write("Fuel Type: D-T Fuel")
+
+            monitor.setCursorPos(1, 11)
+            monitor.clearLine()
+            local signText = (controlDirection == 1) and "+" or "-"
+            monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, REDSTONE_SIDE))
+
+            monitor.setCursorPos(1, 13)
+            monitor.clearLine()
+            monitor.setTextColor(colors.cyan)
+            monitor.write("Diag: " .. string.sub(stuckReason, 1, 30))
+
+            monitor.setBackgroundColor(colors.black)
+            monitor.setTextColor(colors.lightGray)
+        end
+        sleep(0.3)
+    end
+end
+
+-- C. Event-Routine für Benutzereingaben (Tastatur & Monitor-Klicks)
+local function eventRoutine()
+    while true do
+        local event, p1, p2, p3 = os.pullEvent()
+        if event == "key" then
+            -- Leertaste oder Enter schaltet Pause um
+            if p1 == keys.space or p1 == keys.enter then
+                isPaused = not isPaused
+                if isPaused then
+                    print("[INFO] Regelung PAUSIERT.")
+                else
+                    print("[INFO] Regelung GESTARTET.")
+                end
+            end
+        elseif event == "monitor_touch" then
+            -- Klick auf den Monitor schaltet ebenfalls die Pause um
+            isPaused = not isPaused
+            if isPaused then
+                print("[INFO] Regelung per Monitor PAUSIERT.")
+            else
+                print("[INFO] Regelung per Monitor GESTARTET.")
+            end
+        end
+    end
+end
+
+-- 7. Start aller drei Prozesse parallel
+print("Skript gestartet. Status: PAUSIERT.")
+print("Drücke LEERTASTE am Computer oder klicke auf den Monitor, um die Regelung zu starten.")
+
+parallel.waitForAll(controlRoutine, uiRoutine, eventRoutine)
