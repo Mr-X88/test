@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.32 (Strikte 5-Sekunden-Pausensicherung)
+-- SCRIPT VERSION 2.33 (Richtungs-Bug durch Signal-Clamp behoben)
 -- ==========================================
-local SCRIPT_VERSION = "v2.32"
+local SCRIPT_VERSION = "v2.33"
 
 local reactor = nil
 local monitor = nil
@@ -191,7 +191,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit unumstößlicher 5-Sekunden-Pausensicherung
+-- 6. Haupt-Regelungsschleife mit korrigierter Signal-Handhabung
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -225,17 +225,15 @@ local function controlLoop()
             -- Befehl an den Reaktor senden
             applyControlAction(controlDirection, stepSize)
 
+            -- Signal aktualisieren, ABER ohne die Richtung (controlDirection) zu manipulieren!
             currentSignal = currentSignal + (controlDirection * stepSize)
             if currentSignal > 15 then 
                 currentSignal = 15 
-                controlDirection = -1 
             elseif currentSignal < 1 then 
                 currentSignal = 1 
-                controlDirection = 1 
             end
 
-            -- UNUMSTÖSSLICHE PAUSENSICHERUNG: Der Reaktor bekommt GARANTIERT seine vollen 5 Sekunden Pause.
-            -- Hier bricht nichts vorzeitig ab.
+            -- Strikte 5-Sekunden-Pausensicherung
             local elapsedWait = 0
             while elapsedWait < MIN_CYCLE_WAIT do
                 sleep(0.25)
