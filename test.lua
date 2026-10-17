@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.33 (Richtungs-Bug durch Signal-Clamp behoben)
+-- SCRIPT VERSION 2.35 (Mid-Cycle Überwachung & Spät-Sprung +2 Fallback)
 -- ==========================================
-local SCRIPT_VERSION = "v2.33"
+local SCRIPT_VERSION = "v2.35"
 
 local reactor = nil
 local monitor = nil
@@ -14,7 +14,7 @@ local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0      -- Strikte Mindestwartezeit pro Zyklus in Sekunden
-local JUMP_THRESHOLD = 18.0     -- Schwellenwert für echte Reaktor-Sprüngen (>18%)
+local JUMP_THRESHOLD = 5.0      -- Schwellenwert für echte Reaktor-Sprüngen (>5%)
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
@@ -157,9 +157,11 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. Intelligente Formel
+-- 5. Intelligente Formel mit +15 Start-Boost unter 30% EF
 local function calculateStepFromTable(currentEff, targetEff)
-    if currentEff >= 85.0 then
+    if currentEff < 30.0 then
+        return 15  -- Unter 30% EF konsequent maximale Power (+15)
+    elseif currentEff >= 85.0 then
         return 1
     end
 
@@ -191,7 +193,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit korrigierter Signal-Handhabung
+-- 6. Haupt-Regelungsschleife mit Mid-Cycle Überwachung & Spät-Sprung Fallback
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -225,7 +227,7 @@ local function controlLoop()
             -- Befehl an den Reaktor senden
             applyControlAction(controlDirection, stepSize)
 
-            -- Signal aktualisieren, ABER ohne die Richtung (controlDirection) zu manipulieren!
+            -- Signal aktualisieren ohne Richtungs-Überschreibung
             currentSignal = currentSignal + (controlDirection * stepSize)
             if currentSignal > 15 then 
                 currentSignal = 15 
@@ -233,11 +235,22 @@ local function controlLoop()
                 currentSignal = 1 
             end
 
-            -- Strikte 5-Sekunden-Pausensicherung
+            -- UNUMSTÖSSLICHE PAUSENSICHERUNG mit Mid-Cycle Überwachung auf Spät-Sprünge
             local elapsedWait = 0
+            local lateJumpDetected = false
+            local preWaitEF = efficiency
+
             while elapsedWait < MIN_CYCLE_WAIT do
                 sleep(0.25)
                 elapsedWait = os.clock() - cycleStartTime
+                
+                -- Prüfen, ob ein Sprung erst in den letzten 1.5 Sekunden auftritt
+                local currentLiveEF = liveEF
+                if math.abs(currentLiveEF - preWaitEF) > JUMP_THRESHOLD then
+                    if elapsedWait >= (MIN_CYCLE_WAIT - 1.5) then
+                        lateJumpDetected = true
+                    end
+                end
             end
 
             local cycleDuration = os.clock() - cycleStartTime 
@@ -248,7 +261,11 @@ local function controlLoop()
                 local effDelta = newEfficiency - lastEfficiency
                 local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
 
-                if isSpontaneousJump then
+                if lateJumpDetected then
+                    -- Spät-Sprung Fallback: Sicherer +2 Schritt, da zu spät im Zyklus
+                    stepSize = 2
+                    stuckReason = "Spät-Sprung (+2)"
+                elseif isSpontaneousJump then
                     if effDelta < 0 then
                         controlDirection = 1   
                         stepSize = 12          
@@ -271,7 +288,7 @@ local function controlLoop()
                     end
                 end
             else
-                stepSize = 3
+                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                 stuckReason = "Init"
             end
 
@@ -370,7 +387,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("--- ZYKLEN-LOGS ---")
 
-                local maxLogLines = math.max(5, monitorHeight - 7)
+                let maxLogLines = math.max(5, monitorHeight - 7)
                 for i = 1, maxLogLines do
                     monitor.setCursorPos(1, 7 + i)
                     monitor.clearLine()
