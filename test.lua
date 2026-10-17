@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.74 (Mit intelligenter Trend- & Error-Richtungsumkehr)
+-- SCRIPT VERSION 2.75 (Mit 3s-Cooldown & 2x-Go Richtungswechsel)
 -- ==========================================
-local SCRIPT_VERSION = "v2.74"
+local SCRIPT_VERSION = "v2.75"
 
 local reactor = nil
 local monitor = nil
@@ -21,6 +21,7 @@ local lowPerfMultiplier = 1          -- Startet mit Multiplikator 1 (effektiv 4 
 local JUMP_THRESHOLD = 3.0           -- Unberührt für die kleine Sensor-Schleife
 local LOG_JUMP_THRESHOLD = 16.0      -- Eigene Schwelle für Sprünge im Log (ab 16)
 local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
+local EXECUTION_COOLDOWN = 3.0       -- Mindestens 3 Sekunden Pause zwischen Regelschritten/Logs
 
 -- ==========================================
 -- WECKRUF- / REDSTONE-RELAY EINSTELLUNGEN
@@ -51,6 +52,8 @@ local executionGo = false
 local lastPollEF = -1
 local unchangedPollCount = 0
 local previousLoggedEff = -1
+local lastExecutionTime = 0     -- Timer für die 3-Sekunden-Mindestdauer
+local consecutiveGoStuck = 0    -- Zählt aufeinanderfolgende Go-Signale ohne Effizienzänderung
 
 -- Variablen für die Redstone-Puls-Messung & Hysterese von unten
 local lastPulseTime = os.clock()
@@ -323,9 +326,8 @@ local function touchListenerLoop()
     end
 end
 
--- 6. ADAPTIVE SENSOR-SCHLEIFE (Mit intelligenter Trend- & Error-Prüfung)
+-- 6. ADAPTIVE SENSOR-SCHLEIFE
 local lastSensorEF = 0
-local lastSensorER = 0
 
 local function backgroundSensorLoop()
     while true do
@@ -342,24 +344,6 @@ local function backgroundSensorLoop()
         if eff > 0 then
             hasEverRun = true
         end
-
-        -- INTELLIGENTE RICHTUNGS-UMSCHALTUNG
-        if eff >= TARGET_EFFICIENCY then
-            controlDirection = -1 -- Ziel erreicht/überschritten -> Senken
-        elseif err > 20 and err > lastSensorER then
-            -- Error Level steigt trotz Steuerimpuls -> Notbremse: Richtung umkehren
-            controlDirection = -1
-        elseif lastSensorEF > 0 and math.abs(eff - lastSensorEF) < EFF_TOLERANCE and err > 15 then
-            -- Stillstand bei niedriger Effizienz + steigendem/hohem Error Level -> Umkehren!
-            controlDirection = (controlDirection == 1) and -1 or 1
-        else
-            -- Normalfall: Solange unter Ziel und stabil -> Erhöhen
-            if controlDirection == -1 and eff < TARGET_EFFICIENCY - 5 and err < 10 then
-                controlDirection = 1
-            end
-        end
-
-        lastSensorER = err
 
         secondCounter = secondCounter + effectiveTicks
         if secondCounter >= 20 then
@@ -425,7 +409,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 7. AUSFÜHRUNGS-SCHLEIFE (Führt den Schritt mit der angepassten Richtung aus)
+-- 7. AUSFÜHRUNGS-SCHLEIFE (Mit 3s-Cooldown & 2x-Go Richtungswechsel)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -433,6 +417,14 @@ local function executionLoop()
         end
         
         executionGo = false
+
+        -- 3-SEKUNDEN-MINDESTDAUER PRÜFUNG (Cooldown)
+        local currentTime = os.clock()
+        if (currentTime - lastExecutionTime) < EXECUTION_COOLDOWN then
+            -- Wenn noch keine 3 Sekunden vergangen sind, verwerfen wir diesen Ausführungs-Zyklus
+            goto continueExecution
+        end
+        lastExecutionTime = currentTime
 
         local logSeconds = secondsSinceLastGo
         secondsSinceLastGo = 0
@@ -451,13 +443,19 @@ local function executionLoop()
                 maxEfficiencySeen = currentEfficiency
             end
 
-            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
-            
-            -- Schutz bei hohem Error Level: Schrittweite abdämpfen
-            if errorLevel > 30 and stepSize > 4 then
-                stepSize = 4
+            -- 2x-GO RICHTUNGSWECHSEL BEI STILLSTAND / FESTHÄNGEN (z.B. bei 0 oder 100)
+            local effChange = math.abs(currentEfficiency - startEffForLog)
+            if effChange < 1.0 then
+                consecutiveGoStuck = consecutiveGoStuck + 1
+                if consecutiveGoStuck >= 2 then
+                    controlDirection = -controlDirection -- Richtung umkehren!
+                    consecutiveGoStuck = 0
+                end
+            else
+                consecutiveGoStuck = 0
             end
 
+            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
             applyControlAction(controlDirection, stepSize)
 
             currentSignal = currentSignal + (controlDirection * stepSize)
@@ -505,6 +503,8 @@ local function executionLoop()
         end
 
         previousLoggedEff = currentEfficiency
+        
+        ::continueExecution::
     end
 end
 
