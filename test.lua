@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.18 (Echte Zyklus- & Phasen-Erkennung)
+-- SCRIPT VERSION 2.19 (Mit erhöhtem Mindest-Cooldown von 5s)
 -- ==========================================
-local SCRIPT_VERSION = "v2.18"
+local SCRIPT_VERSION = "v2.19"
 
 local reactor = nil
 local monitor = nil
@@ -13,6 +13,7 @@ local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
+local MIN_CYCLE_WAIT = 5.0      -- Mindestwartezeit pro Zyklus in Sekunden (vorher 2-3s)
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
@@ -191,7 +192,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit echter Zyklus-Wartelogik
+-- 6. Haupt-Regelungsschleife mit 5s Mindestwartezeit
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -233,30 +234,27 @@ local function controlLoop()
                 controlDirection = 1 
             end
 
-            -- ECHTE ZYKLUS-ERKENNUNG (Verhindert 0s-Spam):
-            -- Wir geben dem Reaktor mindestens 2 Sekunden Zeit. 
-            -- Danach warten wir, bis der EF-Wert sich eingependelt hat oder max. 15 Sekunden vorüber sind.
+            -- ERHÖHTE MINDEST-WARTEZEIT (MIN_CYCLE_WAIT = 5.0 Sekunden)
             local elapsedWait = 0
             local lastObservedEF = liveEF
             local stableTicksCount = 0
             
-            while elapsedWait < 15.0 do
+            while elapsedWait < 20.0 do
                 sleep(0.3)
                 elapsedWait = elapsedWait + 0.3
                 
                 local currentLiveEF = liveEF
                 local diff = math.abs(currentLiveEF - lastObservedEF)
                 
-                -- Nach den ersten 2 Sekunden Mindestwartezeit auf Stabilität prüfen
-                if elapsedWait >= 2.0 then
+                -- Erst nach Ablauf der Mindestwartezeit (5 Sekunden) auf Stabilität prüfen
+                if elapsedWait >= MIN_CYCLE_WAIT then
                     if diff < 0.15 then
                         stableTicksCount = stableTicksCount + 1
-                        -- Wenn der Wert 3 Abfragen in Folge stabil bleibt, ist der Zyklus beendet!
                         if stableTicksCount >= 3 then
                             break
                         end
                     else
-                        stableTicksCount = 0 -- Reset, wenn er sich noch bewegt
+                        stableTicksCount = 0 
                     end
                 end
                 lastObservedEF = currentLiveEF
@@ -300,7 +298,6 @@ local function controlLoop()
             lastEfficiency = newEfficiency
             logCounter = logCounter + 1
 
-            -- Log-Eintrag mit sauberer Trennung (ER und Sekunden)
             if ENABLE_MONITOR_LOGS then
                 local signChar = (controlDirection == 1) and "+" or "-"
                 local shortDiag = string.sub(stuckReason, 1, 10) 
