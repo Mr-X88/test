@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.40 (Dynamische Restabstands-Formel & Tick-Intelligenz)
+-- SCRIPT VERSION 2.41 (Konfigurierbarer Voll-Power-Abstand & Tick-Intelligenz)
 -- ==========================================
-local SCRIPT_VERSION = "v2.40"
+local SCRIPT_VERSION = "v2.41"
 
 local reactor = nil
 local monitor = nil
@@ -9,12 +9,13 @@ local monitor = nil
 -- ==========================================
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
-local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 95.0     -- Ab hier direkt Idle & Stopp
-local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
-local MIN_CYCLE_WAIT = 5.0      -- Strikte Mindestwartezeit pro Zyklus in Sekunden
-local JUMP_THRESHOLD = 3.0      -- Schwellenwert für Tick-Sprünge/-Einbrüche
-local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
+local TARGET_EFFICIENCY = 100       -- Ziel-EF-Wert
+local IDLE_THRESHOLD = 95.0         -- Ab hier direkt Idle & Stopp
+local FULL_POWER_DISTANCE = 33      -- Ab wie viel Restabstand zum Ziel volle Power (+15) gefahren wird
+local POLL_INTERVAL_TICKS = 4       -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
+local MIN_CYCLE_WAIT = 5.0          -- Strikte Mindestwartezeit pro Zyklus in Sekunden
+local JUMP_THRESHOLD = 3.0          -- Schwellenwert für Tick-Sprünge/-Einbrüche
+local EFF_TOLERANCE = 0.8           -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
 local ENABLE_MONITOR_LOGS = true 
@@ -157,19 +158,19 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. NEUE DYNAMISCHE FORMEL (Skaliert fließend über den Restabstand effDiff)
+-- 5. DYNAMISCHE FORMEL (Nutzt die neue Einstellung FULL_POWER_DISTANCE)
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
 
-    -- Solange der Abstand zum Ziel groß ist (>= 25 Punkte), volle Power (+15)
-    if effDiff >= 25 then
+    -- Solange der Abstand zum Ziel >= FULL_POWER_DISTANCE ist, volle Power (+15)
+    if effDiff >= FULL_POWER_DISTANCE then
         return 15
     elseif effDiff <= 2 then
         return 1
     end
 
-    -- Fließende Skalierung im oberen Bereich (wenn effDiff von 25 auf 2 schrumpft)
-    local calculatedStep = math.floor((effDiff / 25) * 14) + 1
+    -- Fließende Skalierung im oberen Bereich
+    local calculatedStep = math.floor((effDiff / FULL_POWER_DISTANCE) * 14) + 1
     
     if calculatedStep > 15 then
         calculatedStep = 15
