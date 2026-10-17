@@ -1,8 +1,3 @@
-Hier ist das vollständige, aktualisierte Skript in Version **v2.65**.
-
-Es enthält nun die feste Basis-Variable `POLL_INTERVAL_TICKS = 4` kombiniert mit dem dynamischen `lowPerfMultiplier` (1, 2, 4 oder 8), der sich zur Laufzeit automatisch anpasst:
-
-```lua
 -- ==========================================
 -- SCRIPT VERSION 2.65 (Mit Basis-Ticks & dynamischem Multiplikator)
 -- ==========================================
@@ -513,5 +508,3 @@ end
 
 -- 7. Parallele Ausführung aller Prozesse
 parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
-
-```
