@@ -308,3 +308,172 @@ local function backgroundSensorLoop()
                     else
                         controlDirection = -controlDirection
                         stuckReason = "Stillstand -> Wechsel"
+                    end
+                end
+            else
+                stuckReason = "Init"
+            end
+        end
+
+        if eff > 0 then
+            lastSensorEF = eff
+        end
+
+        updateStats(eff, err, caseT)
+        sleep(pollSeconds)
+    end
+end
+
+-- 5. AUSFÜHRUNGS-SCHLEIFE (Der "Arm" & Protokoll, wartet auf Go)
+local function executionLoop()
+    while true do
+        -- Solange kein Go vorliegt, wird gewartet (währenddessen zählt der Sekundenzähler weiter)
+        while not executionGo do
+            sleep(0.05)
+        end
+        
+        -- Go sofort wieder verlieren
+        executionGo = false
+
+        -- Gesammelte Sekunden sichern und Zähler auf 0 zurücksetzen
+        local logSeconds = secondsSinceLastGo
+        secondsSinceLastGo = 0
+
+        local currentEfficiency = liveEF
+        local errorLevel = liveER
+
+        if previousLoggedEff < 0 then
+            previousLoggedEff = currentEfficiency
+        end
+
+        local startEffForLog = previousLoggedEff
+
+        if liveIsRunning and currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD then
+            if currentEfficiency > maxEfficiencySeen then
+                maxEfficiencySeen = currentEfficiency
+            end
+
+            -- Schrittgröße per Kurvenformel berechnen
+            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
+
+            -- Befehl an Reaktor / Relay ausführen
+            applyControlAction(controlDirection, stepSize)
+
+            currentSignal = currentSignal + (controlDirection * stepSize)
+            if currentSignal > 15 then currentSignal = 15 elseif currentSignal < 1 then currentSignal = 1 end
+
+            logCounter = logCounter + 1
+
+            if ENABLE_MONITOR_LOGS then
+                local signChar = (controlDirection == 1) and "+" or "-"
+                local shortDiag = string.sub(stuckReason, 1, 10) 
+                local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s", 
+                    logCounter, signChar, stepSize, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
+                
+                table.insert(logHistory, 1, compactLog)
+                local maxLogLines = math.max(5, monitorHeight - 7)
+                if #logHistory > maxLogLines then
+                    table.remove(logHistory)
+                end
+            end
+        else
+            -- Bei Stillstand oder Idle alle Relays/Signale sicher auf 0 setzen
+            pcall(function()
+                if relay then
+                    for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
+                else
+                    for _, side in ipairs(sides) do redstone.setAnalogOutput(side, 0) end
+                end
+            end)
+        end
+
+        -- EF-Wert für den nächsten Log-Vergleich sichern
+        previousLoggedEff = currentEfficiency
+    end
+end
+
+-- 6. MONITOR-UI SCHLEIFE (Anzeige)
+local function uiLoop()
+    while true do
+        if monitor then
+            local efficiency = liveEF
+            local caseTemp = liveCaseTemp
+            local errorLevel = liveER
+
+            local statusText = "STANDBY"
+            if efficiency > 0 then
+                statusText = "RUN"
+            elseif hasEverRun and efficiency == 0 then
+                statusText = "CRUSH"
+            else
+                statusText = "STANDBY"
+            end
+
+            monitor.setBackgroundColor(colors.black)
+            
+            monitor.setCursorPos(1, 1)
+            monitor.setBackgroundColor(colors.blue)
+            monitor.setTextColor(colors.white)
+            monitor.write(string.format("=== FUSION CONTROL %s ===", SCRIPT_VERSION))
+            monitor.setBackgroundColor(colors.black)
+
+            monitor.setCursorPos(1, 2)
+            monitor.clearLine()
+            monitor.write("Modus: ")
+            if efficiency >= IDLE_THRESHOLD then
+                monitor.setTextColor(colors.cyan)
+                monitor.write("IDLE ")
+            elseif statusText == "RUN" then
+                monitor.setTextColor(colors.green)
+                monitor.write("RUN  ")
+            elseif statusText == "CRUSH" then
+                monitor.setTextColor(colors.red)
+                monitor.write("CRUSH")
+            else
+                monitor.setTextColor(colors.orange)
+                monitor.write("STAND")
+            end
+            monitor.setTextColor(colors.white)
+            monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
+
+            monitor.setCursorPos(1, 3)
+            monitor.clearLine()
+            monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
+            monitor.write(" | ER: ")
+            if errorLevel > 50 then monitor.setTextColor(colors.red) end
+            monitor.write(string.format("%.1f%%", errorLevel))
+            monitor.setTextColor(colors.white)
+
+            monitor.setCursorPos(1, 4)
+            monitor.clearLine()
+            local signText = (controlDirection == 1) and "+" or "-"
+            local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
+            monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
+
+            monitor.setCursorPos(1, 5)
+            monitor.clearLine()
+            monitor.setTextColor(colors.cyan)
+            monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
+            monitor.setTextColor(colors.white)
+
+            if ENABLE_MONITOR_LOGS then
+                monitor.setCursorPos(1, 7)
+                monitor.setTextColor(colors.lightGray)
+                monitor.write("--- ZYKLEN-LOGS ---")
+
+                local maxLogLines = math.max(5, monitorHeight - 7)
+                for i = 1, maxLogLines do
+                    monitor.setCursorPos(1, 7 + i)
+                    monitor.clearLine()
+                    if logHistory[i] then
+                        monitor.write(logHistory[i])
+                    end
+                end
+            end
+        end
+        sleep(0.25)
+    end
+end
+
+-- 7. Parallele Ausführung aller Prozesse
+parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
