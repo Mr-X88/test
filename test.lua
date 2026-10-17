@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.70 (Mit Redstone-Puls-Log auf Seite 2)
+-- SCRIPT VERSION 2.71 (Mit klickbarem Log-Ein/Aus-Schalter)
 -- ==========================================
-local SCRIPT_VERSION = "v2.70"
+local SCRIPT_VERSION = "v2.71"
 
 local reactor = nil
 local monitor = nil
@@ -305,11 +305,22 @@ local function pulseListenerLoop()
     end
 end
 
--- 5. MONITOR-TOUCH LISTENER FÜR SEITENWECHSEL
+-- 5. MONITOR-TOUCH LISTENER FÜR SEITENWECHSEL & LOG-SCHALTER
 local function touchListenerLoop()
     while true do
-        os.pullEvent("monitor_touch")
-        currentPage = (currentPage == 1) and 2 or 1
+        local event, side, x, y = os.pullEvent("monitor_touch")
+        if currentPage == 1 then
+            if y == monitorHeight then
+                currentPage = 2
+            elseif y == 7 then
+                -- Klick auf die Log-Zeile schaltet Logs ein/aus
+                ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
+            end
+        elseif currentPage == 2 then
+            if y == monitorHeight then
+                currentPage = 1
+            end
+        end
     end
 end
 
@@ -473,7 +484,7 @@ local function executionLoop()
     end
 end
 
--- 8. MONITOR-UI SCHLEIFE (Zwei Seiten mit Klick-Navigation)
+-- 8. MONITOR-UI SCHLEIFE (Zwei Seiten mit Klick-Navigation & Log-Button)
 local function uiLoop()
     while true do
         if monitor then
@@ -541,11 +552,22 @@ local function uiLoop()
                 monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
                 monitor.setTextColor(colors.white)
 
+                -- Klickbarer Log-Header in Zeile 7
+                monitor.setCursorPos(1, 7)
+                monitor.clearLine()
+                monitor.setTextColor(colors.lightGray)
+                monitor.write("--- ZYKLEN-LOGS [")
                 if ENABLE_MONITOR_LOGS then
-                    monitor.setCursorPos(1, 7)
-                    monitor.setTextColor(colors.lightGray)
-                    monitor.write("--- ZYKLEN-LOGS ---")
+                    monitor.setTextColor(colors.green)
+                    monitor.write("AN")
+                else
+                    monitor.setTextColor(colors.red)
+                    monitor.write("AUS")
+                end
+                monitor.setTextColor(colors.lightGray)
+                monitor.write("] ---")
 
+                if ENABLE_MONITOR_LOGS then
                     local maxLogLines = math.max(5, monitorHeight - 8)
                     for i = 1, maxLogLines do
                         monitor.setCursorPos(1, 7 + i)
@@ -554,6 +576,10 @@ local function uiLoop()
                             monitor.write(logHistory[i])
                         end
                     end
+                else
+                    monitor.setCursorPos(1, 9)
+                    monitor.setTextColor(colors.gray)
+                    monitor.write("  (Logs sind deaktiviert)")
                 end
 
                 -- Footer / Button für Seitenwechsel
