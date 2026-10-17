@@ -1,7 +1,8 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.83
+-- BETTER FUSION REACTOR CONTROLLER v2.83 (Modifiziert)
 -- Änderungen:
---   * Kein TARGET_EFFICIENCY mehr; IDLE_THRESHOLD ist die einzige Grenze.
+--   * Fester Wert 100 als Bezugspunkt für die Schrittformel in calculateStep.
+--   * IDLE_THRESHOLD bleibt unverändert als Abschaltgrenze erhalten.
 --   * Adaptive Sensorabfrage 4/8/16/32 Ticks anhand der bottom-Impulsabstände.
 --   * Impuls- und Zykluslogs enthalten weiterhin Zeit-, Faktor-, EF- und ER-Werte.
 --   * Gleichheit wird exakt mit == geprüft.
@@ -12,7 +13,7 @@
 --   * Monitor wird ohne vollständiges Löschen jedes Frames aktualisiert.
 --   * Weckimpuls wird unabhängig von der variablen Sensorabfrage beendet.
 -- ============================================================
-local SCRIPT_VERSION = "v2.83"
+local SCRIPT_VERSION = "v2.83-fixed100"
 
 local reactor = nil
 local monitor = nil
@@ -20,7 +21,7 @@ local relay = nil
 local monitorHeight = 25
 
 -- ==================== EINSTELLUNGEN ====================
-local IDLE_THRESHOLD = 95.0          -- Ab hier keine weiteren Regelschritte
+local IDLE_THRESHOLD = 95.0          -- Ab hier keine weiteren Regelschritte (Abschaltgrenze)
 
 -- Adaptive Sensorabfrage wie in v2.81:
 -- 4 Ticks (x1), 8 Ticks (x2), 16 Ticks (x4), 32 Ticks (x8).
@@ -249,7 +250,6 @@ local function getReactorData()
             end
         end
     elseif efficiency > 0 then
-        -- Fallback, falls getLogicMode/getStatus nicht unterstützt werden.
         isRunning = true
     end
 
@@ -258,7 +258,8 @@ end
 
 -- ==================== REGELSCHRITT BERECHNEN ====================
 local function calculateStep(currentEff)
-    local difference = IDLE_THRESHOLD - currentEff
+    -- Fester Wert 100 als Bezugspunkt für die Schrittformel statt IDLE_THRESHOLD
+    local difference = 100 - currentEff
     if difference <= 0 then return 1 end
 
     local rawStep = (0.0927 * difference) + (0.00464 * (difference ^ 2))
@@ -270,7 +271,6 @@ end
 
 -- Richtungssteuerung bevorzugt direkt den Logic-Adapter. Falls das nicht
 -- verfügbar ist, kommt ein kurzer analoger Impuls auf allen Relay-Seiten.
--- Es gibt absichtlich KEINEN Computer-redstone.setAnalogOutput()-Fallback.
 local function applyControlAction(direction, strength)
     strength = math.max(1, math.min(15, math.floor(strength)))
 
@@ -292,7 +292,7 @@ local function applyControlAction(direction, strength)
         return false, "Relay-Ausgabe fehlgeschlagen"
     end
 
-    sleep(0.1) -- gewollter kurzer Steuerimpuls
+    sleep(0.1)
     local stopOK = setRelayAll(0, false)
     if not stopOK then
         return false, "Relay konnte Impuls nicht sicher zurücksetzen"
@@ -301,8 +301,6 @@ local function applyControlAction(direction, strength)
 end
 
 -- ==================== REDSTONE-EINGANGS-LISTENER ====================
--- bottom wird ausschließlich am Computer als Eingang ausgewertet. Es wird
--- nur eine steigende Flanke als neuer Impuls gezählt.
 local function pulseListenerLoop()
     lastBottomState = redstone.getInput("bottom")
 
@@ -310,7 +308,6 @@ local function pulseListenerLoop()
         os.pullEvent("redstone")
         local bottomNow = redstone.getInput("bottom")
 
-        -- Nur die steigende Flanke am Computer-Eingang bottom zählt als Impuls.
         if bottomNow and not lastBottomState then
             local now = os.clock()
             local deltaT = now - lastPulseTime
@@ -334,7 +331,6 @@ local function pulseListenerLoop()
 
                 lastDesiredMultiplier = desiredMultiplier
 
-                -- Hysterese: Multiplikator erst nach drei passenden Impulsen ändern.
                 if desiredMultiplier ~= lowPerfMultiplier then
                     if desiredMultiplier == pulseTargetMultiplier then
                         pulseStreakCount = pulseStreakCount + 1
@@ -387,14 +383,13 @@ local function touchListenerLoop()
     end
 end
 
--- ==================== ADAPTIVE SENSOR-SCHLEIFE: 4/8/16/32 TICKS ====================
+-- ==================== ADAPTIVE SENSOR-SCHLEIFE ====================
 local lastSensorEF = nil
 
 local function backgroundSensorLoop()
     while true do
         stopWakeupPulseIfDue()
 
-        -- Den aktuell gewählten Takt für diese Sensoriteration verwenden.
         local multiplier = ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1
         local effectiveTicks = POLL_INTERVAL_TICKS * multiplier
         local pollSeconds = effectiveTicks / 20
@@ -409,16 +404,12 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            -- Richtungsumkehr bleibt trendbasiert. IDLE_THRESHOLD ist die einzige
-            -- Effizienzgrenze; ab dort werden keine Regelschritte ausgeführt.
             if eff < IDLE_THRESHOLD and lastSensorEF ~= nil and lastSensorEF > 0 then
                 if (eff - lastSensorEF) < -EFF_TOLERANCE then
                     controlDirection = -controlDirection
                 end
             end
 
-            -- Stillstandserkennung anhand exakt gleicher Messwerte.
-            -- Die ursprüngliche Zeitlogik (10 Iterationen + 2 Iterationen) bleibt.
             if running and eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
                 stuckPollCount = stuckPollCount + 1
@@ -433,8 +424,6 @@ local function backgroundSensorLoop()
             end
             lastSensorEFForStuck = eff
 
-            -- Timer bleibt wie zuvor; der Bonus wird hier NICHT gelöscht.
-            -- Er bleibt bestehen, bis applyControlAction einen Schritt erfolgreich ausführt.
             if stuckNudgeActive then
                 stuckNudgeCounter = stuckNudgeCounter - 1
                 if stuckNudgeCounter <= 0 then
@@ -448,7 +437,6 @@ local function backgroundSensorLoop()
                 secondsSinceLastGo = secondsSinceLastGo + 1
             end
 
-            -- Genau gleicher Messwert (kein EFF_TOLERANCE/0,1-Schwellwert).
             if lastPollEF ~= nil and eff == lastPollEF then
                 unchangedPollCount = unchangedPollCount + 1
                 if unchangedPollCount >= 2 then
@@ -509,7 +497,6 @@ local function executionLoop()
             executionGo = false
             local now = os.clock()
 
-            -- Kein goto: Cooldown blockiert nur diesen Regelschritt, nicht den Thread.
             if (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
                 local currentEfficiency = liveEF
                 local errorLevel = liveER
@@ -531,7 +518,6 @@ local function executionLoop()
                         lastAppliedStep = effectiveStep
                         lastAppliedDirection = actionDirection
                         lastActionMode = modeOrError
-                        -- Bonus erst nach tatsächlich erfolgreich ausgeführtem Schritt verbrauchen.
                         if stuckNudgeBonus > 0 then stuckNudgeBonus = 0 end
 
                         logCounter = logCounter + 1
@@ -580,8 +566,6 @@ local function executionLoop()
 end
 
 -- ==================== WECKIMPULS-TIMER ====================
--- Die Impulsdauer bleibt 0,5 Sekunden, auch wenn die Sensorabfrage auf
--- 16 oder 32 Ticks verlangsamt wurde.
 local function wakeupPulseTimerLoop()
     while true do
         if wakeupPulseActive then
