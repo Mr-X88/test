@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.411 (Konfigurierbarer Voll-Power-Abstand & Tick-Intelligenz)
+-- SCRIPT VERSION 2.42 (Deadlock-Schutz & Echte Steigerungs-Prüfung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.41"
+local SCRIPT_VERSION = "v2.42"
 
 local reactor = nil
 local monitor = nil
@@ -158,18 +158,16 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. DYNAMISCHE FORMEL (Nutzt die neue Einstellung FULL_POWER_DISTANCE)
+-- 5. DYNAMISCHE FORMEL
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
 
-    -- Solange der Abstand zum Ziel >= FULL_POWER_DISTANCE ist, volle Power (+15)
     if effDiff >= FULL_POWER_DISTANCE then
         return 15
     elseif effDiff <= 2 then
         return 1
     end
 
-    -- Fließende Skalierung im oberen Bereich
     local calculatedStep = math.floor((effDiff / FULL_POWER_DISTANCE) * 14) + 1
     
     if calculatedStep > 15 then
@@ -213,7 +211,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife
+-- 6. Haupt-Regelungsschleife mit Deadlock-Schutz
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -285,16 +283,14 @@ local function controlLoop()
                         stuckReason = "Tick-Einbruch (Wechsel)"
                     end
                 else
-                    if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
+                    -- DEADLOCK-SCHUTZ: Nur bei ECHTER Steigerung Kurs halten. Bei Stillstand/Hänger sofort Wechsel!
+                    if newEfficiency > lastEfficiency then
+                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                        stuckReason = string.format("Steigt -> Step %d", stepSize)
+                    else
                         controlDirection = -controlDirection
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = "Sinkt -> Wechsel"
-                    elseif newEfficiency >= lastEfficiency then
-                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = string.format("Stabil -> Step %d", stepSize)
-                    else
-                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = "Toleranz -> Halte"
+                        stuckReason = "Stillstand -> Wechsel"
                     end
                 end
             else
