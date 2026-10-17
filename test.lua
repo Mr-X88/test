@@ -1,4 +1,4 @@
--- Better Fusion Reactor Controller for CC:Tweaked
+-- Better Fusion Reactor Controller for CC:Tweaked V1.0.1
 -- Optimized monitor refresh + adaptive efficiency hill-climbing
 -- Native adjustReactivity() is used when available; otherwise left/right redstone pulses.
 
