@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.66 (Mit 3-Zyklen-Hysterese für den Adaptiv-Modus)
+-- SCRIPT VERSION 2.67 (Mit präziser Sekunden-Bereichs-Hysterese)
 -- ==========================================
-local SCRIPT_VERSION = "v2.66"
+local SCRIPT_VERSION = "v2.67"
 
 local reactor = nil
 local monitor = nil
@@ -16,7 +16,7 @@ local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
 -- ADAPTIVE / LOW PERFORMANCE EINSTELLUNGEN
 local ENABLE_LOW_PERF_MODE = true    -- Schaltet die automatische Takt-Anpassung ein/aus
 local POLL_INTERVAL_TICKS = 4        -- Feste Basis-Tickrate (0.2 Sekunden)
-local lowPerfMultiplier = 1          -- Dynamischer Multiplikator (1, 2, 4, 8 -> effektiv 4, 8, 16, 32 Ticks)
+local lowPerfMultiplier = 1          -- Startet mit Multiplikator 1 (effektiv 4 Ticks)
 
 local JUMP_THRESHOLD = 3.0           -- Unberührt für die kleine Sensor-Schleife
 local LOG_JUMP_THRESHOLD = 16.0      -- Eigene Schwelle für Sprünge im Log (ab 16)
@@ -54,8 +54,8 @@ local previousLoggedEff = -1
 
 -- Variablen für die Go-Frequenz-Messung & Hysterese (Low Performance Mode)
 local goIntervalTracker = 0
-local highFreqCycles = 0
-local lowFreqCycles = 0
+local targetMultiplier = 1
+local streakCount = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -244,7 +244,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. ADAPTIVE SENSOR-SCHLEIFE (Mit 3-Zyklen-Hysterese)
+-- 4. ADAPTIVE SENSOR-SCHLEIFE (Mit Sekunden-Bereichs-Hysterese)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -276,33 +276,36 @@ local function backgroundSensorLoop()
                 executionGo = true
                 unchangedPollCount = 0
                 
-                -- Adaptives Anpassen des Multiplikators mit 3-Zyklen-Prüfung
+                -- Adaptives Anpassen nach Sekundebereichen mit 3-Zyklen-Hysterese
                 if ENABLE_LOW_PERF_MODE then
-                    local currentTicksBetweenGo = goIntervalTracker
+                    local secondsBetweenGo = goIntervalTracker / 20
                     goIntervalTracker = 0 
                     
-                    if currentTicksBetweenGo > 0 and currentTicksBetweenGo < 30 then
-                        highFreqCycles = highFreqCycles + 1
-                        lowFreqCycles = 0
-                        if highFreqCycles > 3 then
-                            if lowPerfMultiplier == 1 then lowPerfMultiplier = 2
-                            elseif lowPerfMultiplier == 2 then lowPerfMultiplier = 4
-                            elseif lowPerfMultiplier == 4 then lowPerfMultiplier = 8 end
-                            highFreqCycles = 0 -- Zähler nach Umschaltung zurücksetzen
-                        end
-                    elseif currentTicksBetweenGo > 80 then
-                        lowFreqCycles = lowFreqCycles + 1
-                        highFreqCycles = 0
-                        if lowFreqCycles > 3 then
-                            if lowPerfMultiplier > 1 then 
-                                lowPerfMultiplier = lowPerfMultiplier / 2 
+                    local desiredMultiplier = 1
+                    if secondsBetweenGo <= 4 then
+                        desiredMultiplier = 1 -- 0-4s -> mal 1 (4t)
+                    elseif secondsBetweenGo <= 8 then
+                        desiredMultiplier = 2 -- 5-8s -> mal 2 (8t)
+                    elseif secondsBetweenGo <= 18 then
+                        desiredMultiplier = 4 -- 9-18s -> mal 4 (16t)
+                    else
+                        desiredMultiplier = 8 -- 19-32s -> mal 8 (32t)
+                    end
+                    
+                    if desiredMultiplier ~= lowPerfMultiplier then
+                        if desiredMultiplier == targetMultiplier then
+                            streakCount = streakCount + 1
+                            if streakCount >= 3 then
+                                lowPerfMultiplier = desiredMultiplier
+                                streakCount = 0
                             end
-                            lowFreqCycles = 0 -- Zähler nach Umschaltung zurücksetzen
+                        else
+                            targetMultiplier = desiredMultiplier
+                            streakCount = 1
                         end
                     else
-                        -- Wenn im normalen Bereich, Zähler zurücksetzen
-                        highFreqCycles = 0
-                        lowFreqCycles = 0
+                        targetMultiplier = lowPerfMultiplier
+                        streakCount = 0
                     end
                 end
             end
