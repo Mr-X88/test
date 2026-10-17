@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.8.1 (Ohne Notstopp, mit Blitz-Recovery)
+-- SCRIPT VERSION 2.9 (Mit Ticks-Polling & Auto-Zyklus-Erkennung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.8"
+local SCRIPT_VERSION = "v2.9"
 
 local reactor = nil
 local monitor = nil
@@ -10,14 +10,16 @@ local monitor = nil
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 90.0     -- Sicherer Idle-Punkt bei 90% (verhindert 95%-Crashs)
-local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
+local IDLE_THRESHOLD = 90.0     -- Sicherer Idle-Punkt bei 90%
+local POLL_INTERVAL_TICKS = 10  -- Abfrage-Intervall in Ticks (20 Ticks = 1 Sekunde). 10 Ticks = 0.5s
+local MAX_WAIT_TIME = 20.0      -- Sicherheits-Timeout in Sekunden, falls der Reaktor trödelt
+local STABILITY_EPSILON = 0.03  -- Ab welcher EF-Änderung gilt der Wert als "stabil"
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
-local ENABLE_MONITOR_LOGS = true -- true = Logs auf Monitor anzeigen, false = Aus
+local ENABLE_MONITOR_LOGS = true 
 local monitorWidth, monitorHeight = 39, 25
 
 -- Regelungs-Variablen
@@ -150,7 +152,7 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. Intelligente Formel mit dynamischer Skalierung
+-- 5. Intelligente Formel
 local function calculateStepFromTable(currentEff, targetEff)
     if currentEff >= 85.0 then
         return 1
@@ -168,7 +170,42 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Regelungsschleife mit BLITZ-RECOVERY (ohne erzwungenen Notstopp)
+-- NEU: Dynamisches Polling in Ticks (wartet, bis sich der Reaktor-Wert eingependelt hat)
+local function waitForCycleCompletion()
+    local elapsedSeconds = 0
+    local pollSeconds = POLL_INTERVAL_TICKS / 20 -- Umrechnung Ticks in Sekunden (20 Ticks = 1s)
+    local _, _, initialEff = getReactorData()
+    local lastCheckedEff = initialEff
+    local stableChecksCount = 0
+    
+    while elapsedSeconds < MAX_WAIT_TIME do
+        sleep(pollSeconds)
+        elapsedSeconds = elapsedSeconds + pollSeconds
+        
+        local _, _, currentEff = getReactorData()
+        local diff = math.abs(currentEff - lastCheckedEff)
+        
+        -- Wenn sich der Wert kaum noch verändert hat (stabil ist)
+        if diff < STABILITY_EPSILON then
+            stableChecksCount = stableChecksCount + 1
+            -- Wenn er 3 Abfragen in Folge stabil geblieben ist, ist der Zyklus fertig!
+            if stableChecksCount >= 3 then
+                stuckReason = string.format("Zyklus fertig (%.1fs)", elapsedSeconds)
+                return currentEff
+            end
+        else
+            stableChecksCount = 0 -- Reset, falls er sich noch bewegt
+        end
+        
+        lastCheckedEff = currentEff
+    end
+    
+    stuckReason = "Timeout (Max Wartezeit)"
+    local _, _, finalEff = getReactorData()
+    return finalEff
+end
+
+-- 6. Regelungsschleife mit Auto-Zyklus-Erkennung
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, efficiency, errorLevel = getReactorData()
@@ -221,10 +258,8 @@ local function runControlLoop()
         controlDirection = 1 
     end
 
-    stuckReason = string.format("Cooldown (%.1fs)...", COOLDOWN_WAIT)
-    sleep(COOLDOWN_WAIT)
-
-    local _, _, newEfficiency = getReactorData()
+    -- Warten per dynamischem Ticks-Polling, bis der Reaktor-Zyklus abgeschlossen ist
+    local newEfficiency = waitForCycleCompletion()
 
     if lastEfficiency > 0 then
         local effDelta = newEfficiency - lastEfficiency
@@ -232,7 +267,6 @@ local function runControlLoop()
 
         if isSpontaneousJump then
             if effDelta < 0 then
-                -- EINBRUCH durch TR-Drift! -> BLITZ-RECOVERY EINLEITEN!
                 controlDirection = 1   
                 stepSize = 14          
                 stuckReason = "TR-Drift Einbruch! BLITZ-REC (+14)"
