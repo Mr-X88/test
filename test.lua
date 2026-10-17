@@ -1,7 +1,12 @@
+Hier ist das vollständige, aktualisierte Skript in Version **v2.65**.
+
+Es enthält nun die feste Basis-Variable `POLL_INTERVAL_TICKS = 4` kombiniert mit dem dynamischen `lowPerfMultiplier` (1, 2, 4 oder 8), der sich zur Laufzeit automatisch anpasst:
+
+```lua
 -- ==========================================
--- SCRIPT VERSION 2.63 (Vollständig und fehlerfrei)
+-- SCRIPT VERSION 2.65 (Mit Basis-Ticks & dynamischem Multiplikator)
 -- ==========================================
-local SCRIPT_VERSION = "v2.63"
+local SCRIPT_VERSION = "v2.65"
 
 local reactor = nil
 local monitor = nil
@@ -12,7 +17,12 @@ local relay = nil
 -- ==========================================
 local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
-local POLL_INTERVAL_TICKS = 4        -- Sensor-Intervall (0.2 Sekunden)
+
+-- ADAPTIVE / LOW PERFORMANCE EINSTELLUNGEN
+local ENABLE_LOW_PERF_MODE = true    -- Schaltet die automatische Takt-Anpassung ein/aus
+local POLL_INTERVAL_TICKS = 4        -- Feste Basis-Tickrate (0.2 Sekunden)
+local lowPerfMultiplier = 1          -- Dynamischer Multiplikator (1, 2, 4, 8 -> effektiv 4, 8, 16, 32 Ticks)
+
 local JUMP_THRESHOLD = 3.0           -- Unberührt für die kleine Sensor-Schleife
 local LOG_JUMP_THRESHOLD = 16.0      -- Eigene Schwelle für Sprünge im Log (ab 16)
 local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
@@ -46,6 +56,9 @@ local executionGo = false
 local lastPollEF = -1
 local unchangedPollCount = 0
 local previousLoggedEff = -1
+
+-- Variablen für die Go-Frequenz-Messung (Low Performance Mode)
+local goIntervalTracker = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -234,13 +247,14 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Unberührt)
+-- 4. ADAPTIVE SENSOR-SCHLEIFE (Mit Basis-Ticks * Multiplikator)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
-    local pollSeconds = POLL_INTERVAL_TICKS / 20  -- 0.2 Sekunden
-
     while true do
+        local effectiveTicks = POLL_INTERVAL_TICKS * lowPerfMultiplier
+        local pollSeconds = effectiveTicks / 20  
+        
         local _, caseT, eff, err, running = getReactorData()
         
         liveCaseTemp = caseT
@@ -252,25 +266,46 @@ local function backgroundSensorLoop()
             hasEverRun = true
         end
 
-        secondCounter = secondCounter + POLL_INTERVAL_TICKS
+        secondCounter = secondCounter + effectiveTicks
         if secondCounter >= 20 then
             secondCounter = secondCounter - 20
             secondsSinceLastGo = secondsSinceLastGo + 1
         end
 
+        -- Go-Signal Erkennung
         if lastPollEF >= 0 and math.abs(eff - lastPollEF) < 0.1 then
             unchangedPollCount = unchangedPollCount + 1
             if unchangedPollCount >= 2 then
                 executionGo = true
                 unchangedPollCount = 0
+                
+                -- Adaptives Anpassen des Multiplikators basierend auf der Go-Frequenz
+                if ENABLE_LOW_PERF_MODE then
+                    local currentTicksBetweenGo = goIntervalTracker
+                    goIntervalTracker = 0 
+                    
+                    if currentTicksBetweenGo > 0 and currentTicksBetweenGo < 30 then
+                        if lowPerfMultiplier == 1 then lowPerfMultiplier = 2
+                        elseif lowPerfMultiplier == 2 then lowPerfMultiplier = 4
+                        elseif lowPerfMultiplier == 4 then lowPerfMultiplier = 8 end
+                    elseif currentTicksBetweenGo > 80 then
+                        if lowPerfMultiplier > 1 then 
+                            lowPerfMultiplier = lowPerfMultiplier / 2 
+                        end
+                    end
+                end
             end
         else
             unchangedPollCount = 0
         end
         lastPollEF = eff
 
+        if ENABLE_LOW_PERF_MODE then
+            goIntervalTracker = goIntervalTracker + effectiveTicks
+        end
+
         if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
-            wakeupTickCounter = wakeupTickCounter + POLL_INTERVAL_TICKS
+            wakeupTickCounter = wakeupTickCounter + effectiveTicks
             if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS then
                 wakeupTickCounter = 0
                 sendWakeupPulse()
@@ -392,13 +427,14 @@ local function executionLoop()
     end
 end
 
--- 6. MONITOR-UI SCHLEIFE (Anzeige)
+-- 6. MONITOR-UI SCHLEIFE (Anzeige mit dynamischem Tick-Anzeiger)
 local function uiLoop()
     while true do
         if monitor then
             local efficiency = liveEF
             local caseTemp = liveCaseTemp
             local errorLevel = liveER
+            local effectiveTicks = POLL_INTERVAL_TICKS * lowPerfMultiplier
 
             local statusText = "STANDBY"
             if efficiency > 0 then
@@ -448,7 +484,7 @@ local function uiLoop()
             monitor.clearLine()
             local signText = (controlDirection == 1) and "+" or "-"
             local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
-            monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
+            monitor.write(string.format("Regel: %s%d | Sig: %-2d (T:%dt)", signText, stepSize, currentSignal, effectiveTicks))
 
             monitor.setCursorPos(1, 5)
             monitor.clearLine()
@@ -477,3 +513,5 @@ end
 
 -- 7. Parallele Ausführung aller Prozesse
 parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
+
+```
