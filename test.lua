@@ -1,7 +1,7 @@
 -- ==========================================
 -- SCRIPT VERSION 2.35 (Mid-Cycle Überwachung & Spät-Sprung +2 Fallback)
 -- ==========================================
-local SCRIPT_VERSION = "v2.35"
+local SCRIPT_VERSION = "v2.351"
 
 local reactor = nil
 local monitor = nil
