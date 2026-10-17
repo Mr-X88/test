@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.17 (ER und Sekunden-Trennung korrigiert)
+-- SCRIPT VERSION 2.18 (Echte Zyklus- & Phasen-Erkennung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.17"
+local SCRIPT_VERSION = "v2.18"
 
 local reactor = nil
 local monitor = nil
@@ -13,7 +13,6 @@ local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
-local STABILITY_EPSILON = 0.3   -- Schwellenwert für Zyklus-Erkennung
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
@@ -36,7 +35,6 @@ local liveEF = 0
 local liveER = 0
 local liveCaseTemp = 0
 local liveIsRunning = false
-local cycleIsComplete = false
 
 -- Diagnose-Variable
 local stuckReason = "Warte auf Reaktor..."
@@ -180,8 +178,6 @@ end
 -- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks Takt)
 local function backgroundSensorLoop()
     local pollSeconds = POLL_INTERVAL_TICKS / 20 
-    local lastRecordedEF = 0
-    local stableCount = 0
 
     while true do
         local _, caseT, eff, err, running = getReactorData()
@@ -191,23 +187,11 @@ local function backgroundSensorLoop()
         liveIsRunning = running
         
         updateStats(eff, err, caseT)
-
-        local diff = math.abs(eff - lastRecordedEF)
-        if diff < STABILITY_EPSILON then
-            stableCount = stableCount + 1
-            if stableCount >= 2 then 
-                cycleIsComplete = true
-            end
-        else
-            stableCount = 0
-        end
-        lastRecordedEF = eff
-
         sleep(pollSeconds)
     end
 end
 
--- 6. Haupt-Regelungsschleife
+-- 6. Haupt-Regelungsschleife mit echter Zyklus-Wartelogik
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -249,11 +233,33 @@ local function controlLoop()
                 controlDirection = 1 
             end
 
-            cycleIsComplete = false
-            local waitTimer = 0
-            while not cycleIsComplete and waitTimer < 5.0 do
-                sleep(0.1)
-                waitTimer = waitTimer + 0.1
+            -- ECHTE ZYKLUS-ERKENNUNG (Verhindert 0s-Spam):
+            -- Wir geben dem Reaktor mindestens 2 Sekunden Zeit. 
+            -- Danach warten wir, bis der EF-Wert sich eingependelt hat oder max. 15 Sekunden vorüber sind.
+            local elapsedWait = 0
+            local lastObservedEF = liveEF
+            local stableTicksCount = 0
+            
+            while elapsedWait < 15.0 do
+                sleep(0.3)
+                elapsedWait = elapsedWait + 0.3
+                
+                local currentLiveEF = liveEF
+                local diff = math.abs(currentLiveEF - lastObservedEF)
+                
+                -- Nach den ersten 2 Sekunden Mindestwartezeit auf Stabilität prüfen
+                if elapsedWait >= 2.0 then
+                    if diff < 0.15 then
+                        stableTicksCount = stableTicksCount + 1
+                        -- Wenn der Wert 3 Abfragen in Folge stabil bleibt, ist der Zyklus beendet!
+                        if stableTicksCount >= 3 then
+                            break
+                        end
+                    else
+                        stableTicksCount = 0 -- Reset, wenn er sich noch bewegt
+                    end
+                end
+                lastObservedEF = currentLiveEF
             end
 
             local cycleDuration = os.clock() - cycleStartTime 
@@ -294,7 +300,7 @@ local function controlLoop()
             lastEfficiency = newEfficiency
             logCounter = logCounter + 1
 
-            -- Log-Eintrag mit sauberer Trennung von ER und Sekunden (z.B. ER:2-10s)
+            -- Log-Eintrag mit sauberer Trennung (ER und Sekunden)
             if ENABLE_MONITOR_LOGS then
                 local signChar = (controlDirection == 1) and "+" or "-"
                 local shortDiag = string.sub(stuckReason, 1, 10) 
