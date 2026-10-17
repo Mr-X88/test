@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.35 (Mid-Cycle Überwachung & Spät-Sprung +2 Fallback)
+-- SCRIPT VERSION 2.36 (Tick-basierter Sprung-Check & Schwelle 3.0)
 -- ==========================================
-local SCRIPT_VERSION = "v2.351"
+local SCRIPT_VERSION = "v2.36"
 
 local reactor = nil
 local monitor = nil
@@ -14,7 +14,7 @@ local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0      -- Strikte Mindestwartezeit pro Zyklus in Sekunden
-local JUMP_THRESHOLD = 5.0      -- Schwellenwert für echte Reaktor-Sprüngen (>5%)
+local JUMP_THRESHOLD = 3.0      -- Zurückgesetzt auf 3.0 für echte Tick-Sprünge
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
@@ -130,7 +130,7 @@ local function sendPulse(side, strength)
     pcall(function()
         redstone.setAnalogOutput(side, strength)
     end)
-    sleep(PULSE_LENGTH)
+    sleep(0.1)
     pcall(function()
         redstone.setAnalogOutput(side, 0)
     end)
@@ -177,12 +177,26 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks Takt)
+-- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks / 0.2s Takt mit Tick-Sprung-Erkennung)
+local lastTickEF = 0
+local tickJumpDetected = false
+
 local function backgroundSensorLoop()
     local pollSeconds = POLL_INTERVAL_TICKS / 20 
 
     while true do
         local _, caseT, eff, err, running = getReactorData()
+        
+        -- Prüfe Sprung direkt zum vorherigen 0.2s-Tick
+        if lastTickEF > 0 and eff > 0 then
+            if math.abs(eff - lastTickEF) >= JUMP_THRESHOLD then
+                tickJumpDetected = true
+            end
+        end
+        if eff > 0 then
+            lastTickEF = eff
+        end
+
         liveCaseTemp = caseT
         liveEF = eff
         liveER = err
@@ -193,7 +207,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit Mid-Cycle Überwachung & Spät-Sprung Fallback
+-- 6. Haupt-Regelungsschleife mit strikter 5-Sekunden-Pause & Tick-Auswertung
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -224,6 +238,9 @@ local function controlLoop()
             local startEffForLog = efficiency
             local cycleStartTime = os.clock() 
 
+            -- Reset Flag vor dem Zyklus
+            tickJumpDetected = false
+
             -- Befehl an den Reaktor senden
             applyControlAction(controlDirection, stepSize)
 
@@ -235,22 +252,11 @@ local function controlLoop()
                 currentSignal = 1 
             end
 
-            -- UNUMSTÖSSLICHE PAUSENSICHERUNG mit Mid-Cycle Überwachung auf Spät-Sprünge
+            -- UNUMSTÖSSLICHE PAUSENSICHERUNG: Volle 5 Sekunden warten (währenddessen prüft der Background-Loop die 0.2s-Ticks)
             local elapsedWait = 0
-            local lateJumpDetected = false
-            local preWaitEF = efficiency
-
             while elapsedWait < MIN_CYCLE_WAIT do
                 sleep(0.25)
                 elapsedWait = os.clock() - cycleStartTime
-                
-                -- Prüfen, ob ein Sprung erst in den letzten 1.5 Sekunden auftritt
-                local currentLiveEF = liveEF
-                if math.abs(currentLiveEF - preWaitEF) > JUMP_THRESHOLD then
-                    if elapsedWait >= (MIN_CYCLE_WAIT - 1.5) then
-                        lateJumpDetected = true
-                    end
-                end
             end
 
             local cycleDuration = os.clock() - cycleStartTime 
@@ -261,10 +267,10 @@ local function controlLoop()
                 local effDelta = newEfficiency - lastEfficiency
                 local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
 
-                if lateJumpDetected then
-                    -- Spät-Sprung Fallback: Sicherer +2 Schritt, da zu spät im Zyklus
+                if tickJumpDetected then
+                    -- Tick-Sprung erkannt: Sanfter +2 Fallback zur Sicherheit
                     stepSize = 2
-                    stuckReason = "Spät-Sprung (+2)"
+                    stuckReason = "Tick-Sprung (+2)"
                 elseif isSpontaneousJump then
                     if effDelta < 0 then
                         controlDirection = 1   
