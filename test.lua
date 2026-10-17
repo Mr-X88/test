@@ -1,122 +1,139 @@
--- ==========================================
--- SCRIPT VERSION 2.81 (Trend-Richtungsumkehr bei fallender Effizienz in der 4t-Schleife)
--- ==========================================
-local SCRIPT_VERSION = "v2.81"
+-- ============================================================
+-- BETTER FUSION REACTOR CONTROLLER v2.82
+-- Änderungen:
+--   * Kein TARGET_EFFICIENCY mehr; IDLE_THRESHOLD ist die einzige Grenze.
+--   * Feste Sensorabfrage alle 4 Ticks (0,2 Sekunden).
+--   * Gleichheit wird exakt mit == geprüft.
+--   * Kein Computer-Redstone-Ausgang für die Reaktorsteuerung.
+--   * Steuerung bevorzugt adjustReactivity(); andernfalls analoger
+--     Redstone-Relay-Impuls auf allen Relay-Seiten.
+--   * Deadlock-Bonus bleibt erhalten, bis ein Regelschritt ihn nutzt.
+--   * Monitor wird ohne vollständiges Löschen jedes Frames aktualisiert.
+-- ============================================================
+local SCRIPT_VERSION = "v2.82"
 
 local reactor = nil
 local monitor = nil
-local relay = nil  
+local relay = nil
+local monitorHeight = 25
 
--- ==========================================
--- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
--- ==========================================
-local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
+-- ==================== EINSTELLUNGEN ====================
+local IDLE_THRESHOLD = 95.0          -- Ab hier keine weiteren Regelschritte
+local POLL_INTERVAL_TICKS = 4        -- Fest: 4 Ticks = 0,2 Sekunden
+local POLL_INTERVAL_SECONDS = POLL_INTERVAL_TICKS / 20
 
--- ADAPTIVE / LOW PERFORMANCE EINSTELLUNGEN (Redstone-Puls-basiert)
-local ENABLE_LOW_PERF_MODE = true    -- Schaltet die automatische Takt-Anpassung ein/aus
-local POLL_INTERVAL_TICKS = 4        -- Feste Basis-Tickrate (0.2 Sekunden)
-local lowPerfMultiplier = 1          -- Startet mit Multiplikator 1 (effektiv 4 Ticks)
+local JUMP_THRESHOLD = 3.0
+local LOG_JUMP_THRESHOLD = 16.0
+local EFF_TOLERANCE = 0.8            -- Toleranz nur für Trend-/Logauswertung
+local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
 
-local JUMP_THRESHOLD = 3.0           -- Unberührt für die kleine Sensor-Schleife
-local LOG_JUMP_THRESHOLD = 16.0      -- Eigene Schwelle für Sprünge im Log (ab 16)
-local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
-local EXECUTION_COOLDOWN = 3.0       -- Mindestens 3 Sekunden Pause zwischen Regelschritten/Logs
+-- Weckimpuls: Computer liest bottom ein; das Relay gibt den Impuls aus.
+local ENABLE_WAKEUP_PULSE = true
+local WAKEUP_INTERVAL_TICKS = 40     -- Alle 2 Sekunden
+local WAKEUP_PULSE_TICKS = 10        -- 0,5 Sekunden
+local WAKEUP_STRENGTH = 15
 
--- ==========================================
--- WECKRUF- / REDSTONE-RELAY EINSTELLUNGEN
--- ==========================================
-local ENABLE_WAKEUP_PULSE = true     -- Aktiviert den Weck-Impuls bei Totalstillstand (EF=0 und ER=0)
-local WAKEUP_INTERVAL_TICKS = 40     -- Ticks zwischen den Weck-Versuchen (2 Sekunden)
-local WAKEUP_PULSE_TICKS = 10        -- Länge des Impulses in Ticks (0.5 Sekunden)
-local WAKEUP_STRENGTH = 15           -- Signalstärke des Weck-Impulses (1-15)
+local ENABLE_MONITOR_LOGS = true
 
--- MONITOR LOG EINSTELLUNGEN
-local ENABLE_MONITOR_LOGS = true 
-local monitorWidth, monitorHeight = 39, 25
+local sides = {"top", "bottom", "left", "right", "front", "back"}
 
--- Regelungs-Variablen
-local currentSignal = 8              
-local controlDirection = 1      -- 1 = Erhöhen (+), -1 = Senken (-)
-local stepSize = 4               
-local maxEfficiencySeen = 0     
-local hasEverRun = false        
+-- ==================== REGELUNGSVARIABLEN ====================
+local controlDirection = 1           -- 1 = + / erhöhen, -1 = - / senken
+local stepSize = 4
+local hasEverRun = false
 local logCounter = 0
-local logHistory = {}           
-local wakeupTickCounter = 0     
+local logHistory = {}
+local wakeupTickCounter = 0
+local wakeupPulseActive = false
+local wakeupPulseEndsAt = 0
 
--- Synchronisations-Variablen für Brain-Arm & Sekundenzähler
 local secondCounter = 0
 local secondsSinceLastGo = 0
 local executionGo = false
-local lastPollEF = -1
+local lastPollEF = nil
 local unchangedPollCount = 0
-local previousLoggedEff = -1
-local lastExecutionTime = 0     
+local previousLoggedEff = nil
+local lastExecutionTime = -EXECUTION_COOLDOWN -- erster Regelschritt darf sofort erfolgen
 
--- Variablen für die 10-Iteration Festhänge-Erkennung & Deadlock-Nudge in der 4t-Schleife
+-- Deadlock-Nudge: Zähl- und Zeitlogik bleibt bei 10 + 2 Sensor-Iterationen.
 local stuckPollCount = 0
-local lastSensorEFForStuck = -1
+local lastSensorEFForStuck = nil
 local stuckNudgeActive = false
 local stuckNudgeCounter = 0
 local stuckNudgeBonus = 0
 
--- Variablen für die Redstone-Puls-Messung & Hysterese von unten
-local lastPulseTime = os.clock()
-local pulseTargetMultiplier = 1
-local pulseStreakCount = 0
-
--- Variablen für die Monitor-Seiten & Redstone-Log
-local currentPage = 1                
+-- Redstone-Eingangsprotokoll (Computer-bottom; keine Ausgangssteuerung darüber)
+local lastBottomState = false
+local lastPulseTime = nil
+local lastDeltaT = nil
 local pulseCountTotal = 0
-local lastDeltaT = 0
 local pulseLogHistory = {}
 
--- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
+local currentPage = 1
+local lastRenderedPage = nil
+
+-- Aktuelle, gemeinsam genutzte Sensorwerte
 local liveEF = 0
 local liveER = 0
 local liveCaseTemp = 0
 local liveIsRunning = false
+local liveDataValid = false
 
+-- Anzeige des tatsächlichen letzten Regelschritts
+local lastAppliedStep = nil
+local lastAppliedDirection = nil
+local lastActionMode = "Noch kein Schritt"
 local stuckReason = "Warte auf Reaktor..."
 
-local stats = {
-    minEff = math.huge, maxEff = -math.huge,
-    minErr = math.huge, maxErr = -math.huge,
-    minCase = math.huge, maxCase = 0
-}
-
 print("==========================================")
-print(" FUSION REACTOR CONTROLLER " .. SCRIPT_VERSION)
+print(" BETTER FUSION REACTOR CONTROLLER " .. SCRIPT_VERSION)
 print("==========================================")
 
--- 1. Peripherie automatisch erkennen
+-- ==================== PERIPHERIE-SUCHE ====================
+local function typeMatches(pType, expected)
+    if type(pType) == "string" then
+        return pType == expected
+    elseif type(pType) == "table" then
+        for _, value in pairs(pType) do
+            if value == expected then return true end
+        end
+    end
+    return false
+end
+
 local function scanPeripherals()
     reactor = nil
     monitor = nil
     relay = nil
-    
+
     print("--- Suche Peripherie ---")
     for _, name in ipairs(peripheral.getNames()) do
         local pType = peripheral.getType(name)
-        local lName = name:lower()
-        
-        if pType == "fusionReactor" or lName:find("logicadapter") then
-            reactor = peripheral.wrap(name)
-            print(" -> Reaktor Logic Adapter gefunden: " .. name)
-        elseif pType == "monitor" or lName:find("monitor") then
-            local m = peripheral.wrap(name)
-            if m and m.isColor and m.isColor() then
-                monitor = m
-                monitorWidth, monitorHeight = m.getSize()
-                m.setTextScale(0.5)
-                print(" -> Farb-Monitor gefunden: " .. name .. " (" .. monitorWidth .. "x" .. monitorHeight .. ")")
+        local lowerName = name:lower()
+        local wrapped = peripheral.wrap(name)
+
+        if wrapped and (typeMatches(pType, "fusionReactor") or lowerName:find("logicadapter", 1, true)) then
+            reactor = wrapped
+            print(" -> Reaktor-Logic-Adapter: " .. name)
+        elseif wrapped and (typeMatches(pType, "monitor") or lowerName:find("monitor", 1, true)) then
+            local okColor, isColor = pcall(function() return wrapped.isColor() end)
+            if okColor and isColor then
+                monitor = wrapped
+                pcall(function() monitor.setTextScale(0.5) end)
+                local okSize, _, height = pcall(function() return monitor.getSize() end)
+                if okSize and type(height) == "number" then monitorHeight = height end
+                print(" -> Farbmonitor: " .. name .. " (H=" .. monitorHeight .. ")")
             end
-        elseif pType == "redstoneIntegrator" or pType == "relay" or lName:find("relay") or lName:find("modem") then
-            local r = peripheral.wrap(name)
-            if r and (type(r.setOutput) == "function" or type(r.setAnalogOutput) == "function") then
-                relay = r
-                print(" -> Redstone Relay / Integrator gefunden: " .. name)
+        elseif wrapped and (
+            typeMatches(pType, "redstoneIntegrator") or
+            typeMatches(pType, "relay") or
+            lowerName:find("relay", 1, true)
+        ) then
+            local hasAnalog = type(wrapped.setAnalogOutput) == "function"
+            local hasDigital = type(wrapped.setOutput) == "function"
+            if hasAnalog or hasDigital then
+                relay = wrapped
+                print(" -> Redstone-Relay/Integrator: " .. name .. (hasAnalog and " (analog)" or " (nur AN/AUS)"))
             end
         end
     end
@@ -126,453 +143,425 @@ end
 scanPeripherals()
 
 if not reactor then
-    print("[DIAGNOSE FEHLER] Kein Fusion Reactor Logic Adapter gefunden!")
+    print("[FEHLER] Kein Fusion Reactor Logic Adapter gefunden!")
     return
 end
 
-if monitor then
-    monitor.setTextScale(0.5)
-    monitor.clear()
+if monitor then pcall(function() monitor.clear() end) end
+if relay and type(relay.setAnalogOutput) ~= "function" then
+    print("[WARNUNG] Relay hat kein setAnalogOutput(); es kann keine analoge Schrittstärke ausgeben.")
 end
 
--- 2. Daten sicher abfragen
+-- ==================== RELAY-HILFSFUNKTIONEN ====================
+-- Setzt alle Seiten des externen Relays. Der Computer selbst gibt keine
+-- Redstone-Ausgänge aus; redstone.getInput("bottom") bleibt nur Eingang.
+local function setRelayAll(value, allowDigital)
+    if not relay then return false end
+
+    local success = true
+    local usedAny = false
+    for _, side in ipairs(sides) do
+        local ok = false
+        if type(relay.setAnalogOutput) == "function" then
+            ok = pcall(function() relay.setAnalogOutput(side, value) end)
+        elseif allowDigital and type(relay.setOutput) == "function" then
+            ok = pcall(function() relay.setOutput(side, value > 0) end)
+        end
+        if ok then
+            usedAny = true
+        else
+            success = false
+        end
+    end
+    return success and usedAny
+end
+
+local function sendWakeupPulseStart()
+    if not relay then
+        stuckReason = "Weckimpuls: kein Relay"
+        return false
+    end
+    local ok = setRelayAll(WAKEUP_STRENGTH, true)
+    if not ok then
+        stuckReason = "Weckimpuls: Relay-Fehler"
+        return false
+    end
+    wakeupPulseActive = true
+    wakeupPulseEndsAt = os.clock() + (WAKEUP_PULSE_TICKS * 0.05)
+    return true
+end
+
+local function stopWakeupPulseIfDue()
+    if wakeupPulseActive and os.clock() >= wakeupPulseEndsAt then
+        setRelayAll(0, true)
+        wakeupPulseActive = false
+    end
+end
+
+-- ==================== REAKTORDATEN SICHER LESEN ====================
+local function safeRead(methodName, fallback)
+    if not reactor or type(reactor[methodName]) ~= "function" then
+        return fallback, false
+    end
+    local ok, value = pcall(function() return reactor[methodName]() end)
+    if not ok or value == nil then return fallback, false end
+    return value, true
+end
+
+local function isFiniteNumber(value)
+    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
 local function getReactorData()
-    if not reactor then return "STANDBY", 0, 0, 0, false end
-    
-    local logicMode = "STANDBY"
-    local caseTemp = 0
-    local efficiency = 0
-    local errorLevel = 0
-    
-    pcall(function()
-        logicMode = reactor.getLogicMode()
-        caseTemp = reactor.getCaseTemperature()
-        efficiency = reactor.getEfficiency()
-        errorLevel = reactor.getErrorLevel()
-    end)
-    
+    local logicMode = safeRead("getLogicMode", "UNKNOWN")
+    local caseTemp, tempOK = safeRead("getCaseTemperature", liveCaseTemp)
+    local efficiency, effOK = safeRead("getEfficiency", liveEF)
+    local errorLevel, errOK = safeRead("getErrorLevel", liveER)
+
+    if not isFiniteNumber(caseTemp) or not isFiniteNumber(efficiency) or not isFiniteNumber(errorLevel) then
+        return logicMode, liveCaseTemp, liveEF, liveER, liveIsRunning, false
+    end
+
+    local dataValid = tempOK and effOK and errOK
     local isRunning = (logicMode == "ACTIVE" or logicMode == "RUNNING" or logicMode == "READY")
-    pcall(function() if reactor.getStatus then isRunning = reactor.getStatus() end end)
-    
-    return logicMode, caseTemp, efficiency, errorLevel, isRunning
-end
 
-local function updateStats(eff, err, caseT)
-    if eff > 0 then
-        if eff < stats.minEff then stats.minEff = eff end
-        if eff > stats.maxEff then stats.maxEff = eff end
-    end
-    if err < stats.minErr then stats.minErr = err end
-    if err > stats.maxErr then stats.maxErr = err end
-    if caseT < stats.minCase then stats.minCase = caseT end
-    if caseT > stats.maxCase then stats.maxCase = caseT end
-end
-
-local sides = {"top", "bottom", "left", "right", "front", "back"}
-
-local function sendWakeupPulse()
-    pcall(function()
-        if relay then
-            for _, side in ipairs(sides) do
-                if type(relay.setAnalogOutput) == "function" then
-                    relay.setAnalogOutput(side, WAKEUP_STRENGTH)
-                elseif type(relay.setOutput) == "function" then
-                    relay.setOutput(side, true)
-                end
-            end
-        else
-            for _, side in ipairs(sides) do
-                redstone.setAnalogOutput(side, WAKEUP_STRENGTH)
+    local status, statusOK = safeRead("getStatus", nil)
+    if statusOK then
+        if type(status) == "boolean" then
+            isRunning = status
+        elseif type(status) == "string" then
+            local upperStatus = status:upper()
+            if upperStatus == "ACTIVE" or upperStatus == "RUNNING" or upperStatus == "READY" then
+                isRunning = true
+            elseif upperStatus == "STANDBY" or upperStatus == "STOPPED" or upperStatus == "IDLE" then
+                isRunning = false
             end
         end
-    end)
-    
-    sleep(WAKEUP_PULSE_TICKS * 0.05)
-    
-    pcall(function()
-        if relay then
-            for _, side in ipairs(sides) do
-                if type(relay.setAnalogOutput) == "function" then
-                    relay.setAnalogOutput(side, 0)
-                elseif type(relay.setOutput) == "function" then
-                    relay.setOutput(side, false)
-                end
-            end
-        else
-            for _, side in ipairs(sides) do
-                redstone.setAnalogOutput(side, 0)
-            end
-        end
-    end)
+    elseif efficiency > 0 then
+        -- Fallback, falls getLogicMode/getStatus nicht unterstützt werden.
+        isRunning = true
+    end
+
+    return logicMode, caseTemp, efficiency, errorLevel, isRunning, dataValid
 end
 
-local function applyControlAction(direction, strength)
-    if strength > 15 then strength = 15 end
-    local success = false
-    
-    if reactor and type(reactor.adjustReactivity) == "function" then
-        pcall(function()
-            reactor.adjustReactivity(direction * strength)
-            success = true
-        end)
-    end
-    
-    if not success then
-        local sideName = (direction == 1) and "left" or "right"
-        pcall(function() 
-            if relay then
-                for _, s in ipairs(sides) do relay.setAnalogOutput(s, strength) end
-            else
-                redstone.setAnalogOutput(sideName, strength)
-            end
-        end)
-        sleep(0.1)
-        pcall(function() 
-            if relay then
-                for _, s in ipairs(sides) do relay.setAnalogOutput(s, 0) end
-            else
-                redstone.setAnalogOutput(sideName, 0)
-            end
-        end)
-    end
-end
+-- ==================== REGELSCHRITT BERECHNEN ====================
+local function calculateStep(currentEff)
+    local difference = IDLE_THRESHOLD - currentEff
+    if difference <= 0 then return 1 end
 
--- 3. NICHT-LINEARE KURVEN-FORMEL
-local function calculateStepFromTable(currentEff, targetEff)
-    local effDiff = targetEff - currentEff
-
-    if effDiff <= 0 then
-        return 1
-    end
-
-    local crNeeded = (0.0927 * effDiff) + (0.00464 * (effDiff ^ 2))
-    local calculatedStep = math.floor(crNeeded)
-
-    if calculatedStep > 15 then 
-        calculatedStep = 15 
-    elseif calculatedStep < 1 then 
-        calculatedStep = 1 
-    end
-    
+    local rawStep = (0.0927 * difference) + (0.00464 * (difference ^ 2))
+    local calculatedStep = math.floor(rawStep)
+    if calculatedStep > 15 then calculatedStep = 15 end
+    if calculatedStep < 1 then calculatedStep = 1 end
     return calculatedStep
 end
 
--- 4. SEPARATER EVENT-LISTENER FÜR REDSTONE-PULSE VON UNTEN
+-- Richtungssteuerung bevorzugt direkt den Logic-Adapter. Falls das nicht
+-- verfügbar ist, kommt ein kurzer analoger Impuls auf allen Relay-Seiten.
+-- Es gibt absichtlich KEINEN Computer-redstone.setAnalogOutput()-Fallback.
+local function applyControlAction(direction, strength)
+    strength = math.max(1, math.min(15, math.floor(strength)))
+
+    if reactor and type(reactor.adjustReactivity) == "function" then
+        local ok = pcall(function() reactor.adjustReactivity(direction * strength) end)
+        if ok then return true, "Direkt" end
+    end
+
+    if not relay then
+        return false, "Kein Relay / keine Direktsteuerung"
+    end
+    if type(relay.setAnalogOutput) ~= "function" then
+        return false, "Relay kann keine analoge Schrittstärke senden"
+    end
+
+    local startOK = setRelayAll(strength, false)
+    if not startOK then
+        setRelayAll(0, false)
+        return false, "Relay-Ausgabe fehlgeschlagen"
+    end
+
+    sleep(0.1) -- gewollter kurzer Steuerimpuls
+    local stopOK = setRelayAll(0, false)
+    if not stopOK then
+        return false, "Relay konnte Impuls nicht sicher zurücksetzen"
+    end
+    return true, "Relay-Puls"
+end
+
+-- ==================== REDSTONE-EINGANGS-LISTENER ====================
+-- bottom wird ausschließlich am Computer als Eingang ausgewertet. Es wird
+-- nur eine steigende Flanke als neuer Impuls gezählt.
 local function pulseListenerLoop()
+    lastBottomState = redstone.getInput("bottom")
+
     while true do
         os.pullEvent("redstone")
-        
-        if ENABLE_LOW_PERF_MODE and redstone.getInput("bottom") then
+        local bottomNow = redstone.getInput("bottom")
+
+        if bottomNow and not lastBottomState then
             local now = os.clock()
-            local deltaT = now - lastPulseTime
+            local deltaT = lastPulseTime and (now - lastPulseTime) or nil
             lastPulseTime = now
             lastDeltaT = deltaT
             pulseCountTotal = pulseCountTotal + 1
-            
-            if deltaT >= 0.05 and deltaT <= 3.0 then
-                local desiredMultiplier = 1
-                
-                if deltaT >= 0.75 then
-                    desiredMultiplier = 1 
-                elseif deltaT >= 0.375 then
-                    desiredMultiplier = 2 
-                elseif deltaT >= 0.187 then
-                    desiredMultiplier = 4 
-                else
-                    desiredMultiplier = 8 
-                end
-                
-                local pulseLogLine = string.format("#%03d|Dt:%.3fs|Faktor:%d", pulseCountTotal, deltaT, desiredMultiplier)
-                table.insert(pulseLogHistory, 1, pulseLogLine)
-                local maxPulseLines = math.max(5, monitorHeight - 8)
-                if #pulseLogHistory > maxPulseLines then
-                    table.remove(pulseLogHistory)
-                end
 
-                if desiredMultiplier ~= lowPerfMultiplier then
-                    if desiredMultiplier == pulseTargetMultiplier then
-                        pulseStreakCount = pulseStreakCount + 1
-                        if pulseStreakCount >= 3 then
-                            lowPerfMultiplier = desiredMultiplier
-                            pulseStreakCount = 0
-                        end
-                    else
-                        pulseTargetMultiplier = desiredMultiplier
-                        pulseStreakCount = 1
-                    end
-                else
-                    pulseTargetMultiplier = lowPerfMultiplier
-                    pulseStreakCount = 0
-                end
+            local pulseLine
+            if deltaT then
+                pulseLine = string.format("#%03d|Dt:%.3fs|Eingang EIN", pulseCountTotal, deltaT)
+            else
+                pulseLine = string.format("#%03d|Erster Impuls|Eingang EIN", pulseCountTotal)
             end
+            table.insert(pulseLogHistory, 1, pulseLine)
+            local maxPulseLines = math.max(1, monitorHeight - 7)
+            while #pulseLogHistory > maxPulseLines do table.remove(pulseLogHistory) end
         end
+
+        lastBottomState = bottomNow
     end
 end
 
--- 5. MONITOR-TOUCH LISTENER FÜR SEITENWECHSEL & LOG-SCHALTER
+-- ==================== MONITOR-TOUCH LISTENER ====================
 local function touchListenerLoop()
     while true do
-        local event, side, x, y = os.pullEvent("monitor_touch")
+        local _, _, x, y = os.pullEvent("monitor_touch")
         if currentPage == 1 then
             if y == monitorHeight then
                 currentPage = 2
             elseif y == 7 then
                 ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
             end
-        elseif currentPage == 2 then
-            if y == monitorHeight then
-                currentPage = 1
-            end
+        elseif currentPage == 2 and y == monitorHeight then
+            currentPage = 1
         end
     end
 end
 
--- 6. ADAPTIVE SENSOR-SCHLEIFE (Exklusive Richtungsänderung + Trend-Erkennung)
-local lastSensorEF = 0
+-- ==================== SENSOR-SCHLEIFE: FEST 0,2 SEKUNDEN ====================
+local lastSensorEF = nil
 
 local function backgroundSensorLoop()
     while true do
-        local effectiveTicks = POLL_INTERVAL_TICKS * lowPerfMultiplier
-        local pollSeconds = effectiveTicks / 20  
-        
-        local _, caseT, eff, err, running = getReactorData()
-        
-        liveCaseTemp = caseT
-        liveEF = eff
-        liveER = err
-        liveIsRunning = running
-        
-        if eff > 0 then
-            hasEverRun = true
-        end
+        stopWakeupPulseIfDue()
 
-        -- Dynamische Trend-Erkennung:
-        if eff >= TARGET_EFFICIENCY then
-            controlDirection = -1 -- Ziel erreicht -> Senken (-)
-        elseif lastSensorEF > 0 then
-            -- Wenn die Effizienz nach dem letzten Schritt sinkt -> Richtung umkehren
-            if (eff - lastSensorEF) < -EFF_TOLERANCE then
-                controlDirection = -controlDirection
+        local _, caseT, eff, err, running, valid = getReactorData()
+        if valid then
+            liveCaseTemp = caseT
+            liveEF = eff
+            liveER = err
+            liveIsRunning = running
+            liveDataValid = true
+
+            if eff > 0 then hasEverRun = true end
+
+            -- Richtungsumkehr bleibt trendbasiert. IDLE_THRESHOLD ist die einzige
+            -- Effizienzgrenze; ab dort werden keine Regelschritte ausgeführt.
+            if eff < IDLE_THRESHOLD and lastSensorEF ~= nil and lastSensorEF > 0 then
+                if (eff - lastSensorEF) < -EFF_TOLERANCE then
+                    controlDirection = -controlDirection
+                end
             end
-        end
 
-        -- 10-Iteration Stillstand-Erkennung mit Deadlock-Nudge (Bonus +1)
-        if lastSensorEFForStuck >= 0 and math.abs(eff - lastSensorEFForStuck) < 0.1 then
-            stuckPollCount = stuckPollCount + 1
-            if stuckPollCount >= 10 then
-                stuckNudgeActive = true
-                stuckNudgeCounter = 2   
-                stuckNudgeBonus = 1     
+            -- Stillstandserkennung anhand exakt gleicher Messwerte.
+            -- Die ursprüngliche Zeitlogik (10 Iterationen + 2 Iterationen) bleibt.
+            if running and eff > 0 and eff < IDLE_THRESHOLD and
+               lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
+                stuckPollCount = stuckPollCount + 1
+                if stuckPollCount >= 10 then
+                    stuckNudgeActive = true
+                    stuckNudgeCounter = 2
+                    stuckNudgeBonus = 1
+                    stuckPollCount = 0
+                end
+            else
                 stuckPollCount = 0
             end
-        else
-            stuckPollCount = 0
-        end
-        lastSensorEFForStuck = eff
+            lastSensorEFForStuck = eff
 
-        -- Nudge-Timer herunterzählen
-        if stuckNudgeActive then
-            stuckNudgeCounter = stuckNudgeCounter - 1
-            if stuckNudgeCounter <= 0 then
-                stuckNudgeActive = false
-                stuckNudgeBonus = 0
+            -- Timer bleibt wie zuvor; der Bonus wird hier NICHT gelöscht.
+            -- Er bleibt bestehen, bis applyControlAction einen Schritt erfolgreich ausführt.
+            if stuckNudgeActive then
+                stuckNudgeCounter = stuckNudgeCounter - 1
+                if stuckNudgeCounter <= 0 then
+                    stuckNudgeActive = false
+                end
             end
-        end
 
-        secondCounter = secondCounter + effectiveTicks
-        if secondCounter >= 20 then
-            secondCounter = secondCounter - 20
-            secondsSinceLastGo = secondsSinceLastGo + 1
-        end
+            secondCounter = secondCounter + POLL_INTERVAL_TICKS
+            if secondCounter >= 20 then
+                secondCounter = secondCounter - 20
+                secondsSinceLastGo = secondsSinceLastGo + 1
+            end
 
-        -- Go-Signal Erkennung
-        if lastPollEF >= 0 and math.abs(eff - lastPollEF) < 0.1 then
-            unchangedPollCount = unchangedPollCount + 1
-            if unchangedPollCount >= 2 then
-                executionGo = true
+            -- Genau gleicher Messwert (kein EFF_TOLERANCE/0,1-Schwellwert).
+            if lastPollEF ~= nil and eff == lastPollEF then
+                unchangedPollCount = unchangedPollCount + 1
+                if unchangedPollCount >= 2 then
+                    executionGo = true
+                    unchangedPollCount = 0
+                end
+            else
                 unchangedPollCount = 0
             end
-        else
-            unchangedPollCount = 0
-        end
-        lastPollEF = eff
+            lastPollEF = eff
 
-        if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
-            wakeupTickCounter = wakeupTickCounter + effectiveTicks
-            if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS then
+            if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
+                wakeupTickCounter = wakeupTickCounter + POLL_INTERVAL_TICKS
+                if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS and not wakeupPulseActive then
+                    wakeupTickCounter = 0
+                    sendWakeupPulseStart()
+                end
+            else
                 wakeupTickCounter = 0
-                sendWakeupPulse()
             end
-        else
-            wakeupTickCounter = 0
-        end
 
-        if not running or eff == 0 then
-            stuckReason = (hasEverRun and eff == 0) and "CRASH erkannt!" or "Standby"
-        elseif eff >= IDLE_THRESHOLD then
-            stuckReason = string.format("Idle & Stopp (>=%.1f%%)", eff)
-        else
-            if lastSensorEF > 0 then
-                local delta = eff - lastSensorEF
-                if math.abs(delta) >= JUMP_THRESHOLD then
-                    if delta < 0 then
-                        stuckReason = "Einbruch"
-                    else
-                        stuckReason = "Sprung (+)"
-                    end
-                else
-                    if eff > lastSensorEF then
+            if not running or eff == 0 then
+                stuckReason = (hasEverRun and eff == 0) and "CRASH erkannt!" or "Standby"
+            elseif eff >= IDLE_THRESHOLD then
+                stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
+            else
+                if lastSensorEF ~= nil then
+                    local delta = eff - lastSensorEF
+                    if math.abs(delta) >= JUMP_THRESHOLD then
+                        stuckReason = (delta < 0) and "Einbruch" or "Sprung (+)"
+                    elseif delta > EFF_TOLERANCE then
                         stuckReason = "Steigt"
-                    elseif eff < (lastSensorEF - EFF_TOLERANCE) then
+                    elseif delta < -EFF_TOLERANCE then
                         stuckReason = "Sinkt"
                     else
                         stuckReason = "Stillstand"
                     end
+                else
+                    stuckReason = "Init"
                 end
-            else
-                stuckReason = "Init"
             end
+
+            if eff > 0 then lastSensorEF = eff end
+        else
+            liveDataValid = false
+            executionGo = false
+            stuckReason = "Sensor-Lesefehler"
         end
 
-        if eff > 0 then
-            lastSensorEF = eff
-        end
-
-        updateStats(eff, err, caseT)
-        sleep(pollSeconds)
+        sleep(POLL_INTERVAL_SECONDS)
     end
 end
 
--- 7. AUSFÜHRUNGS-SCHLEIFE
+-- ==================== AUSFÜHRUNGS-SCHLEIFE ====================
 local function executionLoop()
     while true do
-        while not executionGo do
-            sleep(0.05)
-        end
-        
-        executionGo = false
+        if executionGo then
+            executionGo = false
+            local now = os.clock()
 
-        -- 3-Sekunden Cooldown Prüfung
-        local currentTime = os.clock()
-        if (currentTime - lastExecutionTime) < EXECUTION_COOLDOWN then
-            goto continueExecution
-        end
-        lastExecutionTime = currentTime
+            -- Kein goto: Cooldown blockiert nur diesen Regelschritt, nicht den Thread.
+            if (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
+                local currentEfficiency = liveEF
+                local errorLevel = liveER
+                local canControl = liveDataValid and liveIsRunning and
+                    currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD and errorLevel < 100
 
-        local logSeconds = secondsSinceLastGo
-        secondsSinceLastGo = 0
+                if canControl then
+                    lastExecutionTime = now
 
-        local currentEfficiency = liveEF
-        local errorLevel = liveER
+                    if previousLoggedEff == nil then previousLoggedEff = currentEfficiency end
+                    local startEffForLog = previousLoggedEff
 
-        if previousLoggedEff < 0 then
-            previousLoggedEff = currentEfficiency
-        end
+                    stepSize = calculateStep(currentEfficiency)
+                    local effectiveStep = math.min(15, stepSize + stuckNudgeBonus)
+                    local actionDirection = controlDirection
+                    local success, modeOrError = applyControlAction(actionDirection, effectiveStep)
 
-        local startEffForLog = previousLoggedEff
+                    if success then
+                        lastAppliedStep = effectiveStep
+                        lastAppliedDirection = actionDirection
+                        lastActionMode = modeOrError
+                        -- Bonus erst nach tatsächlich erfolgreich ausgeführtem Schritt verbrauchen.
+                        if stuckNudgeBonus > 0 then stuckNudgeBonus = 0 end
 
-        if liveIsRunning and currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD then
-            if currentEfficiency > maxEfficiencySeen then
-                maxEfficiencySeen = currentEfficiency
-            end
+                        logCounter = logCounter + 1
+                        if ENABLE_MONITOR_LOGS then
+                            local delta = currentEfficiency - startEffForLog
+                            local cycleDiag = "Stillstand"
+                            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
+                                cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
+                            elseif delta > EFF_TOLERANCE then
+                                cycleDiag = "Steigt"
+                            elseif delta < -EFF_TOLERANCE then
+                                cycleDiag = "Sinkt"
+                            end
 
-            -- Schrittweite über die Kurventabelle berechnen
-            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
+                            local signChar = (actionDirection == 1) and "+" or "-"
+                            local compactLog = string.format(
+                                "#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s",
+                                logCounter, signChar, effectiveStep, startEffForLog,
+                                currentEfficiency, math.floor(errorLevel + 0.5),
+                                secondsSinceLastGo, string.sub(cycleDiag, 1, 10)
+                            )
+                            table.insert(logHistory, 1, compactLog)
+                            local maxLogLines = math.max(1, monitorHeight - 9)
+                            while #logHistory > maxLogLines do table.remove(logHistory) end
+                        end
 
-            -- Falls Deadlock-Nudge aktiv ist, temporären Bonus addieren
-            local effectiveStep = stepSize + stuckNudgeBonus
-            if effectiveStep > 15 then effectiveStep = 15 end
-
-            applyControlAction(controlDirection, effectiveStep)
-
-            currentSignal = currentSignal + (controlDirection * effectiveStep)
-            if currentSignal > 15 then currentSignal = 15 elseif currentSignal < 1 then currentSignal = 1 end
-
-            logCounter = logCounter + 1
-
-            if ENABLE_MONITOR_LOGS then
-                local effDelta = currentEfficiency - startEffForLog
-                local cycleDiag = "Stillstand"
-
-                if math.abs(effDelta) >= LOG_JUMP_THRESHOLD then
-                    if effDelta > 0 then
-                        cycleDiag = "Sprung (+)"
+                        previousLoggedEff = currentEfficiency
+                        secondsSinceLastGo = 0
+                        stuckReason = "Schritt ausgeführt: " .. modeOrError
                     else
-                        cycleDiag = "Sprung (-)"
+                        stuckReason = modeOrError
                     end
-                elseif effDelta > EFF_TOLERANCE then
-                    cycleDiag = "Steigt"
-                elseif effDelta < -EFF_TOLERANCE then
-                    cycleDiag = "Sinkt"
-                else
-                    cycleDiag = "Stillstand"
-                end
-
-                local signChar = (controlDirection == 1) and "+" or "-"
-                local shortDiag = string.sub(cycleDiag, 1, 10) 
-                local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s", 
-                    logCounter, signChar, effectiveStep, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
-                
-                table.insert(logHistory, 1, compactLog)
-                local maxLogLines = math.max(5, monitorHeight - 9)
-                if #logHistory > maxLogLines then
-                    table.remove(logHistory)
+                elseif liveDataValid then
+                    if errorLevel >= 100 then
+                        stuckReason = "SICHERHEIT: ER >= 100"
+                    elseif currentEfficiency >= IDLE_THRESHOLD then
+                        stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
+                    elseif not liveIsRunning or currentEfficiency == 0 then
+                        stuckReason = "Keine Regelung: Standby"
+                    end
                 end
             end
-        else
-            pcall(function()
-                if relay then
-                    for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
-                else
-                    for _, side in ipairs(sides) do redstone.setAnalogOutput(side, 0) end
-                end
-            end)
         end
-
-        previousLoggedEff = currentEfficiency
-        
-        ::continueExecution::
+        sleep(0.05)
     end
 end
 
--- 8. MONITOR-UI SCHLEIFE
+-- ==================== MONITOR-UI ====================
+local function clearLineAt(y)
+    monitor.setCursorPos(1, y)
+    monitor.clearLine()
+end
+
+local function writeHeader(text)
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.clearLine()
+    monitor.write(text)
+    monitor.setBackgroundColor(colors.black)
+end
+
 local function uiLoop()
     while true do
         if monitor then
-            monitor.setBackgroundColor(colors.black)
-            monitor.clear()
+            if lastRenderedPage ~= currentPage then
+                pcall(function() monitor.clear() end)
+                lastRenderedPage = currentPage
+            end
 
             if currentPage == 1 then
-                local efficiency = liveEF
-                local caseTemp = liveCaseTemp
-                local errorLevel = liveER
-                local effectiveTicks = POLL_INTERVAL_TICKS * lowPerfMultiplier
+                writeHeader(string.format("=== FUSION CONTROL %s (1/2) ===", SCRIPT_VERSION))
 
-                local statusText = "STANDBY"
-                if efficiency > 0 then
-                    statusText = "RUN"
-                elseif hasEverRun and efficiency == 0 then
-                    statusText = "CRUSH"
-                else
-                    statusText = "STANDBY"
-                end
-                
-                monitor.setCursorPos(1, 1)
-                monitor.setBackgroundColor(colors.blue)
-                monitor.setTextColor(colors.white)
-                monitor.write(string.format("=== FUSION CONTROL %s (1/2) ===", SCRIPT_VERSION))
-                monitor.setBackgroundColor(colors.black)
-
-                monitor.setCursorPos(1, 2)
-                monitor.clearLine()
+                clearLineAt(2)
                 monitor.write("Modus: ")
-                if efficiency >= IDLE_THRESHOLD then
+                if not liveDataValid then
+                    monitor.setTextColor(colors.red)
+                    monitor.write("SENSOR? ")
+                elseif liveEF >= IDLE_THRESHOLD then
                     monitor.setTextColor(colors.cyan)
                     monitor.write("IDLE ")
-                elseif statusText == "RUN" then
+                elseif liveIsRunning and liveEF > 0 then
                     monitor.setTextColor(colors.green)
                     monitor.write("RUN  ")
-                elseif statusText == "CRUSH" then
+                elseif hasEverRun and liveEF == 0 then
                     monitor.setTextColor(colors.red)
                     monitor.write("CRUSH")
                 else
@@ -580,29 +569,28 @@ local function uiLoop()
                     monitor.write("STAND")
                 end
                 monitor.setTextColor(colors.white)
-                monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
+                monitor.write(string.format(" | EF: %.1f%%", liveEF))
 
-                monitor.setCursorPos(1, 3)
-                monitor.clearLine()
-                monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
-                monitor.write(" | ER: ")
-                if errorLevel > 50 then monitor.setTextColor(colors.red) end
-                monitor.write(string.format("%.1f%%", errorLevel))
+                clearLineAt(3)
+                monitor.write(string.format("Case: %.1fM K | ER: ", liveCaseTemp / 1000000))
+                if liveER > 50 then monitor.setTextColor(colors.red) end
+                monitor.write(string.format("%.1f", liveER))
                 monitor.setTextColor(colors.white)
 
-                monitor.setCursorPos(1, 4)
-                monitor.clearLine()
-                local signText = (controlDirection == 1) and "+" or "-"
-                monitor.write(string.format("Regel: %s%d | Sig: %-2d (T:%dt)", signText, stepSize, currentSignal, effectiveTicks))
+                clearLineAt(4)
+                local sign = (lastAppliedDirection == -1) and "-" or "+"
+                if lastAppliedStep then
+                    monitor.write(string.format("Schritt: %s%d | Ausgang: %s", sign, lastAppliedStep, lastActionMode))
+                else
+                    monitor.write("Schritt: -- | Noch keine Aktion")
+                end
 
-                monitor.setCursorPos(1, 5)
-                monitor.clearLine()
+                clearLineAt(5)
                 monitor.setTextColor(colors.cyan)
-                monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
+                monitor.write("Diag: " .. string.sub(stuckReason, 1, math.max(1, monitorHeight > 30 and 35 or 28)))
                 monitor.setTextColor(colors.white)
 
-                monitor.setCursorPos(1, 7)
-                monitor.clearLine()
+                clearLineAt(7)
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("--- ZYKLEN-LOGS [")
                 if ENABLE_MONITOR_LOGS then
@@ -614,39 +602,35 @@ local function uiLoop()
                 end
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("] ---")
+                monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxLogLines = math.max(5, monitorHeight - 8)
+                    local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
                     for i = 1, maxLogLines do
-                        monitor.setCursorPos(1, 7 + i)
-                        monitor.clearLine()
-                        if logHistory[i] then
-                            monitor.write(logHistory[i])
-                        end
+                        clearLineAt(7 + i)
+                        if logHistory[i] then monitor.write(logHistory[i]) end
                     end
                 else
-                    monitor.setCursorPos(1, 9)
+                    clearLineAt(8)
                     monitor.setTextColor(colors.gray)
                     monitor.write("  (Logs sind deaktiviert)")
+                    monitor.setTextColor(colors.white)
                 end
 
-                monitor.setCursorPos(1, monitorHeight)
-                monitor.setBackgroundColor(colors.gray)
-                monitor.setTextColor(colors.yellow)
-                monitor.write("[ Klick für Seite 2: Redstone-Log ]")
-                monitor.setBackgroundColor(colors.black)
-
+                if monitorHeight >= 1 then
+                    clearLineAt(monitorHeight)
+                    monitor.setBackgroundColor(colors.gray)
+                    monitor.setTextColor(colors.yellow)
+                    monitor.write("[ Klick für Seite 2: Redstone-Log ]")
+                    monitor.setBackgroundColor(colors.black)
+                    monitor.setTextColor(colors.white)
+                end
             else
-                monitor.setCursorPos(1, 1)
-                monitor.setBackgroundColor(colors.blue)
-                monitor.setTextColor(colors.white)
-                monitor.write(string.format("=== REDSTONE PULS LOG (2/2) ===", SCRIPT_VERSION))
-                monitor.setBackgroundColor(colors.black)
+                writeHeader("=== REDSTONE INPUT LOG (2/2) ===")
 
+                clearLineAt(3)
                 local bottomState = redstone.getInput("bottom")
-
-                monitor.setCursorPos(1, 3)
-                monitor.write("Unten: ")
+                monitor.write("Computer-bottom: ")
                 if bottomState then
                     monitor.setTextColor(colors.green)
                     monitor.write("AN ")
@@ -655,31 +639,39 @@ local function uiLoop()
                     monitor.write("AUS ")
                 end
                 monitor.setTextColor(colors.white)
-                monitor.write(string.format("| Pulse:%d | Aktif:%dx (T:%dt)", pulseCountTotal, lowPerfMultiplier, POLL_INTERVAL_TICKS * lowPerfMultiplier))
+                local dtText = lastDeltaT and string.format("%.3fs", lastDeltaT) or "--"
+                monitor.write(string.format("| Pulse: %d | letztes Dt: %s", pulseCountTotal, dtText))
 
-                monitor.setCursorPos(1, 5)
+                clearLineAt(5)
                 monitor.setTextColor(colors.lightGray)
-                monitor.write("--- PULS-LOGS (Zeit & Faktor) ---")
+                monitor.write("--- EINGANGSIMPULSE (Zeitabstand) ---")
+                monitor.setTextColor(colors.white)
 
-                local maxPulseLines = math.max(5, monitorHeight - 7)
+                local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
                 for i = 1, maxPulseLines do
-                    monitor.setCursorPos(1, 5 + i)
-                    monitor.clearLine()
-                    if pulseLogHistory[i] then
-                        monitor.write(pulseLogHistory[i])
-                    end
+                    clearLineAt(5 + i)
+                    if pulseLogHistory[i] then monitor.write(pulseLogHistory[i]) end
                 end
 
-                monitor.setCursorPos(1, monitorHeight)
-                monitor.setBackgroundColor(colors.gray)
-                monitor.setTextColor(colors.yellow)
-                monitor.write("[ Klick für Seite 1: Haupt-UI ]")
-                monitor.setBackgroundColor(colors.black)
+                if monitorHeight >= 1 then
+                    clearLineAt(monitorHeight)
+                    monitor.setBackgroundColor(colors.gray)
+                    monitor.setTextColor(colors.yellow)
+                    monitor.write("[ Klick für Seite 1: Haupt-UI ]")
+                    monitor.setBackgroundColor(colors.black)
+                    monitor.setTextColor(colors.white)
+                end
             end
         end
         sleep(0.25)
     end
 end
 
--- 9. Parallele Ausführung aller Prozesse
-parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop, pulseListenerLoop, touchListenerLoop)
+-- ==================== PARALLELER START ====================
+parallel.waitForAll(
+    backgroundSensorLoop,
+    executionLoop,
+    uiLoop,
+    pulseListenerLoop,
+    touchListenerLoop
+)
