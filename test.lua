@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.21 (Echtzeit-Sprungerkennung im 4-Ticks-Takt)
+-- SCRIPT VERSION 2.22 (Typo behoben & Echtzeit-Sprungerkennung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.21"
+local SCRIPT_VERSION = "v2.22"
 
 local reactor = nil
 local monitor = nil
@@ -14,7 +14,7 @@ local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0      -- Mindestwartezeit pro Zyklus in Sekunden
-local FAST_JUMP_THRESHOLD = 2.5 -- NEU: Sprung-Schwelle im 4-Ticks-Takt (reagiert blitzschnell auf TR-Drifts)
+local FAST_JUMP_THRESHOLD = 2.5 -- Sprung-Schwelle im 4-Ticks-Takt
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
@@ -194,7 +194,6 @@ local function backgroundSensorLoop()
 
         if not isFirstRun and running and eff > 0 then
             local pollDelta = eff - lastRecordedEF
-            -- Wenn sich der Wert im 4-Ticks-Takt abrupt stärker ändert als normal, ist es ein Reaktor-Sprung!
             if math.abs(pollDelta) >= FAST_JUMP_THRESHOLD then
                 instantJumpDetected = true
                 instantJumpDelta = pollDelta
@@ -240,10 +239,9 @@ local function controlLoop()
             local startEffForLog = efficiency
             local cycleStartTime = os.clock() 
 
-            -- Vorab prüfen, ob der Hintergrundsensor bereits einen Sprung gemeldet hat
             local jumpDetectedThisCycle = instantJumpDetected
             local jumpDeltaThisCycle = instantJumpDelta
-            instantJumpDetected = false -- Flag zurücksetzen
+            instantJumpDetected = false 
 
             if jumpDetectedThisCycle then
                 if jumpDeltaThisCycle < 0 then
@@ -266,14 +264,12 @@ local function controlLoop()
                 end
             end
 
-            -- Warten, bis der Zyklus stabil ist (mit Mindestwartezeit, bricht aber sofort ab, wenn ein Live-Sprung reinkommt)
             local elapsedWait = 0
             local lastObservedEF = liveEF
-            local stableTicksCount = f
+            local stableTicksCount = 0 -- KORRIGIERT: Sauber auf 0 initialisiert!
             
             while elapsedWait < 20.0 do
                 if instantJumpDetected then
-                    -- Sofort abbrechen, wenn im Hintergrund ein neuer Sprung erkannt wird!
                     break
                 end
 
