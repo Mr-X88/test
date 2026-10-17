@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.77 (Bereinigte, zentrale Trend-Logik)
+-- SCRIPT VERSION 2.79 (Saubere Trennung: Nur 4t-Sensor steuert die Richtung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.77"
+local SCRIPT_VERSION = "v2.79"
 
 local reactor = nil
 local monitor = nil
@@ -54,6 +54,10 @@ local unchangedPollCount = 0
 local previousLoggedEff = -1
 local lastExecutionTime = 0     
 
+-- Variablen für die 10-Poll Festhänge-Erkennung in der 4t-Schleife
+local stuckPollCount = 0
+local lastSensorEFForStuck = -1
+
 -- Variablen für die Redstone-Puls-Messung & Hysterese von unten
 local lastPulseTime = os.clock()
 local pulseTargetMultiplier = 1
@@ -70,8 +74,6 @@ local liveEF = 0
 local liveER = 0
 local liveCaseTemp = 0
 local liveIsRunning = false
-local tickJumpOccurred = false
-local tickJumpDelta = 0
 
 local stuckReason = "Warte auf Reaktor..."
 
@@ -322,9 +324,8 @@ local function touchListenerLoop()
     end
 end
 
--- 6. ADAPTIVE SENSOR-SCHLEIFE (Zentrale Trend- & Richtungserkennung)
+-- 6. ADAPTIVE SENSOR-SCHLEIFE (Die EINZIGE Stelle für Richtungsänderungen)
 local lastSensorEF = 0
-local lastSensorER = 0
 
 local function backgroundSensorLoop()
     while true do
@@ -342,28 +343,22 @@ local function backgroundSensorLoop()
             hasEverRun = true
         end
 
-        -- ZENTRALE TREND-ERFOLGS-PRÜFUNG
+        -- Standard-Zielprüfung: Wenn Ziel erreicht/überschritten -> Senken (-)
         if eff >= TARGET_EFFICIENCY then
-            controlDirection = -1 -- Ziel erreicht -> Senken
-        else
-            if lastSensorEF > 0 then
-                local effDelta = eff - lastSensorEF
-                -- Wenn Erhöhen (+) zu einem Effizienz-Einbruch führt -> Sofort umkehren!
-                if controlDirection == 1 and effDelta < -1.0 then
-                    controlDirection = -1
-                -- Wenn Senken (-) ebenfalls zu einem Einbruch führt -> Wieder erhöhen!
-                elseif controlDirection == -1 and effDelta < -1.0 and err < 30 then
-                    controlDirection = 1
-                end
-            end
-            
-            -- Standard: Unter dem Ziel und stabil -> Erhöhen
-            if controlDirection == -1 and eff < TARGET_EFFICIENCY - 3 and err < 15 then
-                controlDirection = 1
-            end
+            controlDirection = -1
         end
 
-        lastSensorER = err
+        -- Zweite Abfrage: Prüfen, ob sich der EF-Wert über 10 Abfragen hinweg kaum verändert hat (< 0.1)
+        if lastSensorEFForStuck >= 0 and math.abs(eff - lastSensorEFForStuck) < 0.1 then
+            stuckPollCount = stuckPollCount + 1
+            if stuckPollCount >= 10 then
+                controlDirection = -controlDirection -- Richtung genau einmal umkehren, um Festhängen zu lösen
+                stuckPollCount = 0
+            end
+        else
+            stuckPollCount = 0
+        end
+        lastSensorEFForStuck = eff
 
         secondCounter = secondCounter + effectiveTicks
         if secondCounter >= 20 then
@@ -429,7 +424,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 7. AUSFÜHRUNGS-SCHLEIFE (Bereinigt von konkurrierenden Richtungswechseln)
+-- 7. AUSFÜHRUNGS-SCHLEIFE (Ohne eigene Richtungs-Logik, rein ausführend)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -462,12 +457,10 @@ local function executionLoop()
                 maxEfficiencySeen = currentEfficiency
             end
 
+            -- Schrittweite über die Kurventabelle berechnen
             stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
-            if errorLevel > 30 and stepSize > 4 then
-                stepSize = 4
-            end
 
-            -- Nutzt direkt die saubere controlDirection aus der Sensor-Schleife
+            -- Führt den Befehl mit der von der 4t-Schleife vorgegebenen controlDirection aus
             applyControlAction(controlDirection, stepSize)
 
             currentSignal = currentSignal + (controlDirection * stepSize)
