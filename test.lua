@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.19 (Mit erhöhtem Mindest-Cooldown von 5s)
+-- SCRIPT VERSION 2.21 (Echtzeit-Sprungerkennung im 4-Ticks-Takt)
 -- ==========================================
-local SCRIPT_VERSION = "v2.19"
+local SCRIPT_VERSION = "v2.21"
 
 local reactor = nil
 local monitor = nil
@@ -13,9 +13,8 @@ local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
-local MIN_CYCLE_WAIT = 5.0      -- Mindestwartezeit pro Zyklus in Sekunden (vorher 2-3s)
-local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
-local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
+local MIN_CYCLE_WAIT = 5.0      -- Mindestwartezeit pro Zyklus in Sekunden
+local FAST_JUMP_THRESHOLD = 2.5 -- NEU: Sprung-Schwelle im 4-Ticks-Takt (reagiert blitzschnell auf TR-Drifts)
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
 
 -- MONITOR LOG EINSTELLUNGEN
@@ -31,11 +30,13 @@ local maxEfficiencySeen = 0
 local logCounter = 0
 local logHistory = {}           -- Speicher für die Monitor-Logs
 
--- Live-Daten für den Hintergrund-Prozess
+-- Live-Daten für den Hintergrund-Prozess & Echtzeit-Sprung-Flags
 local liveEF = 0
 local liveER = 0
 local liveCaseTemp = 0
 local liveIsRunning = false
+local instantJumpDetected = false
+local instantJumpDelta = 0
 
 -- Diagnose-Variable
 local stuckReason = "Warte auf Reaktor..."
@@ -176,9 +177,11 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks Takt)
+-- PARALLELE HINTERGRUND-ÜBERWACHUNG (Prüft alle 4 Ticks in Echtzeit auf TR-Sprünge)
 local function backgroundSensorLoop()
     local pollSeconds = POLL_INTERVAL_TICKS / 20 
+    local lastRecordedEF = 0
+    local isFirstRun = true
 
     while true do
         local _, caseT, eff, err, running = getReactorData()
@@ -188,11 +191,24 @@ local function backgroundSensorLoop()
         liveIsRunning = running
         
         updateStats(eff, err, caseT)
+
+        if not isFirstRun and running and eff > 0 then
+            local pollDelta = eff - lastRecordedEF
+            -- Wenn sich der Wert im 4-Ticks-Takt abrupt stärker ändert als normal, ist es ein Reaktor-Sprung!
+            if math.abs(pollDelta) >= FAST_JUMP_THRESHOLD then
+                instantJumpDetected = true
+                instantJumpDelta = pollDelta
+            end
+        else
+            isFirstRun = false
+        end
+        
+        lastRecordedEF = eff
         sleep(pollSeconds)
     end
 end
 
--- 6. Haupt-Regelungsschleife mit 5s Mindestwartezeit
+-- 6. Haupt-Regelungsschleife mit Echtzeit-Sprung-Auswertung
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -205,6 +221,7 @@ local function controlLoop()
             end)
             lastEfficiency = 0 
             maxEfficiencySeen = 0 
+            instantJumpDetected = false
             stuckReason = "Standby"
             sleep(1.0)
         elseif efficiency >= HARD_STOP_EF or efficiency >= IDLE_THRESHOLD then
@@ -223,30 +240,49 @@ local function controlLoop()
             local startEffForLog = efficiency
             local cycleStartTime = os.clock() 
 
-            applyControlAction(controlDirection, stepSize)
+            -- Vorab prüfen, ob der Hintergrundsensor bereits einen Sprung gemeldet hat
+            local jumpDetectedThisCycle = instantJumpDetected
+            local jumpDeltaThisCycle = instantJumpDelta
+            instantJumpDetected = false -- Flag zurücksetzen
 
-            currentSignal = currentSignal + (controlDirection * stepSize)
-            if currentSignal > 15 then 
-                currentSignal = 15 
-                controlDirection = -1 
-            elseif currentSignal < 1 then 
-                currentSignal = 1 
-                controlDirection = 1 
+            if jumpDetectedThisCycle then
+                if jumpDeltaThisCycle < 0 then
+                    controlDirection = 1   
+                    stepSize = 12          
+                    stuckReason = "Sprung (-) Einbruch"
+                else
+                    stepSize = calculateStepFromTable(efficiency, TARGET_EFFICIENCY)
+                    stuckReason = "Sprung (+) Boost"
+                end
+            else
+                applyControlAction(controlDirection, stepSize)
+                currentSignal = currentSignal + (controlDirection * stepSize)
+                if currentSignal > 15 then 
+                    currentSignal = 15 
+                    controlDirection = -1 
+                elseif currentSignal < 1 then 
+                    currentSignal = 1 
+                    controlDirection = 1 
+                end
             end
 
-            -- ERHÖHTE MINDEST-WARTEZEIT (MIN_CYCLE_WAIT = 5.0 Sekunden)
+            -- Warten, bis der Zyklus stabil ist (mit Mindestwartezeit, bricht aber sofort ab, wenn ein Live-Sprung reinkommt)
             local elapsedWait = 0
             local lastObservedEF = liveEF
-            local stableTicksCount = 0
+            local stableTicksCount = f
             
             while elapsedWait < 20.0 do
+                if instantJumpDetected then
+                    -- Sofort abbrechen, wenn im Hintergrund ein neuer Sprung erkannt wird!
+                    break
+                end
+
                 sleep(0.3)
                 elapsedWait = elapsedWait + 0.3
                 
                 local currentLiveEF = liveEF
                 local diff = math.abs(currentLiveEF - lastObservedEF)
                 
-                -- Erst nach Ablauf der Mindestwartezeit (5 Sekunden) auf Stabilität prüfen
                 if elapsedWait >= MIN_CYCLE_WAIT then
                     if diff < 0.15 then
                         stableTicksCount = stableTicksCount + 1
@@ -264,20 +300,8 @@ local function controlLoop()
             local newEfficiency = liveEF
             local recordedER = liveER 
 
-            if lastEfficiency > 0 then
-                local effDelta = newEfficiency - lastEfficiency
-                local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
-
-                if isSpontaneousJump then
-                    if effDelta < 0 then
-                        controlDirection = 1   
-                        stepSize = 12          
-                        stuckReason = "Sprung (-) Einbruch"
-                    else
-                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = "Sprung (+) Boost"
-                    end
-                else
+            if not jumpDetectedThisCycle then
+                if lastEfficiency > 0 then
                     if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
                         controlDirection = -controlDirection
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
@@ -289,10 +313,10 @@ local function controlLoop()
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Toleranz -> Halte"
                     end
+                else
+                    stepSize = 3
+                    stuckReason = "Init"
                 end
-            else
-                stepSize = 3
-                stuckReason = "Init"
             end
 
             lastEfficiency = newEfficiency
