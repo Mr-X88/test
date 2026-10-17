@@ -1,16 +1,18 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.82
+-- BETTER FUSION REACTOR CONTROLLER v2.83
 -- Änderungen:
 --   * Kein TARGET_EFFICIENCY mehr; IDLE_THRESHOLD ist die einzige Grenze.
---   * Feste Sensorabfrage alle 4 Ticks (0,2 Sekunden).
+--   * Adaptive Sensorabfrage 4/8/16/32 Ticks anhand der bottom-Impulsabstände.
+--   * Impuls- und Zykluslogs enthalten weiterhin Zeit-, Faktor-, EF- und ER-Werte.
 --   * Gleichheit wird exakt mit == geprüft.
 --   * Kein Computer-Redstone-Ausgang für die Reaktorsteuerung.
 --   * Steuerung bevorzugt adjustReactivity(); andernfalls analoger
 --     Redstone-Relay-Impuls auf allen Relay-Seiten.
 --   * Deadlock-Bonus bleibt erhalten, bis ein Regelschritt ihn nutzt.
 --   * Monitor wird ohne vollständiges Löschen jedes Frames aktualisiert.
+--   * Weckimpuls wird unabhängig von der variablen Sensorabfrage beendet.
 -- ============================================================
-local SCRIPT_VERSION = "v2.82"
+local SCRIPT_VERSION = "v2.83"
 
 local reactor = nil
 local monitor = nil
@@ -19,8 +21,16 @@ local monitorHeight = 25
 
 -- ==================== EINSTELLUNGEN ====================
 local IDLE_THRESHOLD = 95.0          -- Ab hier keine weiteren Regelschritte
-local POLL_INTERVAL_TICKS = 4        -- Fest: 4 Ticks = 0,2 Sekunden
-local POLL_INTERVAL_SECONDS = POLL_INTERVAL_TICKS / 20
+
+-- Adaptive Sensorabfrage wie in v2.81:
+-- 4 Ticks (x1), 8 Ticks (x2), 16 Ticks (x4), 32 Ticks (x8).
+-- Der Computer reagiert weiter auf bottom; die Impulsabstände bestimmen
+-- den Multiplikator mit einer Hysterese von drei übereinstimmenden Impulsen.
+local ENABLE_LOW_PERF_MODE = true
+local POLL_INTERVAL_TICKS = 4        -- Basis: 4 Ticks = 0,2 Sekunden
+local lowPerfMultiplier = 1
+local pulseTargetMultiplier = 1
+local pulseStreakCount = 0
 
 local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
@@ -64,8 +74,9 @@ local stuckNudgeBonus = 0
 
 -- Redstone-Eingangsprotokoll (Computer-bottom; keine Ausgangssteuerung darüber)
 local lastBottomState = false
-local lastPulseTime = nil
+local lastPulseTime = os.clock()
 local lastDeltaT = nil
+local lastDesiredMultiplier = 1
 local pulseCountTotal = 0
 local pulseLogHistory = {}
 
@@ -299,21 +310,60 @@ local function pulseListenerLoop()
         os.pullEvent("redstone")
         local bottomNow = redstone.getInput("bottom")
 
+        -- Nur die steigende Flanke am Computer-Eingang bottom zählt als Impuls.
         if bottomNow and not lastBottomState then
             local now = os.clock()
-            local deltaT = lastPulseTime and (now - lastPulseTime) or nil
+            local deltaT = now - lastPulseTime
             lastPulseTime = now
             lastDeltaT = deltaT
             pulseCountTotal = pulseCountTotal + 1
 
-            local pulseLine
-            if deltaT then
-                pulseLine = string.format("#%03d|Dt:%.3fs|Eingang EIN", pulseCountTotal, deltaT)
-            else
-                pulseLine = string.format("#%03d|Erster Impuls|Eingang EIN", pulseCountTotal)
+            local desiredMultiplier = lowPerfMultiplier
+            local validInterval = deltaT >= 0.05 and deltaT <= 3.0
+
+            if ENABLE_LOW_PERF_MODE and validInterval then
+                if deltaT >= 0.75 then
+                    desiredMultiplier = 1
+                elseif deltaT >= 0.375 then
+                    desiredMultiplier = 2
+                elseif deltaT >= 0.187 then
+                    desiredMultiplier = 4
+                else
+                    desiredMultiplier = 8
+                end
+
+                lastDesiredMultiplier = desiredMultiplier
+
+                -- Hysterese: Multiplikator erst nach drei passenden Impulsen ändern.
+                if desiredMultiplier ~= lowPerfMultiplier then
+                    if desiredMultiplier == pulseTargetMultiplier then
+                        pulseStreakCount = pulseStreakCount + 1
+                        if pulseStreakCount >= 3 then
+                            lowPerfMultiplier = desiredMultiplier
+                            pulseStreakCount = 0
+                        end
+                    else
+                        pulseTargetMultiplier = desiredMultiplier
+                        pulseStreakCount = 1
+                    end
+                else
+                    pulseTargetMultiplier = lowPerfMultiplier
+                    pulseStreakCount = 0
+                end
             end
+
+            local intervalText
+            if validInterval then
+                intervalText = string.format("Dt:%.3fs", deltaT)
+            else
+                intervalText = string.format("Dt:%.3f(out)", deltaT)
+            end
+            local pulseLine = string.format(
+                "#%03d|%s|Faktor:%d|Aktiv:%d",
+                pulseCountTotal, intervalText, lastDesiredMultiplier, lowPerfMultiplier
+            )
             table.insert(pulseLogHistory, 1, pulseLine)
-            local maxPulseLines = math.max(1, monitorHeight - 7)
+            local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
             while #pulseLogHistory > maxPulseLines do table.remove(pulseLogHistory) end
         end
 
@@ -337,12 +387,17 @@ local function touchListenerLoop()
     end
 end
 
--- ==================== SENSOR-SCHLEIFE: FEST 0,2 SEKUNDEN ====================
+-- ==================== ADAPTIVE SENSOR-SCHLEIFE: 4/8/16/32 TICKS ====================
 local lastSensorEF = nil
 
 local function backgroundSensorLoop()
     while true do
         stopWakeupPulseIfDue()
+
+        -- Den aktuell gewählten Takt für diese Sensoriteration verwenden.
+        local multiplier = ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1
+        local effectiveTicks = POLL_INTERVAL_TICKS * multiplier
+        local pollSeconds = effectiveTicks / 20
 
         local _, caseT, eff, err, running, valid = getReactorData()
         if valid then
@@ -387,8 +442,8 @@ local function backgroundSensorLoop()
                 end
             end
 
-            secondCounter = secondCounter + POLL_INTERVAL_TICKS
-            if secondCounter >= 20 then
+            secondCounter = secondCounter + effectiveTicks
+            while secondCounter >= 20 do
                 secondCounter = secondCounter - 20
                 secondsSinceLastGo = secondsSinceLastGo + 1
             end
@@ -406,9 +461,9 @@ local function backgroundSensorLoop()
             lastPollEF = eff
 
             if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
-                wakeupTickCounter = wakeupTickCounter + POLL_INTERVAL_TICKS
+                wakeupTickCounter = wakeupTickCounter + effectiveTicks
                 if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS and not wakeupPulseActive then
-                    wakeupTickCounter = 0
+                    wakeupTickCounter = wakeupTickCounter - WAKEUP_INTERVAL_TICKS
                     sendWakeupPulseStart()
                 end
             else
@@ -443,7 +498,7 @@ local function backgroundSensorLoop()
             stuckReason = "Sensor-Lesefehler"
         end
 
-        sleep(POLL_INTERVAL_SECONDS)
+        sleep(pollSeconds)
     end
 end
 
@@ -524,6 +579,24 @@ local function executionLoop()
     end
 end
 
+-- ==================== WECKIMPULS-TIMER ====================
+-- Die Impulsdauer bleibt 0,5 Sekunden, auch wenn die Sensorabfrage auf
+-- 16 oder 32 Ticks verlangsamt wurde.
+local function wakeupPulseTimerLoop()
+    while true do
+        if wakeupPulseActive then
+            local remaining = wakeupPulseEndsAt - os.clock()
+            if remaining > 0 then
+                sleep(remaining)
+            else
+                stopWakeupPulseIfDue()
+            end
+        else
+            sleep(0.05)
+        end
+    end
+end
+
 -- ==================== MONITOR-UI ====================
 local function clearLineAt(y)
     monitor.setCursorPos(1, y)
@@ -590,6 +663,13 @@ local function uiLoop()
                 monitor.write("Diag: " .. string.sub(stuckReason, 1, math.max(1, monitorHeight > 30 and 35 or 28)))
                 monitor.setTextColor(colors.white)
 
+                clearLineAt(6)
+                local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
+                monitor.write(string.format("Sensor: %dt / %.2fs | Faktor x%d%s",
+                    currentTicks, currentTicks / 20,
+                    ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
+                    ENABLE_LOW_PERF_MODE and " AUTO" or " FIX"))
+
                 clearLineAt(7)
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("--- ZYKLEN-LOGS [")
@@ -640,7 +720,12 @@ local function uiLoop()
                 end
                 monitor.setTextColor(colors.white)
                 local dtText = lastDeltaT and string.format("%.3fs", lastDeltaT) or "--"
-                monitor.write(string.format("| Pulse: %d | letztes Dt: %s", pulseCountTotal, dtText))
+                monitor.write(string.format("| Pulse: %d | Dt: %s", pulseCountTotal, dtText))
+                clearLineAt(4)
+                local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
+                monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
+                    lastDesiredMultiplier, ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
+                    currentTicks, currentTicks / 20))
 
                 clearLineAt(5)
                 monitor.setTextColor(colors.lightGray)
@@ -673,5 +758,6 @@ parallel.waitForAll(
     executionLoop,
     uiLoop,
     pulseListenerLoop,
-    touchListenerLoop
+    touchListenerLoop,
+    wakeupPulseTimerLoop
 )
