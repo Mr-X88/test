@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.79 (Saubere Trennung: Nur 4t-Sensor steuert die Richtung)
+-- SCRIPT VERSION 2.80 (Mit intelligentem Deadlock-Nudge in der 4t-Schleife)
 -- ==========================================
-local SCRIPT_VERSION = "v2.79"
+local SCRIPT_VERSION = "v2.80"
 
 local reactor = nil
 local monitor = nil
@@ -54,9 +54,12 @@ local unchangedPollCount = 0
 local previousLoggedEff = -1
 local lastExecutionTime = 0     
 
--- Variablen für die 10-Poll Festhänge-Erkennung in der 4t-Schleife
+-- Variablen für die 10-Iteration Festhänge-Erkennung & Deadlock-Nudge in der 4t-Schleife
 local stuckPollCount = 0
 local lastSensorEFForStuck = -1
+local stuckNudgeActive = false
+local stuckNudgeCounter = 0
+local stuckNudgeBonus = 0
 
 -- Variablen für die Redstone-Puls-Messung & Hysterese von unten
 local lastPulseTime = os.clock()
@@ -324,7 +327,7 @@ local function touchListenerLoop()
     end
 end
 
--- 6. ADAPTIVE SENSOR-SCHLEIFE (Die EINZIGE Stelle für Richtungsänderungen)
+-- 6. ADAPTIVE SENSOR-SCHLEIFE (Die EINZIGE Stelle für Richtungsänderungen & Deadlock-Nudge)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -348,17 +351,28 @@ local function backgroundSensorLoop()
             controlDirection = -1
         end
 
-        -- Zweite Abfrage: Prüfen, ob sich der EF-Wert über 10 Abfragen hinweg kaum verändert hat (< 0.1)
+        -- 10-Iteration Stillstand-Erkennung mit temporärem Deadlock-Nudge (Bonus +1)
         if lastSensorEFForStuck >= 0 and math.abs(eff - lastSensorEFForStuck) < 0.1 then
             stuckPollCount = stuckPollCount + 1
             if stuckPollCount >= 10 then
-                controlDirection = -controlDirection -- Richtung genau einmal umkehren, um Festhängen zu lösen
+                stuckNudgeActive = true
+                stuckNudgeCounter = 2   -- Wirkt für 2 Sensor-Zyklen
+                stuckNudgeBonus = 1     -- Fügt einen temporären Schub von +1 hinzu
                 stuckPollCount = 0
             end
         else
             stuckPollCount = 0
         end
         lastSensorEFForStuck = eff
+
+        -- Nudge-Timer herunterzählen
+        if stuckNudgeActive then
+            stuckNudgeCounter = stuckNudgeCounter - 1
+            if stuckNudgeCounter <= 0 then
+                stuckNudgeActive = false
+                stuckNudgeBonus = 0
+            end
+        end
 
         secondCounter = secondCounter + effectiveTicks
         if secondCounter >= 20 then
@@ -424,7 +438,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 7. AUSFÜHRUNGS-SCHLEIFE (Ohne eigene Richtungs-Logik, rein ausführend)
+-- 7. AUSFÜHRUNGS-SCHLEIFE (Berücksichtigt den Deadlock-Nudge bei der Schrittberechnung)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -460,10 +474,14 @@ local function executionLoop()
             -- Schrittweite über die Kurventabelle berechnen
             stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
 
-            -- Führt den Befehl mit der von der 4t-Schleife vorgegebenen controlDirection aus
-            applyControlAction(controlDirection, stepSize)
+            -- Wenn der Deadlock-Nudge aktiv ist, fügen wir den temporären Bonus hinzu
+            local effectiveStep = stepSize + stuckNudgeBonus
+            if effectiveStep > 15 then effectiveStep = 15 end
 
-            currentSignal = currentSignal + (controlDirection * stepSize)
+            -- Führt den Befehl mit der Richtung und dem eventuellen Nudge-Schub aus
+            applyControlAction(controlDirection, effectiveStep)
+
+            currentSignal = currentSignal + (controlDirection * effectiveStep)
             if currentSignal > 15 then currentSignal = 15 elseif currentSignal < 1 then currentSignal = 1 end
 
             logCounter = logCounter + 1
@@ -489,7 +507,7 @@ local function executionLoop()
                 local signChar = (controlDirection == 1) and "+" or "-"
                 local shortDiag = string.sub(cycleDiag, 1, 10) 
                 local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s", 
-                    logCounter, signChar, stepSize, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
+                    logCounter, signChar, effectiveStep, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
                 
                 table.insert(logHistory, 1, compactLog)
                 local maxLogLines = math.max(5, monitorHeight - 9)
