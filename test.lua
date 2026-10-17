@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.15 (Mit ER- und Zeitmessung in den Logs)
+-- SCRIPT VERSION 2.17 (ER und Sekunden-Trennung korrigiert)
 -- ==========================================
-local SCRIPT_VERSION = "v2.15"
+local SCRIPT_VERSION = "v2.17"
 
 local reactor = nil
 local monitor = nil
@@ -13,7 +13,7 @@ local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
 local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
-local STABILITY_EPSILON = 0.03  -- Ab welcher EF-Änderung gilt der Wert als "stabil"
+local STABILITY_EPSILON = 0.3   -- Schwellenwert für Zyklus-Erkennung
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 local EFF_TOLERANCE = 0.8       -- Toleranz-Schwelle für normales Rauschen
@@ -195,7 +195,7 @@ local function backgroundSensorLoop()
         local diff = math.abs(eff - lastRecordedEF)
         if diff < STABILITY_EPSILON then
             stableCount = stableCount + 1
-            if stableCount >= 3 then
+            if stableCount >= 2 then 
                 cycleIsComplete = true
             end
         else
@@ -213,7 +213,6 @@ local function controlLoop()
         local efficiency = liveEF
         local errorLevel = liveER
 
-        -- ECHTER STANDBY-SCHUTZ: Solange EF 0 ist oder der Reaktor aus ist, passiert absolut gar nichts
         if not liveIsRunning or efficiency == 0 then
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
@@ -221,10 +220,9 @@ local function controlLoop()
             end)
             lastEfficiency = 0 
             maxEfficiencySeen = 0 
-            stuckReason = "Reaktor in Standby"
+            stuckReason = "Standby"
             sleep(1.0)
         elseif efficiency >= HARD_STOP_EF or efficiency >= IDLE_THRESHOLD then
-            -- Harter Stopp kurz vor dem Ziel
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
                 redstone.setAnalogOutput("right", 0)
@@ -238,7 +236,7 @@ local function controlLoop()
             end
 
             local startEffForLog = efficiency
-            local cycleStartTime = os.clock() -- Zeitmessung für den Zyklus starten
+            local cycleStartTime = os.clock() 
 
             applyControlAction(controlDirection, stepSize)
 
@@ -253,14 +251,14 @@ local function controlLoop()
 
             cycleIsComplete = false
             local waitTimer = 0
-            while not cycleIsComplete and waitTimer < 20.0 do
+            while not cycleIsComplete and waitTimer < 5.0 do
                 sleep(0.1)
                 waitTimer = waitTimer + 0.1
             end
 
-            local cycleDuration = os.clock() - cycleStartTime -- Verstrichene Zeit in Sekunden berechnen
+            local cycleDuration = os.clock() - cycleStartTime 
             local newEfficiency = liveEF
-            local recordedER = liveER -- ER-Wert für den Log festhalten
+            local recordedER = liveER 
 
             if lastEfficiency > 0 then
                 local effDelta = newEfficiency - lastEfficiency
@@ -270,42 +268,42 @@ local function controlLoop()
                     if effDelta < 0 then
                         controlDirection = 1   
                         stepSize = 12          
-                        stuckReason = "[REAKTOR-SPRUNG (-)] Einbruch!"
+                        stuckReason = "Sprung (-) Einbruch"
                     else
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = "[REAKTOR-SPRUNG (+)] Boost!"
+                        stuckReason = "Sprung (+) Boost"
                     end
                 else
                     if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
                         controlDirection = -controlDirection
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = "Sinkt -> Richtungswechsel"
+                        stuckReason = "Sinkt -> Wechsel"
                     elseif newEfficiency >= lastEfficiency then
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = string.format("Stabil/Besser -> Step %d", stepSize)
+                        stuckReason = string.format("Stabil -> Step %d", stepSize)
                     else
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                        stuckReason = "Im Toleranzbereich -> Halte"
+                        stuckReason = "Toleranz -> Halte"
                     end
                 end
             else
                 stepSize = 3
-                stuckReason = "Initialisierung"
+                stuckReason = "Init"
             end
 
             lastEfficiency = newEfficiency
             logCounter = logCounter + 1
 
-            -- Log-Eintrag erstellen (Nur wenn Logs aktiv sind, inklusive ER und Zyklus-Dauer in Sekunden)
+            -- Log-Eintrag mit sauberer Trennung von ER und Sekunden (z.B. ER:2-10s)
             if ENABLE_MONITOR_LOGS then
                 local signChar = (controlDirection == 1) and "+" or "-"
-                local shortDiag = string.sub(stuckReason, 1, 10) -- Etwas kompakter für die erweiterte Anzeige
-                local compactLog = string.format("#%03d|%s%d|%.1f->%.1f|ER:%d|%ds|%s", 
+                local shortDiag = string.sub(stuckReason, 1, 10) 
+                local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d-%ds|%s", 
                     logCounter, signChar, stepSize, startEffForLog, newEfficiency, math.floor(recordedER + 0.5), math.floor(cycleDuration + 0.5), shortDiag)
                 
                 table.insert(logHistory, 1, compactLog)
                 
-                local maxLogLines = math.max(5, monitorHeight - 9)
+                local maxLogLines = math.max(5, monitorHeight - 7)
                 if #logHistory > maxLogLines then
                     table.remove(logHistory)
                 end
@@ -389,7 +387,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("--- ZYKLEN-LOGS ---")
 
-                local maxLogLines = math.max(5, monitorHeight - 8)
+                local maxLogLines = math.max(5, monitorHeight - 7)
                 for i = 1, maxLogLines do
                     monitor.setCursorPos(1, 7 + i)
                     monitor.clearLine()
