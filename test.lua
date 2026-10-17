@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.55 (Entkoppelte Brain-Arm Architektur mit EF-Stable Go & Sekundenzähler)
+-- SCRIPT VERSION 2.56 (Entkoppelte Brain-Arm Architektur mit verzögertem Log-Vergleich)
 -- ==========================================
-local SCRIPT_VERSION = "v2.55"
+local SCRIPT_VERSION = "v2.56"
 
 local reactor = nil
 local monitor = nil
@@ -14,7 +14,7 @@ local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
 local FULL_POWER_DISTANCE = 43       -- Volle Power ab 43 Punkten Restabstand
 local POLL_INTERVAL_TICKS = 4        -- Sensor-Intervall (0.2 Sekunden)
-local EXECUTION_INTERVAL_TICKS = 20  -- (Wird nun durch EF-Stabilität ersetzt)
+local EXECUTION_INTERVAL_TICKS = 20  -- (Wird durch EF-Stabilität ersetzt)
 local JUMP_THRESHOLD = 3.0           -- Schwellenwert für Tick-Sprünge/-Einbrüche
 local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
 
@@ -47,6 +47,7 @@ local secondsSinceLastGo = 0
 local executionGo = false
 local lastPollEF = -1
 local unchangedPollCount = 0
+local previousLoggedEff = -1
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -336,18 +337,22 @@ local function executionLoop()
         local logSeconds = secondsSinceLastGo
         secondsSinceLastGo = 0
 
-        local efficiency = liveEF
+        local currentEfficiency = liveEF
         local errorLevel = liveER
 
-        if liveIsRunning and efficiency > 0 and efficiency < IDLE_THRESHOLD then
-            if efficiency > maxEfficiencySeen then
-                maxEfficiencySeen = efficiency
+        if previousLoggedEff < 0 then
+            previousLoggedEff = currentEfficiency
+        end
+
+        local startEffForLog = previousLoggedEff
+
+        if liveIsRunning and currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD then
+            if currentEfficiency > maxEfficiencySeen then
+                maxEfficiencySeen = currentEfficiency
             end
 
-            local startEffForLog = efficiency
-
             -- Schrittgröße per Formel berechnen
-            stepSize = calculateStepFromTable(efficiency, TARGET_EFFICIENCY)
+            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
 
             -- Befehl an Reaktor / Relay ausführen
             applyControlAction(controlDirection, stepSize)
@@ -361,7 +366,7 @@ local function executionLoop()
                 local signChar = (controlDirection == 1) and "+" or "-"
                 local shortDiag = string.sub(stuckReason, 1, 10) 
                 local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s", 
-                    logCounter, signChar, stepSize, startEffForLog, efficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
+                    logCounter, signChar, stepSize, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
                 
                 table.insert(logHistory, 1, compactLog)
                 local maxLogLines = math.max(5, monitorHeight - 7)
@@ -379,6 +384,9 @@ local function executionLoop()
                 end
             end)
         end
+
+        -- EF-Wert für den nächsten Log-Vergleich sichern
+        previousLoggedEff = currentEfficiency
     end
 end
 
