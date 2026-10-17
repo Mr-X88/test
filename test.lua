@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.71 (Mit klickbarem Log-Ein/Aus-Schalter)
+-- SCRIPT VERSION 2.73 (Richtungserkennung wieder in der Sensor-Schleife)
 -- ==========================================
-local SCRIPT_VERSION = "v2.71"
+local SCRIPT_VERSION = "v2.73"
 
 local reactor = nil
 local monitor = nil
@@ -276,7 +276,7 @@ local function pulseListenerLoop()
                     desiredMultiplier = 8 -- Faktor 8 (32t)
                 end
                 
-                -- Puls in die Log-Historie aufnehmen (#ID|Zeit|DeltaT|Faktor)
+                -- Puls in die Log-Historie aufnehmen
                 local pulseLogLine = string.format("#%03d|Dt:%.3fs|Faktor:%d", pulseCountTotal, deltaT, desiredMultiplier)
                 table.insert(pulseLogHistory, 1, pulseLogLine)
                 local maxPulseLines = math.max(5, monitorHeight - 8)
@@ -313,7 +313,6 @@ local function touchListenerLoop()
             if y == monitorHeight then
                 currentPage = 2
             elseif y == 7 then
-                -- Klick auf die Log-Zeile schaltet Logs ein/aus
                 ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
             end
         elseif currentPage == 2 then
@@ -324,7 +323,7 @@ local function touchListenerLoop()
     end
 end
 
--- 6. ADAPTIVE SENSOR-SCHLEIFE
+-- 6. ADAPTIVE SENSOR-SCHLEIFE (Hier wird die Richtung permanent im Hintergrund ermittelt)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -341,6 +340,13 @@ local function backgroundSensorLoop()
         
         if eff > 0 then
             hasEverRun = true
+        end
+
+        -- Dynamische Richtungserkennung direkt im schnellen Sensor-Takt
+        if eff >= TARGET_EFFICIENCY then
+            controlDirection = -1 -- Senken, wenn Ziel erreicht oder überschritten
+        else
+            controlDirection = 1  -- Erhöhen, wenn unter dem Ziel
         end
 
         secondCounter = secondCounter + effectiveTicks
@@ -407,7 +413,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 7. AUSFÜHRUNGS-SCHLEIFE (Verwendet LOG_JUMP_THRESHOLD für die Log-Diagnose)
+-- 7. AUSFÜHRUNGS-SCHLEIFE (Übernimmt einfach die vorbereitete controlDirection)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -433,6 +439,7 @@ local function executionLoop()
                 maxEfficiencySeen = currentEfficiency
             end
 
+            -- Nutzt die von der Sensor-Schleife vorbereitete controlDirection
             stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
             applyControlAction(controlDirection, stepSize)
 
