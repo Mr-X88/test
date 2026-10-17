@@ -1,18 +1,18 @@
--- Version: 1.5 (Mit linearer Tabellen-Formel & Turbo-Modus)
--- Fusion Reactor Controller (Mit linearer Formel aus Tabellendaten & Absoluten Signalen)
+-- Version: 1.7 (Ohne redundanten Turbo-Modus, reine Tabellen-Formel & Impulssteuerung)
 local reactor = nil
 local monitor = nil
 
 -- ==========================================
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
-local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert (Standard auf ~100% angepasst)
+local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
+local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden
 
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
 local controlDirection = 1      -- 1 = Links (+ / Erhöhen), -1 = Rechts (- / Senken)
-local stepSize = 1              -- Dynamische Schrittweite
+local stepSize = 2              -- Start-Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
 
@@ -96,20 +96,17 @@ local function updateStats(eff, err, caseT)
     if caseT > stats.maxCase then stats.maxCase = caseT end
 end
 
--- 4. Absolutes Redstone-Signal auf Links oder Rechts setzen
-local function setSignalOutput(direction, signal)
-    if signal < 1 then signal = 1 end
-    if signal > 15 then signal = 15 end
+-- 4. Redstone-Impuls senden (mit konfigurierbarer Impulslänge)
+local function sendPulse(side, strength)
+    if strength < 1 then strength = 1 end
+    if strength > 15 then strength = 15 end
     
-    currentSignal = signal
     pcall(function()
-        if direction == 1 then
-            redstone.setAnalogOutput("left", currentSignal)
-            redstone.setAnalogOutput("right", 0)
-        else
-            redstone.setAnalogOutput("right", currentSignal)
-            redstone.setAnalogOutput("left", 0)
-        end
+        redstone.setAnalogOutput(side, strength)
+    end)
+    sleep(PULSE_LENGTH)
+    pcall(function()
+        redstone.setAnalogOutput(side, 0)
     end)
 end
 
@@ -118,11 +115,8 @@ redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
 -- 5. Lineare Formel basierend auf den Tabellendaten (CR zu EF)[cite: 2]
--- Aus den Daten ergibt sich ein linearer Anstieg von ca. 0.92 EF pro CR-Einheit.
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
-    -- Umrechnung der Effizienz-Differenz in einen passenden Signal-Anpassungsschritt
-    -- Steigung m ≈ 0.92 aus den Messwerten[cite: 2]
     local calculatedStep = math.floor(math.abs(effDiff) / 5.0) + 1
     
     if calculatedStep > 15 then
@@ -134,7 +128,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Hill-Climbing Regelung mit linearer Formel & Turbo-Modus
+-- 6. Hill-Climbing Regelung mit Cooldown & linearer Formel
 local function runControlLoop()
     local _, caseTemp, efficiency, errorLevel = getReactorData()
 
@@ -160,7 +154,7 @@ local function runControlLoop()
         statusText = "STANDBY"
     end
 
-    -- Wenn Standby oder Crush: Beide Redstone-Signale auf 0 setzen
+    -- Wenn Standby oder Crush: Keine Signale senden
     if statusText == "STANDBY" or statusText == "CRUSH" then
         pcall(function()
             redstone.setAnalogOutput("left", 0)
@@ -168,30 +162,32 @@ local function runControlLoop()
         end)
         lastEfficiency = 0 
         stuckReason = "Reaktor in " .. statusText
+        sleep(1.0)
         return
     end
 
-    -- Neuen Zielwert berechnen und absolut auf die entsprechende Seite legen
-    local targetSignal = currentSignal + (controlDirection * stepSize)
-    
-    if targetSignal > 15 then
-        targetSignal = 15
-        controlDirection = -1 -- Richtung wechseln
-    elseif targetSignal < 1 then
-        targetSignal = 1
-        controlDirection = 1  -- Richtung wechseln
+    -- Impuls auf die entsprechende Seite senden
+    local sideName = (controlDirection == 1) and "left" or "right"
+    sendPulse(sideName, stepSize)
+
+    -- Internen Signalwert nachführen
+    currentSignal = currentSignal + (controlDirection * stepSize)
+    if currentSignal > 15 then 
+        currentSignal = 15 
+        controlDirection = -1 
+    elseif currentSignal < 1 then 
+        currentSignal = 1 
+        controlDirection = 1 
     end
 
-    setSignalOutput(controlDirection, targetSignal)
-
-    -- Cooldown abwarten
+    -- Cooldown abwarten (auch bei Richtungswechsel)
     stuckReason = string.format("Cooldown (%.1fs)...", COOLDOWN_WAIT)
     sleep(COOLDOWN_WAIT)
 
     -- Erst nach dem Cooldown den neuen Wert abfragen
     local _, _, newEfficiency = getReactorData()
 
-    -- Auswertung & Anwendung der linearen Tabellen-Formel
+    -- Auswertung & Anwendung der linearen Tabellen-Formel[cite: 2]
     if lastEfficiency > 0 then
         if newEfficiency < lastEfficiency then
             -- Wert wurde schlechter -> Richtung wechseln und Schritt verkleinern
@@ -199,16 +195,9 @@ local function runControlLoop()
             stepSize = 1
             stuckReason = "Schlechter -> Richtung gewechselt"
         else
-            -- Wert wurde besser oder gleich -> Richtung beibehalten!
-            if newEfficiency < 50 then
-                -- TURBO-MODUS: Unter 50% EF und Richtung stimmt -> Volle Kraft (+15)
-                stepSize = 15
-                stuckReason = "Turbo (<50% EF) -> Max Power (15)"
-            else
-                -- Ab 50% EF: Nutzung der linearen Formel aus der Tabelle[cite: 2] für präzise Annäherung
-                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Tabellen-Formel -> Step %d", stepSize)
-            end
+            -- Wert wurde besser oder gleich -> Richtung beibehalten und über Formel anpassen!
+            stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+            stuckReason = string.format("Tabellen-Formel -> Step %d", stepSize)
         end
     else
         stepSize = 2
