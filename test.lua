@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.65 (Mit Basis-Ticks & dynamischem Multiplikator)
+-- SCRIPT VERSION 2.66 (Mit 3-Zyklen-Hysterese für den Adaptiv-Modus)
 -- ==========================================
-local SCRIPT_VERSION = "v2.65"
+local SCRIPT_VERSION = "v2.66"
 
 local reactor = nil
 local monitor = nil
@@ -52,8 +52,10 @@ local lastPollEF = -1
 local unchangedPollCount = 0
 local previousLoggedEff = -1
 
--- Variablen für die Go-Frequenz-Messung (Low Performance Mode)
+-- Variablen für die Go-Frequenz-Messung & Hysterese (Low Performance Mode)
 local goIntervalTracker = 0
+local highFreqCycles = 0
+local lowFreqCycles = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -242,7 +244,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. ADAPTIVE SENSOR-SCHLEIFE (Mit Basis-Ticks * Multiplikator)
+-- 4. ADAPTIVE SENSOR-SCHLEIFE (Mit 3-Zyklen-Hysterese)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -274,19 +276,33 @@ local function backgroundSensorLoop()
                 executionGo = true
                 unchangedPollCount = 0
                 
-                -- Adaptives Anpassen des Multiplikators basierend auf der Go-Frequenz
+                -- Adaptives Anpassen des Multiplikators mit 3-Zyklen-Prüfung
                 if ENABLE_LOW_PERF_MODE then
                     local currentTicksBetweenGo = goIntervalTracker
                     goIntervalTracker = 0 
                     
                     if currentTicksBetweenGo > 0 and currentTicksBetweenGo < 30 then
-                        if lowPerfMultiplier == 1 then lowPerfMultiplier = 2
-                        elseif lowPerfMultiplier == 2 then lowPerfMultiplier = 4
-                        elseif lowPerfMultiplier == 4 then lowPerfMultiplier = 8 end
-                    elseif currentTicksBetweenGo > 80 then
-                        if lowPerfMultiplier > 1 then 
-                            lowPerfMultiplier = lowPerfMultiplier / 2 
+                        highFreqCycles = highFreqCycles + 1
+                        lowFreqCycles = 0
+                        if highFreqCycles > 3 then
+                            if lowPerfMultiplier == 1 then lowPerfMultiplier = 2
+                            elseif lowPerfMultiplier == 2 then lowPerfMultiplier = 4
+                            elseif lowPerfMultiplier == 4 then lowPerfMultiplier = 8 end
+                            highFreqCycles = 0 -- Zähler nach Umschaltung zurücksetzen
                         end
+                    elseif currentTicksBetweenGo > 80 then
+                        lowFreqCycles = lowFreqCycles + 1
+                        highFreqCycles = 0
+                        if lowFreqCycles > 3 then
+                            if lowPerfMultiplier > 1 then 
+                                lowPerfMultiplier = lowPerfMultiplier / 2 
+                            end
+                            lowFreqCycles = 0 -- Zähler nach Umschaltung zurücksetzen
+                        end
+                    else
+                        -- Wenn im normalen Bereich, Zähler zurücksetzen
+                        highFreqCycles = 0
+                        lowFreqCycles = 0
                     end
                 end
             end
