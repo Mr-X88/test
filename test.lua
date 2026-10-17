@@ -11,7 +11,7 @@ local monitor = nil
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 90.0     -- Sicherer Idle-Punkt bei 90%
-local POLL_INTERVAL_TICKS = 10  -- Abfrage-Intervall in Ticks (20 Ticks = 1 Sekunde). 10 Ticks = 0.5s
+local POLL_INTERVAL_TICKS = 4  -- Abfrage-Intervall in Ticks (20 Ticks = 1 Sekunde). 10 Ticks = 0.5s
 local MAX_WAIT_TIME = 20.0      -- Sicherheits-Timeout in Sekunden, falls der Reaktor trödelt
 local STABILITY_EPSILON = 0.03  -- Ab welcher EF-Änderung gilt der Wert als "stabil"
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
