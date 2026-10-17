@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.59 (Mit nicht-linearer Kurvenformel & ohne Full-Power-Distance)
+-- SCRIPT VERSION 2.591 (Mit nicht-linearer Kurvenformel & ohne Full-Power-Distance)
 -- ==========================================
-local SCRIPT_VERSION = "v2.59"
+local SCRIPT_VERSION = "v2.591"
 
 local reactor = nil
 local monitor = nil
