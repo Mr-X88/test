@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 1.9
+-- SCRIPT VERSION 2.0
 -- ==========================================
-local SCRIPT_VERSION = "v1.9"
+local SCRIPT_VERSION = "v2.0"
 
 local reactor = nil
 local monitor = nil
@@ -12,12 +12,12 @@ local monitor = nil
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- EF-Schwelle: Ab hier stoppt die Regelung, bis es wieder sinkt
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
-local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden
+local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 4.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
-local controlDirection = 1      -- 1 = Links (+ / Erhöhen), -1 = Rechts (- / Senken)
+local controlDirection = 1      -- 1 = Links / Erhöhen (+), -1 = Rechts / Senken (-)
 local stepSize = 2              -- Start-Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
@@ -107,7 +107,7 @@ local function updateStats(eff, err, caseT)
     if caseT > stats.maxCase then stats.maxCase = caseT end
 end
 
--- 4. Redstone-Impuls senden (mit konfigurierbarer Impulslänge)
+-- 4. Redstone-Impuls senden (Fallback)
 local function sendPulse(side, strength)
     if strength < 1 then strength = 1 end
     if strength > 15 then strength = 15 end
@@ -119,6 +119,26 @@ local function sendPulse(side, strength)
     pcall(function()
         redstone.setAnalogOutput(side, 0)
     end)
+end
+
+-- Steuerungs-Funktion: Versucht adjustReactivity, nutzt Redstone als Fallback
+local function applyControlAction(direction, strength)
+    local success = false
+    
+    -- Versuche die direkte API-Funktion des Logic Adapters
+    if reactor and type(reactor.adjustReactivity) == "function" then
+        pcall(function()
+            -- Übergabe mit Vorzeichen: direction (1 oder -1) * strength
+            reactor.adjustReactivity(direction * strength)
+            success = true
+        end)
+    end
+    
+    -- Wenn adjustReactivity nicht verfügbar ist oder fehlschlägt -> Redstone-Fallback
+    if not success then
+        local sideName = (direction == 1) and "left" or "right"
+        sendPulse(sideName, strength)
+    end
 end
 
 -- Alle Ausgänge beim Start sicherheitshalber zurücksetzen
@@ -139,7 +159,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Hill-Climbing Regelung mit Ruhe-Modus bei IDLE_THRESHOLD
+-- 6. Hill-Climbing Regelung mit adjustReactivity & Fallback
 local function runControlLoop()
     local _, caseTemp, efficiency, errorLevel = getReactorData()
 
@@ -177,7 +197,7 @@ local function runControlLoop()
         return
     end
 
-    -- NEU: Wenn der Reaktor den Schwellenwert (z.B. 95%) erreicht hat -> Warten, bis er wieder sinkt
+    -- Wenn der Reaktor den Schwellenwert (z.B. 95%) erreicht hat -> Warten, bis er wieder sinkt
     if efficiency >= IDLE_THRESHOLD then
         pcall(function()
             redstone.setAnalogOutput("left", 0)
@@ -189,9 +209,8 @@ local function runControlLoop()
         return
     end
 
-    -- Impuls auf die entsprechende Seite senden
-    local sideName = (controlDirection == 1) and "left" or "right"
-    sendPulse(sideName, stepSize)
+    -- Regelungsbefehl senden (Nutzt adjustReactivity oder Redstone-Fallback)
+    applyControlAction(controlDirection, stepSize)
 
     -- Internen Signalwert nachführen
     currentSignal = currentSignal + (controlDirection * stepSize)
@@ -310,11 +329,11 @@ local function drawUI()
     monitor.clearLine()
     monitor.write("Fuel Type: D-T Fuel")
 
-    -- Regelung, Signalstärke und Seite (Links / Rechts)
+    -- Regelung, Signalstärke und Seite (Links / Rechts / API)
     monitor.setCursorPos(1, 11)
     monitor.clearLine()
     local signText = (controlDirection == 1) and "+" or "-"
-    local sideText = (controlDirection == 1) and "Links" or "Rechts"
+    local sideText = (reactor and type(reactor.adjustReactivity) == "function") and "API" or ((controlDirection == 1) and "Links" or "Rechts")
     monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
 
     -- Diagnose-Zeile
