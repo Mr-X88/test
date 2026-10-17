@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.54 (Entkoppelte Brain-Arm Architektur mit Go-Sync & Sekundenzähler)
+-- SCRIPT VERSION 2.55 (Entkoppelte Brain-Arm Architektur mit EF-Stable Go & Sekundenzähler)
 -- ==========================================
-local SCRIPT_VERSION = "v2.54"
+local SCRIPT_VERSION = "v2.55"
 
 local reactor = nil
 local monitor = nil
@@ -14,7 +14,7 @@ local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
 local FULL_POWER_DISTANCE = 43       -- Volle Power ab 43 Punkten Restabstand
 local POLL_INTERVAL_TICKS = 4        -- Sensor-Intervall (0.2 Sekunden)
-local EXECUTION_INTERVAL_TICKS = 20  -- Ausführungs-Takt für Befehle & Logs (20 Ticks = 1 Sekunde)
+local EXECUTION_INTERVAL_TICKS = 20  -- (Wird nun durch EF-Stabilität ersetzt)
 local JUMP_THRESHOLD = 3.0           -- Schwellenwert für Tick-Sprünge/-Einbrüche
 local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
 
@@ -41,11 +41,12 @@ local logCounter = 0
 local logHistory = {}           
 local wakeupTickCounter = 0     
 
--- Synchronisations-Variablen für Brain-Arm
-local executionTickCounter = 0
+-- Synchronisations-Variablen für Brain-Arm & Sekundenzähler
 local secondCounter = 0
 local secondsSinceLastGo = 0
 local executionGo = false
+local lastPollEF = -1
+local unchangedPollCount = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -230,7 +231,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung, Taktgeber & Sekundenzähler)
+-- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung, Sekundenzähler & Go-Trigger)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -248,19 +249,24 @@ local function backgroundSensorLoop()
             hasEverRun = true
         end
 
-        -- Taktgeber, Go-Signal und Sekunden-Zähler
-        executionTickCounter = executionTickCounter + POLL_INTERVAL_TICKS
+        -- Sekundenzähler läuft kontinuierlich im Hintergrund hoch
         secondCounter = secondCounter + POLL_INTERVAL_TICKS
-
         if secondCounter >= 20 then
             secondCounter = secondCounter - 20
             secondsSinceLastGo = secondsSinceLastGo + 1
         end
 
-        if executionTickCounter >= EXECUTION_INTERVAL_TICKS then
-            executionTickCounter = 0
-            executionGo = true
+        -- Go-Signal, wenn sich der EF-Wert innerhalb von 2 4-Ticken nicht ändert
+        if lastPollEF >= 0 and eff == lastPollEF then
+            unchangedPollCount = unchangedPollCount + 1
+            if unchangedPollCount >= 2 then
+                executionGo = true
+                unchangedPollCount = 0
+            end
+        else
+            unchangedPollCount = 0
         end
+        lastPollEF = eff
 
         -- Weckruf-Prüfung bei absolutem Stillstand
         if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
@@ -315,18 +321,18 @@ local function backgroundSensorLoop()
     end
 end
 
--- 5. KONFIGURIERBARE 20-TICK AUSFÜHRUNGS-SCHLEIFE (Der "Arm" & Protokoll, wartet auf Go)
+-- 5. AUSFÜHRUNGS-SCHLEIFE (Der "Arm" & Protokoll, wartet auf Go)
 local function executionLoop()
     while true do
-        -- Solange kein Go vorliegt, wird gewartet (kein Signal, kein Log, aber Berechnung läuft im Hintergrund)
+        -- Solange kein Go vorliegt, wird gewartet (währenddessen zählt der Sekundenzähler weiter)
         while not executionGo do
             sleep(0.05)
         end
         
-        -- Go sofort wieder verlieren, bis der nächste Takt ein neues Go gibt
+        -- Go sofort wieder verlieren
         executionGo = false
 
-        -- Sekunden für diesen Zyklus sichern und Zähler für den nächsten Zyklus auf 0 zurücksetzen
+        -- Gesammelte Sekunden sichern und Zähler auf 0 zurücksetzen
         local logSeconds = secondsSinceLastGo
         secondsSinceLastGo = 0
 
