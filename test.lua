@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.3 (Reine Formel-Steuerung)
+-- SCRIPT VERSION 2.5 (Ultrakompaktes Layout für Max-Logs)
 -- ==========================================
-local SCRIPT_VERSION = "v2.3"
+local SCRIPT_VERSION = "v2.5"
 
 local reactor = nil
 local monitor = nil
@@ -10,14 +10,15 @@ local monitor = nil
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 95.0     -- EF-Schwelle: Ab hier stoppt die Regelung, bis es wieder sinkt
+local IDLE_THRESHOLD = 95.0     -- EF-Schwelle: Ab hier stoppt die Regelung
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 8.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
+local EFF_TOLERANCE = 0.5       -- Toleranz-Schwelle für kleine Drops
 
 -- MONITOR LOG EINSTELLUNGEN
 local ENABLE_MONITOR_LOGS = true -- true = Logs auf Monitor anzeigen, false = Aus
-local MAX_LOG_LINES = 10        -- Maximale Anzahl an Log-Zeilen
+local monitorWidth, monitorHeight = 39, 25
 
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
@@ -26,7 +27,7 @@ local stepSize = 2              -- Start-Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
 local logCounter = 0
-local logHistory = {}           -- Speicher für die kompakten Monitor-Logs
+local logHistory = {}           -- Speicher für die Monitor-Logs
 
 -- Diagnose-Variable
 local stuckReason = "Warte auf Reaktor..."
@@ -38,7 +39,6 @@ local stats = {
     minCase = math.huge, maxCase = 0
 }
 
--- Start-Informationen im Computer-Terminal ausgeben
 print("==========================================")
 print(" FUSION REACTOR CONTROLLER " .. SCRIPT_VERSION)
 print("==========================================")
@@ -60,7 +60,9 @@ local function scanPeripherals()
             local m = peripheral.wrap(name)
             if m and m.isColor and m.isColor() then
                 monitor = m
-                print(" -> Farb-Monitor gefunden: " .. name)
+                monitorWidth, monitorHeight = monitor.getSize()
+                monitor.setTextScale(0.5) -- Kleinste Schrift für maximale Auflösung
+                print(" -> Farb-Monitor gefunden: " .. name .. " (" .. monitorWidth .. "x" .. monitorHeight .. ")")
             end
         end
     end
@@ -127,7 +129,7 @@ local function sendPulse(side, strength)
     end)
 end
 
--- Steuerungs-Funktion: Versucht adjustReactivity, nutzt Redstone als Fallback
+-- Steuerungs-Funktion
 local function applyControlAction(direction, strength)
     if strength > 15 then strength = 15 end
     local success = false
@@ -145,20 +147,14 @@ local function applyControlAction(direction, strength)
     end
 end
 
--- Alle Ausgänge beim Start sicherheitshalber zurücksetzen
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. Natürliche Formel-Steuerung (Proportional-Anpassung ohne künstlichen Deckel)
+-- 5. Natürliche Formel-Steuerung
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
-    
-    -- Faktor 0.12 skaliert den Schritt organisch:
-    -- Bei 70% Differenz -> 70 * 0.12 = 8.4 -> Schritt von ca. 9 (sicher und effektiv)
-    -- Bei 10% Differenz -> 10 * 0.12 = 1.2 -> Schritt von 2 (feinfühlig)
     local calculatedStep = math.floor(math.abs(effDiff) * 0.12) + 1
     
-    -- Physikalische Signal-Obergrenze des Ports (1 bis 15)
     if calculatedStep > 15 then
         calculatedStep = 15
     elseif calculatedStep < 1 then
@@ -168,7 +164,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Hill-Climbing Regelung mit reiner Formel-Dynamik
+-- 6. Regelungsschleife
 local function runControlLoop()
     logCounter = logCounter + 1
     local _, caseTemp, efficiency, errorLevel = getReactorData()
@@ -218,7 +214,6 @@ local function runControlLoop()
 
     local startEffForLog = efficiency
 
-    -- Regelungsbefehl direkt über die Formel-Schrittweite senden
     applyControlAction(controlDirection, stepSize)
 
     currentSignal = currentSignal + (controlDirection * stepSize)
@@ -252,13 +247,16 @@ local function runControlLoop()
                 stuckReason = "Sprung-, weg -> Richtungsel."
             end
         else
-            if newEfficiency < lastEfficiency then
+            if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
                 controlDirection = -controlDirection
                 stepSize = 1
-                stuckReason = "Schlechter -> Richtungswechsel"
+                stuckReason = "Schlechter (>Tol) -> Wechsel"
+            elseif newEfficiency >= lastEfficiency then
+                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                stuckReason = string.format("Stabil/Besser -> Step %d", stepSize)
             else
                 stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Formel -> Step %d", stepSize)
+                stuckReason = string.format("Im Toleranzbereich -> Halte")
             end
         end
     else
@@ -268,17 +266,20 @@ local function runControlLoop()
 
     lastEfficiency = newEfficiency
 
-    -- Kompakten und auf Monitorbreite optimierten Log-Eintrag erstellen
+    -- Log-Eintrag hinzufügen
     local signChar = (controlDirection == 1) and "+" or "-"
-    local shortDiag = string.sub(stuckReason, 1, 16)
+    local shortDiag = string.sub(stuckReason, 1, 18)
     local compactLog = string.format("#%03d|%s%d|EF:%.1f->%.1f|%s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, shortDiag)
     table.insert(logHistory, 1, compactLog)
-    if #logHistory > MAX_LOG_LINES then
+    
+    -- Dynamische Anzahl an Log-Zeilen (nutzt den gesamten Platz ab Zeile 9 bis zum Bildschirmende)
+    local maxLogLines = math.max(5, monitorHeight - 9)
+    if #logHistory > maxLogLines then
         table.remove(logHistory)
     end
 end
 
--- 7. Monitor grafisch zeichnen
+-- 7. Monitor im Ultrakompakt-Layout zeichnen
 local function drawUI()
     if not monitor then return end
 
@@ -294,85 +295,73 @@ local function drawUI()
         statusText = "STANDBY"
     end
 
+    monitor.setBackgroundColor(colors.black)
+    
+    -- Zeile 1: Titelleiste
     monitor.setCursorPos(1, 1)
     monitor.setBackgroundColor(colors.blue)
     monitor.setTextColor(colors.white)
-    monitor.write(" === FUSION CONTROL " .. SCRIPT_VERSION .. " === ")
+    monitor.write(string.format("=== FUSION CONTROL %s ===", SCRIPT_VERSION))
     monitor.setBackgroundColor(colors.black)
 
-    -- Status
-    monitor.setCursorPos(1, 3)
+    -- Zeile 2: Status & EF
+    monitor.setCursorPos(1, 2)
     monitor.clearLine()
     monitor.write("Modus: ")
     if efficiency >= IDLE_THRESHOLD then
         monitor.setTextColor(colors.cyan)
-        monitor.write("IDLE (>= " .. IDLE_THRESHOLD .. "%)")
+        monitor.write("IDLE ")
     elseif statusText == "RUN" then
         monitor.setTextColor(colors.green)
-        monitor.write("RUN           ")
+        monitor.write("RUN  ")
     elseif statusText == "CRUSH" then
         monitor.setTextColor(colors.red)
-        monitor.write("CRUSH         ")
+        monitor.write("CRUSH")
     else
         monitor.setTextColor(colors.orange)
-        monitor.write("STANDBY       ")
+        monitor.write("STAND")
     end
     monitor.setTextColor(colors.white)
+    monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
 
-    -- Case Temperatur
-    monitor.setCursorPos(1, 5)
+    -- Zeile 3: Case Temperatur & Error Level
+    monitor.setCursorPos(1, 3)
     monitor.clearLine()
-    monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
-
-    -- EF (Efficiency)
-    monitor.setCursorPos(1, 7)
-    monitor.clearLine()
-    monitor.setTextColor(colors.yellow)
-    monitor.write(string.format("EF: %.1f%% (Ziel:%d Min:%.1f)", efficiency, TARGET_EFFICIENCY, stats.minEff == math.huge and 0 or stats.minEff))
-    monitor.setTextColor(colors.white)
-
-    -- ER (Error Level)
-    monitor.setCursorPos(1, 8)
-    monitor.clearLine()
+    monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
+    monitor.write(" | ER: ")
     if errorLevel > 50 then monitor.setTextColor(colors.red) end
-    monitor.write(string.format("ER (Err):  %.2f%% (Min:%.2f Max:%.2f)", errorLevel, stats.minErr == math.huge and 0 or stats.minErr, stats.maxErr))
+    monitor.write(string.format("%.1f%%", errorLevel))
     monitor.setTextColor(colors.white)
 
-    -- Fuel Type
-    monitor.setCursorPos(1, 10)
-    monitor.clearLine()
-    monitor.write("Fuel Type: D-T Fuel")
-
-    -- Regelung, Signalstärke und Seite
-    monitor.setCursorPos(1, 11)
+    -- Zeile 4: Regelung & Signal
+    monitor.setCursorPos(1, 4)
     monitor.clearLine()
     local signText = (controlDirection == 1) and "+" or "-"
-    local sideText = (reactor and type(reactor.adjustReactivity) == "function") and "API" or ((controlDirection == 1) and "Links" or "Rechts")
-    monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
+    local sideText = (reactor and type(reactor.adjustReactivity) == "function") and "API" or ((controlDirection == 1) and "L" or "R")
+    monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
 
-    -- Diagnose-Zeile
-    monitor.setCursorPos(1, 13)
+    -- Zeile 5: Diagnose
+    monitor.setCursorPos(1, 5)
     monitor.clearLine()
     monitor.setTextColor(colors.cyan)
-    monitor.write("Diag: " .. string.sub(stuckReason, 1, 24))
+    monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
+    monitor.setTextColor(colors.white)
 
-    -- MONITOR-LOGS (Auf Bildschirmbreite optimiert und gekürzt)
+    -- Zeile 7+: MONITOR-LOGS (Füllt den Rest des Bildschirms komplett aus!)
     if ENABLE_MONITOR_LOGS then
-        monitor.setCursorPos(1, 15)
+        monitor.setCursorPos(1, 7)
         monitor.setTextColor(colors.lightGray)
         monitor.write("--- ZYKLEN-LOGS ---")
 
-        for i = 1, MAX_LOG_LINES do
-            monitor.setCursorPos(1, 15 + i)
+        local maxLogLines = math.max(5, monitorHeight - 8)
+        for i = 1, maxLogLines do
+            monitor.setCursorPos(1, 7 + i)
             monitor.clearLine()
             if logHistory[i] then
                 monitor.write(logHistory[i])
             end
         end
     end
-
-    monitor.setBackgroundColor(colors.black)
-    monitor.setTextColor(colors.lightGray)
 end
 
 -- 8. Hauptschleife
