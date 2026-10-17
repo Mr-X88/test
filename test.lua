@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.69 (Mit 2. Monitor-Seite für Redstone-Diag & Klick-Umschaltung)
+-- SCRIPT VERSION 2.70 (Mit Redstone-Puls-Log auf Seite 2)
 -- ==========================================
-local SCRIPT_VERSION = "v2.69"
+local SCRIPT_VERSION = "v2.70"
 
 local reactor = nil
 local monitor = nil
@@ -57,10 +57,11 @@ local lastPulseTime = os.clock()
 local pulseTargetMultiplier = 1
 local pulseStreakCount = 0
 
--- Variablen für die Monitor-Seiten & Redstone-Diagnose
-local currentPage = 1                -- 1 = Haupt-UI & Logs, 2 = Redstone-Diagnose
+-- Variablen für die Monitor-Seiten & Redstone-Log
+local currentPage = 1                -- 1 = Haupt-UI & Logs, 2 = Redstone-Diagnose & Puls-Logs
 local pulseCountTotal = 0
 local lastDeltaT = 0
+local pulseLogHistory = {}
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -266,15 +267,23 @@ local function pulseListenerLoop()
                 local desiredMultiplier = 1
                 
                 if deltaT >= 0.75 then
-                    desiredMultiplier = 1 -- 2.0s - 0.75s -> 4t
+                    desiredMultiplier = 1 -- Faktor 1 (4t)
                 elseif deltaT >= 0.375 then
-                    desiredMultiplier = 2 -- 0.74s - 0.375s -> 8t
+                    desiredMultiplier = 2 -- Faktor 2 (8t)
                 elseif deltaT >= 0.187 then
-                    desiredMultiplier = 4 -- 0.374s - 0.187s -> 16t
+                    desiredMultiplier = 4 -- Faktor 4 (16t)
                 else
-                    desiredMultiplier = 8 -- 0.186s - 0.05s -> 32t
+                    desiredMultiplier = 8 -- Faktor 8 (32t)
                 end
                 
+                -- Puls in die Log-Historie aufnehmen (#ID|Zeit|DeltaT|Faktor)
+                local pulseLogLine = string.format("#%03d|Dt:%.3fs|Faktor:%d", pulseCountTotal, deltaT, desiredMultiplier)
+                table.insert(pulseLogHistory, 1, pulseLogLine)
+                local maxPulseLines = math.max(5, monitorHeight - 8)
+                if #pulseLogHistory > maxPulseLines then
+                    table.remove(pulseLogHistory)
+                end
+
                 -- Hysterese: Erst umschalten, wenn der Bereich 3 mal hintereinander erreicht wurde
                 if desiredMultiplier ~= lowPerfMultiplier then
                     if desiredMultiplier == pulseTargetMultiplier then
@@ -300,7 +309,6 @@ end
 local function touchListenerLoop()
     while true do
         os.pullEvent("monitor_touch")
-        -- Umschalten zwischen Seite 1 und 2
         currentPage = (currentPage == 1) and 2 or 1
     end
 end
@@ -552,66 +560,49 @@ local function uiLoop()
                 monitor.setCursorPos(1, monitorHeight)
                 monitor.setBackgroundColor(colors.gray)
                 monitor.setTextColor(colors.yellow)
-                monitor.write("[ Klick für Seite 2: Redstone-Diag ]")
+                monitor.write("[ Klick für Seite 2: Redstone-Log ]")
                 monitor.setBackgroundColor(colors.black)
 
             else
-                -- === SEITE 2: REDSTONE-PULS-DIAGNOSE ===
+                -- === SEITE 2: REDSTONE-DIAGNOSE & PULS-LOGS ===
                 monitor.setCursorPos(1, 1)
                 monitor.setBackgroundColor(colors.blue)
                 monitor.setTextColor(colors.white)
-                monitor.write(string.format("=== REDSTONE DIAGNOSE (2/2) ===", SCRIPT_VERSION))
+                monitor.write(string.format("=== REDSTONE PULS LOG (2/2) ===", SCRIPT_VERSION))
                 monitor.setBackgroundColor(colors.black)
 
                 local bottomState = redstone.getInput("bottom")
 
                 monitor.setCursorPos(1, 3)
-                monitor.write("Eingang unten (Bottom): ")
+                monitor.write("Unten: ")
                 if bottomState then
                     monitor.setTextColor(colors.green)
-                    monitor.write("AN (Signal aktiv)")
+                    monitor.write("AN ")
                 else
                     monitor.setTextColor(colors.lightGray)
-                    monitor.write("AUS / Warten")
+                    monitor.write("AUS ")
                 end
                 monitor.setTextColor(colors.white)
+                monitor.write(string.format("| Pulse:%d | Aktif:%dx (T:%dt)", pulseCountTotal, lowPerfMultiplier, POLL_INTERVAL_TICKS * lowPerfMultiplier))
 
                 monitor.setCursorPos(1, 5)
-                monitor.write(string.format("Gesamt-Pulse empfangen: %d", pulseCountTotal))
+                monitor.setTextColor(colors.lightGray)
+                monitor.write("--- PULS-LOGS (Zeit & Faktor) ---")
 
-                monitor.setCursorPos(1, 6)
-                monitor.write(string.format("Letzter Puls Abstand:   %.3fs", lastDeltaT))
-
-                monitor.setCursorPos(1, 7)
-                monitor.write(string.format("Aktiver Multiplikator:  %dx (T:%dt)", lowPerfMultiplier, POLL_INTERVAL_TICKS * lowPerfMultiplier))
-
-                monitor.setCursorPos(1, 9)
-                monitor.setTextColor(colors.yellow)
-                monitor.write("--- WAS MAN WISSEN SOLLTE ---")
-                monitor.setTextColor(colors.white)
-
-                monitor.setCursorPos(1, 11)
-                monitor.write("• Misst die Zeit zwischen Pulsen von unten.")
-                monitor.setCursorPos(1, 12)
-                monitor.write("• Aktive Takt-Bereiche (Intervalle):")
-                monitor.setCursorPos(1, 13)
-                monitor.write("  - 2.0s bis 0.75s -> 4t  (Faktor 1)")
-                monitor.setCursorPos(1, 14)
-                monitor.write("  - 0.74s bis 0.375s -> 8t (Faktor 2)")
-                monitor.setCursorPos(1, 15)
-                monitor.write("  - 0.374s bis 0.187s -> 16t (Faktor 4)")
-                monitor.setCursorPos(1, 16)
-                monitor.write("  - 0.186s bis 0.05s -> 32t (Faktor 8)")
-                monitor.setCursorPos(1, 18)
-                monitor.write("• Hysterese-Schutz: Schaltet erst um,")
-                monitor.setCursorPos(1, 19)
-                monitor.write("  wenn ein Bereich 3x in Folge anliegt.")
+                local maxPulseLines = math.max(5, monitorHeight - 7)
+                for i = 1, maxPulseLines do
+                    monitor.setCursorPos(1, 5 + i)
+                    monitor.clearLine()
+                    if pulseLogHistory[i] then
+                        monitor.write(pulseLogHistory[i])
+                    end
+                end
 
                 -- Footer / Button für Seitenwechsel
                 monitor.setCursorPos(1, monitorHeight)
                 monitor.setBackgroundColor(colors.gray)
                 monitor.setTextColor(colors.yellow)
-                monitor.write("[ Klick für Seite 1: Haupt-UI & Logs ]")
+                monitor.write("[ Klick für Seite 1: Haupt-UI ]")
                 monitor.setBackgroundColor(colors.black)
             end
         end
