@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.68 (Mit Redstone-Puls-Messung von unten)
+-- SCRIPT VERSION 2.69 (Mit 2. Monitor-Seite für Redstone-Diag & Klick-Umschaltung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.68"
+local SCRIPT_VERSION = "v2.69"
 
 local reactor = nil
 local monitor = nil
@@ -56,6 +56,11 @@ local previousLoggedEff = -1
 local lastPulseTime = os.clock()
 local pulseTargetMultiplier = 1
 local pulseStreakCount = 0
+
+-- Variablen für die Monitor-Seiten & Redstone-Diagnose
+local currentPage = 1                -- 1 = Haupt-UI & Logs, 2 = Redstone-Diagnose
+local pulseCountTotal = 0
+local lastDeltaT = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -253,19 +258,21 @@ local function pulseListenerLoop()
             local now = os.clock()
             local deltaT = now - lastPulseTime
             lastPulseTime = now
+            lastDeltaT = deltaT
+            pulseCountTotal = pulseCountTotal + 1
             
             -- Filter gegen extreme Ausreißer
             if deltaT >= 0.05 and deltaT <= 3.0 then
                 local desiredMultiplier = 1
                 
                 if deltaT >= 0.75 then
-                    desiredMultiplier = 1 -- 2.0s - 0.75s -> 4t (Multiplikator 1)
+                    desiredMultiplier = 1 -- 2.0s - 0.75s -> 4t
                 elseif deltaT >= 0.375 then
-                    desiredMultiplier = 2 -- 0.74s - 0.375s -> 8t (Multiplikator 2)
+                    desiredMultiplier = 2 -- 0.74s - 0.375s -> 8t
                 elseif deltaT >= 0.187 then
-                    desiredMultiplier = 4 -- 0.374s - 0.187s -> 16t (Multiplikator 4)
+                    desiredMultiplier = 4 -- 0.374s - 0.187s -> 16t
                 else
-                    desiredMultiplier = 8 -- 0.186s - 0.05s -> 32t (Multiplikator 8)
+                    desiredMultiplier = 8 -- 0.186s - 0.05s -> 32t
                 end
                 
                 -- Hysterese: Erst umschalten, wenn der Bereich 3 mal hintereinander erreicht wurde
@@ -289,7 +296,16 @@ local function pulseListenerLoop()
     end
 end
 
--- 5. ADAPTIVE SENSOR-SCHLEIFE
+-- 5. MONITOR-TOUCH LISTENER FÜR SEITENWECHSEL
+local function touchListenerLoop()
+    while true do
+        os.pullEvent("monitor_touch")
+        -- Umschalten zwischen Seite 1 und 2
+        currentPage = (currentPage == 1) and 2 or 1
+    end
+end
+
+-- 6. ADAPTIVE SENSOR-SCHLEIFE
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -372,7 +388,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. AUSFÜHRUNGS-SCHLEIFE (Verwendet LOG_JUMP_THRESHOLD für die Log-Diagnose)
+-- 7. AUSFÜHRUNGS-SCHLEIFE (Verwendet LOG_JUMP_THRESHOLD für die Log-Diagnose)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -430,7 +446,7 @@ local function executionLoop()
                     logCounter, signChar, stepSize, startEffForLog, currentEfficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
                 
                 table.insert(logHistory, 1, compactLog)
-                local maxLogLines = math.max(5, monitorHeight - 7)
+                local maxLogLines = math.max(5, monitorHeight - 9)
                 if #logHistory > maxLogLines then
                     table.remove(logHistory)
                 end
@@ -449,89 +465,159 @@ local function executionLoop()
     end
 end
 
--- 7. MONITOR-UI SCHLEIFE (Anzeige mit dynamischem Tick-Anzeiger)
+-- 8. MONITOR-UI SCHLEIFE (Zwei Seiten mit Klick-Navigation)
 local function uiLoop()
     while true do
         if monitor then
-            local efficiency = liveEF
-            local caseTemp = liveCaseTemp
-            local errorLevel = liveER
-            local effectiveTicks = POLL_INTERVAL_TICKS * lowPerfMultiplier
-
-            local statusText = "STANDBY"
-            if efficiency > 0 then
-                statusText = "RUN"
-            elseif hasEverRun and efficiency == 0 then
-                statusText = "CRUSH"
-            else
-                statusText = "STANDBY"
-            end
-
             monitor.setBackgroundColor(colors.black)
-            
-            monitor.setCursorPos(1, 1)
-            monitor.setBackgroundColor(colors.blue)
-            monitor.setTextColor(colors.white)
-            monitor.write(string.format("=== FUSION CONTROL %s ===", SCRIPT_VERSION))
-            monitor.setBackgroundColor(colors.black)
+            monitor.clear()
 
-            monitor.setCursorPos(1, 2)
-            monitor.clearLine()
-            monitor.write("Modus: ")
-            if efficiency >= IDLE_THRESHOLD then
+            if currentPage == 1 then
+                -- === SEITE 1: HAUPT-UI & ZYKLEN-LOGS ===
+                local efficiency = liveEF
+                local caseTemp = liveCaseTemp
+                local errorLevel = liveER
+                local effectiveTicks = POLL_INTERVAL_TICKS * lowPerfMultiplier
+
+                local statusText = "STANDBY"
+                if efficiency > 0 then
+                    statusText = "RUN"
+                elseif hasEverRun and efficiency == 0 then
+                    statusText = "CRUSH"
+                else
+                    statusText = "STANDBY"
+                end
+                
+                monitor.setCursorPos(1, 1)
+                monitor.setBackgroundColor(colors.blue)
+                monitor.setTextColor(colors.white)
+                monitor.write(string.format("=== FUSION CONTROL %s (1/2) ===", SCRIPT_VERSION))
+                monitor.setBackgroundColor(colors.black)
+
+                monitor.setCursorPos(1, 2)
+                monitor.clearLine()
+                monitor.write("Modus: ")
+                if efficiency >= IDLE_THRESHOLD then
+                    monitor.setTextColor(colors.cyan)
+                    monitor.write("IDLE ")
+                elseif statusText == "RUN" then
+                    monitor.setTextColor(colors.green)
+                    monitor.write("RUN  ")
+                elseif statusText == "CRUSH" then
+                    monitor.setTextColor(colors.red)
+                    monitor.write("CRUSH")
+                else
+                    monitor.setTextColor(colors.orange)
+                    monitor.write("STAND")
+                end
+                monitor.setTextColor(colors.white)
+                monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
+
+                monitor.setCursorPos(1, 3)
+                monitor.clearLine()
+                monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
+                monitor.write(" | ER: ")
+                if errorLevel > 50 then monitor.setTextColor(colors.red) end
+                monitor.write(string.format("%.1f%%", errorLevel))
+                monitor.setTextColor(colors.white)
+
+                monitor.setCursorPos(1, 4)
+                monitor.clearLine()
+                local signText = (controlDirection == 1) and "+" or "-"
+                local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
+                monitor.write(string.format("Regel: %s%d | Sig: %-2d (T:%dt)", signText, stepSize, currentSignal, effectiveTicks))
+
+                monitor.setCursorPos(1, 5)
+                monitor.clearLine()
                 monitor.setTextColor(colors.cyan)
-                monitor.write("IDLE ")
-            elseif statusText == "RUN" then
-                monitor.setTextColor(colors.green)
-                monitor.write("RUN  ")
-            elseif statusText == "CRUSH" then
-                monitor.setTextColor(colors.red)
-                monitor.write("CRUSH")
-            else
-                monitor.setTextColor(colors.orange)
-                monitor.write("STAND")
-            end
-            monitor.setTextColor(colors.white)
-            monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
+                monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
+                monitor.setTextColor(colors.white)
 
-            monitor.setCursorPos(1, 3)
-            monitor.clearLine()
-            monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
-            monitor.write(" | ER: ")
-            if errorLevel > 50 then monitor.setTextColor(colors.red) end
-            monitor.write(string.format("%.1f%%", errorLevel))
-            monitor.setTextColor(colors.white)
+                if ENABLE_MONITOR_LOGS then
+                    monitor.setCursorPos(1, 7)
+                    monitor.setTextColor(colors.lightGray)
+                    monitor.write("--- ZYKLEN-LOGS ---")
 
-            monitor.setCursorPos(1, 4)
-            monitor.clearLine()
-            local signText = (controlDirection == 1) and "+" or "-"
-            local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
-            monitor.write(string.format("Regel: %s%d | Sig: %-2d (T:%dt)", signText, stepSize, currentSignal, effectiveTicks))
-
-            monitor.setCursorPos(1, 5)
-            monitor.clearLine()
-            monitor.setTextColor(colors.cyan)
-            monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
-            monitor.setTextColor(colors.white)
-
-            if ENABLE_MONITOR_LOGS then
-                monitor.setCursorPos(1, 7)
-                monitor.setTextColor(colors.lightGray)
-                monitor.write("--- ZYKLEN-LOGS ---")
-
-                local maxLogLines = math.max(5, monitorHeight - 7)
-                for i = 1, maxLogLines do
-                    monitor.setCursorPos(1, 7 + i)
-                    monitor.clearLine()
-                    if logHistory[i] then
-                        monitor.write(logHistory[i])
+                    local maxLogLines = math.max(5, monitorHeight - 8)
+                    for i = 1, maxLogLines do
+                        monitor.setCursorPos(1, 7 + i)
+                        monitor.clearLine()
+                        if logHistory[i] then
+                            monitor.write(logHistory[i])
+                        end
                     end
                 end
+
+                -- Footer / Button für Seitenwechsel
+                monitor.setCursorPos(1, monitorHeight)
+                monitor.setBackgroundColor(colors.gray)
+                monitor.setTextColor(colors.yellow)
+                monitor.write("[ Klick für Seite 2: Redstone-Diag ]")
+                monitor.setBackgroundColor(colors.black)
+
+            else
+                -- === SEITE 2: REDSTONE-PULS-DIAGNOSE ===
+                monitor.setCursorPos(1, 1)
+                monitor.setBackgroundColor(colors.blue)
+                monitor.setTextColor(colors.white)
+                monitor.write(string.format("=== REDSTONE DIAGNOSE (2/2) ===", SCRIPT_VERSION))
+                monitor.setBackgroundColor(colors.black)
+
+                local bottomState = redstone.getInput("bottom")
+
+                monitor.setCursorPos(1, 3)
+                monitor.write("Eingang unten (Bottom): ")
+                if bottomState then
+                    monitor.setTextColor(colors.green)
+                    monitor.write("AN (Signal aktiv)")
+                else
+                    monitor.setTextColor(colors.lightGray)
+                    monitor.write("AUS / Warten")
+                end
+                monitor.setTextColor(colors.white)
+
+                monitor.setCursorPos(1, 5)
+                monitor.write(string.format("Gesamt-Pulse empfangen: %d", pulseCountTotal))
+
+                monitor.setCursorPos(1, 6)
+                monitor.write(string.format("Letzter Puls Abstand:   %.3fs", lastDeltaT))
+
+                monitor.setCursorPos(1, 7)
+                monitor.write(string.format("Aktiver Multiplikator:  %dx (T:%dt)", lowPerfMultiplier, POLL_INTERVAL_TICKS * lowPerfMultiplier))
+
+                monitor.setCursorPos(1, 9)
+                monitor.setTextColor(colors.yellow)
+                monitor.write("--- WAS MAN WISSEN SOLLTE ---")
+                monitor.setTextColor(colors.white)
+
+                monitor.setCursorPos(1, 11)
+                monitor.write("• Misst die Zeit zwischen Pulsen von unten.")
+                monitor.setCursorPos(1, 12)
+                monitor.write("• Aktive Takt-Bereiche (Intervalle):")
+                monitor.setCursorPos(1, 13)
+                monitor.write("  - 2.0s bis 0.75s -> 4t  (Faktor 1)")
+                monitor.setCursorPos(1, 14)
+                monitor.write("  - 0.74s bis 0.375s -> 8t (Faktor 2)")
+                monitor.setCursorPos(1, 15)
+                monitor.write("  - 0.374s bis 0.187s -> 16t (Faktor 4)")
+                monitor.setCursorPos(1, 16)
+                monitor.write("  - 0.186s bis 0.05s -> 32t (Faktor 8)")
+                monitor.setCursorPos(1, 18)
+                monitor.write("• Hysterese-Schutz: Schaltet erst um,")
+                monitor.setCursorPos(1, 19)
+                monitor.write("  wenn ein Bereich 3x in Folge anliegt.")
+
+                -- Footer / Button für Seitenwechsel
+                monitor.setCursorPos(1, monitorHeight)
+                monitor.setBackgroundColor(colors.gray)
+                monitor.setTextColor(colors.yellow)
+                monitor.write("[ Klick für Seite 1: Haupt-UI & Logs ]")
+                monitor.setBackgroundColor(colors.black)
             end
         end
         sleep(0.25)
     end
 end
 
--- 8. Parallele Ausführung aller Prozesse (inklusive Puls-Listener)
-parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop, pulseListenerLoop)
+-- 9. Parallele Ausführung aller Prozesse (inkl. Touch- und Puls-Listener)
+parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop, pulseListenerLoop, touchListenerLoop)
