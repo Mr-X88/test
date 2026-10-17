@@ -1,5 +1,5 @@
 -- ==========================================
--- SCRIPT VERSION 2.8 (Ohne Notstopp, mit Blitz-Recovery)
+-- SCRIPT VERSION 2.8.1 (Ohne Notstopp, mit Blitz-Recovery)
 -- ==========================================
 local SCRIPT_VERSION = "v2.8"
 
