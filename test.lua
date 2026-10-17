@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.53 (Entkoppelte Brain-Arm Architektur mit Go-Sync & Sekundenzähler)
+-- SCRIPT VERSION 2.54 (Entkoppelte Brain-Arm Architektur mit Go-Sync & Sekundenzähler)
 -- ==========================================
-local SCRIPT_VERSION = "v2.53"
+local SCRIPT_VERSION = "v2.54"
 
 local reactor = nil
 local monitor = nil
@@ -440,4 +440,24 @@ local function uiLoop()
             monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
             monitor.setTextColor(colors.white)
 
-            if ENABLE_MON
+            if ENABLE_MONITOR_LOGS then
+                monitor.setCursorPos(1, 7)
+                monitor.setTextColor(colors.lightGray)
+                monitor.write("--- ZYKLEN-LOGS ---")
+
+                local maxLogLines = math.max(5, monitorHeight - 7)
+                for i = 1, maxLogLines do
+                    monitor.setCursorPos(1, 7 + i)
+                    monitor.clearLine()
+                    if logHistory[i] then
+                        monitor.write(logHistory[i])
+                    end
+                end
+            end
+        end
+        sleep(0.25)
+    end
+end
+
+-- 7. Parallele Ausführung aller Prozesse
+parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
