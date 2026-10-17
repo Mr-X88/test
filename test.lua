@@ -1,673 +1,281 @@
+-- Fusion Reactor Controller (Anti-Ping-Pong & Low-Signal-Schutz)
+-- Optimierte Version mit direktem absolutem Analog-Signal
 
--- Better Fusion Reactor Controller
--- Minecraft 1.20.1 | CC:Tweaked / Advanced Peripherals
--- Effizienzoptimierung mit Anti-Ping-Pong und Monitor
---
--- WICHTIG:
--- left  = Erhöhen (Annahme)
--- right = Verringern (Annahme)
--- Automatik startet AUS.
---
--- Tasten:
--- A = Automatik ein/aus
--- Q = Beenden und Ausgänge auf 0 setzen
---
--- Die Reactor-API muss zu deiner Mod-Version passen.
+local reactor = nil
+local monitor = nil
 
-local CFG = {
-    targetEfficiency = 70,  -- Mindestziel; danach weiter optimieren
-    deadband = 0.35,        -- ignorierte Effizienzschwankung
-    maxError = 100,         -- ab hier Automatik pausieren
-    warningError = 50,
+-- REGELUNGS-EINSTELLUNGEN
+local TARGET_EFFICIENCY = 70    -- Gewünschter Ziel-EF-Wert
+local REDSTONE_SIDE = "back"    -- Feste Seite für das analoge Steuersignal
 
-    minSignal = 1,
-    maxSignal = 15,
-    initialSignal = 8,
-    initialStep = 1,
-    maxStep = 2,
+-- Regelungs-Variablen
+local currentSignal = 8         
+local controlDirection = 1     
+local stepSize = 1             
+local recoveryCounter = 0      
 
-    sampleInterval = 1,     -- Sekunden
-    displayInterval = 1,    -- Sekunden
-    samplesPerTrial = 5,
-    monitorScale = 0.5,
+-- Diagnose- & Log-Variablen
+local stuckReason = "Warte auf Reaktor..."
+local logCounter = 0
 
-    increaseSide = "left",
-    decreaseSide = "right",
-
-    -- Erst aktivieren, wenn du eine sichere Temperaturgrenze kennst.
-    useCaseTempLimit = false,
-    criticalCaseTemp = 10000000
-}
-
-local reactor, reactorName
-local monitor, monitorName
-local auto = false
-local running = true
-
-local status = "Initialisierung"
-local detail = "Suche Peripherie..."
-local lastAction = "Keine"
-local lastError = nil
-local logicMode = "Unbekannt"
-
-local signal = CFG.initialSignal
-local direction = 1 -- +1 = erhöhen, -1 = verringern
-local step = CFG.initialStep
-
-local trial = nil
-local samples = {}
-local cycles = 0
-local bestEfficiency = nil
-
-local data = {
-    efficiency = nil,
-    errorLevel = nil,
-    caseTemp = nil
-}
-
+-- Statistiken für Min/Max
 local stats = {
-    minEff = math.huge,
-    maxEff = -math.huge,
-    minError = math.huge,
-    maxError = -math.huge,
-    minTemp = math.huge,
-    maxTemp = -math.huge
+    minEff = math.huge, maxEff = -math.huge,
+    minErr = math.huge, maxErr = -math.huge,
+    minCase = math.huge, maxCase = 0
 }
 
--- Sichere API-Aufrufe
-local function hasMethod(obj, method)
-    if not obj then return false end
-    local ok, fn = pcall(function()
-        return obj[method]
-    end)
-    return ok and type(fn) == "function"
-end
-
-local function safeCall(obj, method, ...)
-    if not obj then
-        return false, nil, "Peripherie nicht verfügbar"
-    end
-
-    local okFn, fn = pcall(function()
-        return obj[method]
-    end)
-
-    if not okFn or type(fn) ~= "function" then
-        return false, nil, "Methode fehlt: " .. method
-    end
-
-    local args = {...}
-    local unpackArgs = table.unpack or unpack
-
-    local ok, result = pcall(function()
-        return fn(unpackArgs(args))
-    end)
-
-    if not ok then
-        return false, nil, tostring(result)
-    end
-
-    return true, result
-end
-
+-- 1. Peripherie automatisch erkennen
 local function scanPeripherals()
-    reactor, reactorName = nil, nil
-    monitor, monitorName = nil, nil
-
-    local ok, names = pcall(peripheral.getNames)
-    if not ok or type(names) ~= "table" then
-        return false
-    end
-
-    -- getNames() umfasst auch sichtbare Geräte über Wired Modems.
-    for _, name in ipairs(names) do
-        local obj = peripheral.wrap(name)
-        local okType, pType = pcall(peripheral.getType, name)
-
-        local lowerName = tostring(name):lower()
-        local lowerType = tostring(pType or ""):lower()
-
-        if not reactor and obj
-            and hasMethod(obj, "getEfficiency")
-            and hasMethod(obj, "getErrorLevel")
-            and hasMethod(obj, "getCaseTemperature")
-            and (
-                hasMethod(obj, "getLogicMode")
-                or lowerName:find("logicadapter", 1, true)
-            )
-        then
-            reactor = obj
-            reactorName = name
-        end
-
-        if not monitor and obj
-            and (
-                lowerType:find("monitor", 1, true)
-                or lowerName:find("monitor", 1, true)
-            )
-            and hasMethod(obj, "setCursorPos")
-            and hasMethod(obj, "write")
-            and hasMethod(obj, "getSize")
-        then
-            monitor = obj
-            monitorName = name
+    reactor = nil
+    monitor = nil
+    
+    print("--- Suche Peripherie ---")
+    for _, name in ipairs(peripheral.getNames()) do
+        local pType = peripheral.getType(name)
+        local lName = name:lower()
+        
+        if pType == "fusionReactor" or lName:find("logicadapter") then
+            reactor = peripheral.wrap(name)
+            print(" -> Reaktor Logic Adapter gefunden: " .. name)
+        elseif pType == "monitor" or lName:find("monitor") then
+            local m = peripheral.wrap(name)
+            if m and m.isColor and m.isColor() then
+                monitor = m
+                print(" -> Farb-Monitor gefunden: " .. name)
+            end
         end
     end
-
-    return reactor ~= nil
+    print("------------------------")
 end
 
-local function readNumber(method)
-    local ok, value, err = safeCall(reactor, method)
+scanPeripherals()
 
-    if not ok then
-        return nil, err
-    end
-
-    if type(value) ~= "number"
-        or value ~= value
-        or value == math.huge
-        or value == -math.huge
-    then
-        return nil, method .. " lieferte keinen gültigen Zahlenwert"
-    end
-
-    return value
+if not reactor then
+    print("[FEHLER] Kein Fusion Reactor Logic Adapter gefunden!")
+    return
 end
 
-local function readData()
-    if not reactor then
-        return false, "Reaktoradapter nicht verbunden"
-    end
+if monitor then
+    monitor.setTextScale(0.5) 
+    monitor.clear()
+end
 
-    local eff, e1 = readNumber("getEfficiency")
-    local err, e2 = readNumber("getErrorLevel")
-    local temp, e3 = readNumber("getCaseTemperature")
+-- 2. Daten sicher abfragen
+local function getReactorData()
+    if not reactor then return "STANDBY", 0, 0, 0, false end
+    
+    local logicMode = "STANDBY"
+    local caseTemp = 0
+    local efficiency = 0
+    local errorLevel = 0
+    
+    pcall(function()
+        logicMode = reactor.getLogicMode()
+        caseTemp = reactor.getCaseTemperature()
+        efficiency = reactor.getEfficiency()
+        errorLevel = reactor.getErrorLevel()
+    end)
+    
+    local isRunning = (logicMode == "ACTIVE" or logicMode == "RUNNING" or logicMode == "READY")
+    pcall(function() if reactor.getStatus then isRunning = reactor.getStatus() end end)
+    
+    return logicMode, caseTemp, efficiency, errorLevel, isRunning
+end
 
-    if eff == nil or err == nil or temp == nil then
-        local errors = {}
-
-        if eff == nil then
-            errors[#errors + 1] = e1 or "Effizienz nicht verfügbar"
-        end
-        if err == nil then
-            errors[#errors + 1] = e2 or "Fehlerlevel nicht verfügbar"
-        end
-        if temp == nil then
-            errors[#errors + 1] = e3 or "Temperatur nicht verfügbar"
-        end
-
-        return false, table.concat(errors, " | ")
-    end
-
-    -- Ungültige Messwerte dürfen keine Regelaktion auslösen.
-    if eff < 0 or eff > 1000 or err < 0 or temp < 0 then
-        return false, "Messwert außerhalb des plausiblen Bereichs"
-    end
-
-    data.efficiency = eff
-    data.errorLevel = err
-    data.caseTemp = temp
-
-    local okMode, mode = safeCall(reactor, "getLogicMode")
-    logicMode = okMode and tostring(mode) or "Unbekannt"
-
+-- 3. Statistiken aktualisieren
+local function updateStats(eff, err, caseT)
     if eff > 0 then
-        stats.minEff = math.min(stats.minEff, eff)
-        stats.maxEff = math.max(stats.maxEff, eff)
+        if eff < stats.minEff then stats.minEff = eff end
+        if eff > stats.maxEff then stats.maxEff = eff end
+    end
+    if err < stats.minErr then stats.minErr = err end
+    if err > stats.maxErr then stats.maxErr = err end
+    if caseT < stats.minCase then stats.minCase = caseT end
+    if caseT > stats.maxCase then stats.maxCase = caseT end
+end
+
+-- 4. Absolutes Redstone-Signal setzen
+local function setSignalOutput(signal)
+    -- Signal im gültigen Bereich 1-15 halten
+    if signal < 1 then signal = 1 end
+    if signal > 15 then signal = 15 end
+    
+    currentSignal = signal
+    pcall(function()
+        redstone.setAnalogOutput(REDSTONE_SIDE, currentSignal)
+    end)
+end
+
+local function logPrint(msg)
+    print(msg)
+end
+
+-- 5. Intelligenter Regelkreis
+local function runControlLoop()
+    logCounter = logCounter + 1
+    local _, caseTemp, startEff, errorLevel = getReactorData()
+
+    if (errorLevel >= 100) then
+        pcall(function() reactor.stop() end)
+        pcall(function() redstone.setAnalogOutput(REDSTONE_SIDE, 0) end)
+        stuckReason = "NOTSTOPP: Fehlerlevel >= 100"
+        logPrint(string.format("[LOG #%d] NOTSTOPP ausgelöst!", logCounter))
+        return
     end
 
-    stats.minError = math.min(stats.minError, err)
-    stats.maxError = math.max(stats.maxError, err)
-    stats.minTemp = math.min(stats.minTemp, temp)
-    stats.maxTemp = math.max(stats.maxTemp, temp)
-
-    return true
-end
-
--- Ausgänge immer zuerst in einen definierten Zustand bringen.
-local function clearOutputs()
-    pcall(redstone.setAnalogOutput, CFG.increaseSide, 0)
-    pcall(redstone.setAnalogOutput, CFG.decreaseSide, 0)
-end
-
-local function applySignal()
-    signal = math.floor(math.max(
-        CFG.minSignal,
-        math.min(CFG.maxSignal, signal)
-    ))
-
-    if direction > 0 then
-        redstone.setAnalogOutput(CFG.increaseSide, signal)
-        redstone.setAnalogOutput(CFG.decreaseSide, 0)
-        lastAction = "Erhöhen: " .. signal
+    local statusText = "STANDBY"
+    if startEff > 0 then
+        statusText = "RUN"
+    elseif startEff == 0 then
+        statusText = "CRUSH"
     else
-        redstone.setAnalogOutput(CFG.increaseSide, 0)
-        redstone.setAnalogOutput(CFG.decreaseSide, signal)
-        lastAction = "Verringern: " .. signal
-    end
-end
-
-local function average(values)
-    if #values == 0 then return nil end
-
-    local sum = 0
-    for _, value in ipairs(values) do
-        sum = sum + value
+        statusText = "STANDBY"
     end
 
-    return sum / #values
-end
-
-local function safetyCheck()
-    if not data.efficiency
-        or not data.errorLevel
-        or not data.caseTemp
-    then
-        return false, "Messwerte fehlen"
-    end
-
-    if data.errorLevel >= CFG.maxError then
-        return false, "Kritisches Fehlerlevel"
-    end
-
-    if CFG.useCaseTempLimit
-        and data.caseTemp >= CFG.criticalCaseTemp
-    then
-        return false, "Temperaturgrenze erreicht"
-    end
-
-    return true
-end
-
--- Beginnt einen einzelnen Optimierungsversuch.
-local function beginTrial()
-    if not auto then
-        status = "PAUSIERT"
-        detail = "A drücken, um Automatik einzuschalten"
+    if statusText == "STANDBY" or statusText == "CRUSH" then
+        pcall(function() redstone.setAnalogOutput(REDSTONE_SIDE, 0) end)
+        currentSignal = 8
+        controlDirection = 1
+        stepSize = 1
+        recoveryCounter = 0
+        stuckReason = "Reaktor in " .. statusText
         return
     end
 
-    local safe, reason = safetyCheck()
-
-    if not safe then
-        auto = false
-        clearOutputs()
-        trial = nil
-        samples = {}
-        status = "SICHERHEITSPAUSE"
-        detail = reason
-        return
+    -- Anschlag-Schutz & Richtungswechsel
+    if currentSignal >= 15 and controlDirection == 1 then
+        controlDirection = -1
+        stepSize = 1
+    elseif currentSignal <= 1 and controlDirection == -1 then
+        controlDirection = 1
+        stepSize = 1
     end
 
-    local actualStep = step
+    local oldSignal = currentSignal
+    
+    -- Neuen Zielwert berechnen und sofort als absolutes Signal anlegen
+    local targetSignal = currentSignal + (controlDirection * stepSize)
+    setSignalOutput(targetSignal)
 
-    -- Bei erhöhtem Fehlerlevel nur minimal verändern.
-    if data.errorLevel >= CFG.warningError then
-        actualStep = 1
+    stuckReason = "Cooldown: Ticks sammeln..."
+
+    local efficiencyReadings = { startEff }
+    for i = 1, 5 do
+        sleep(1.0)
+        local _, _, currentEff = getReactorData()
+        table.insert(efficiencyReadings, currentEff)
     end
 
-    trial = {
-        beforeEfficiency = data.efficiency,
-        oldSignal = signal,
-        oldDirection = direction,
-        oldStep = actualStep
-    }
+    local endEff = efficiencyReadings[#efficiencyReadings]
+    local trendDiff = endEff - startEff
+    local actionType = ""
 
-    signal = signal + direction * actualStep
-
-    -- An der Grenze nicht ständig in dieselbe Richtung weiterlaufen.
-    if signal > CFG.maxSignal then
-        signal = CFG.maxSignal
-        direction = -1
-    elseif signal < CFG.minSignal then
-        signal = CFG.minSignal
-        direction = 1
-    end
-
-    samples = {}
-
-    applySignal()
-
-    status = "MESSVERSUCH"
-    detail = string.format(
-        "Ziel mindestens %.1f%% | Messung läuft",
-        CFG.targetEfficiency
-    )
-end
-
-local function finishTrial()
-    if not trial or #samples < CFG.samplesPerTrial then
-        return
-    end
-
-    local measuredEfficiency = average(samples)
-    local change = measuredEfficiency - trial.beforeEfficiency
-    cycles = cycles + 1
-
-    local safe, reason = safetyCheck()
-
-    if not safe then
-        auto = false
-        clearOutputs()
-        trial = nil
-        samples = {}
-        status = "SICHERHEITSPAUSE"
-        detail = reason
-        return
-    end
-
-    if measuredEfficiency < CFG.targetEfficiency then
-        detail = string.format(
-            "Unter Mindestziel; Änderung %+.2f",
-            change
-        )
+    if trendDiff < -0.5 then
+        controlDirection = -controlDirection
+        stepSize = 1
+        recoveryCounter = 4 
+        actionType = string.format("STURZ (%.2f) -> Sperre", trendDiff)
     else
-        detail = string.format(
-            "Messwertänderung %+.2f Prozentpunkte",
-            change
-        )
-    end
-
-    -- Anti-Ping-Pong:
-    -- Nur bei einer eindeutigen Verschlechterung umkehren.
-    if change < -CFG.deadband then
-        direction = -trial.oldDirection
-        signal = trial.oldSignal
-        step = 1
-
-        applySignal()
-
-        status = "RICHTUNG GEWECHSELT"
-        detail = string.format(
-            "Verschlechterung %+.2f; Signal zurückgesetzt",
-            change
-        )
-
-    elseif change > CFG.deadband then
-        -- Verbesserung: Richtung beibehalten.
-        direction = trial.oldDirection
-
-        if data.errorLevel >= CFG.warningError then
-            step = 1
-        elseif math.abs(change) >= 2 then
-            step = math.min(CFG.maxStep, trial.oldStep + 1)
+        if recoveryCounter > 0 then
+            recoveryCounter = recoveryCounter - 1
+            stepSize = 1 
+            actionType = string.format("Erholung (%d)", recoveryCounter)
         else
-            step = trial.oldStep
+            if currentSignal <= 4 then
+                stepSize = 1
+                actionType = string.format("Low-Signal Safe (%.2f)", trendDiff)
+            else
+                actionType = string.format("Stabil (%.2f) -> Formel", trendDiff)
+                local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
+                stepSize = math.floor(effDistance * 0.3) + 1
+                if stepSize > 15 then stepSize = 15 end
+                if stepSize < 1 then stepSize = 1 end
+            end
         end
-
-        bestEfficiency = math.max(
-            bestEfficiency or measuredEfficiency,
-            measuredEfficiency
-        )
-
-        status = "VERBESSERUNG"
-        detail = string.format(
-            "Effizienz verbessert um %+.2f",
-            change
-        )
-
-    else
-        -- Kleine Änderung gilt als Messrauschen.
-        direction = trial.oldDirection
-        step = 1
-
-        status = "TOLERANZBEREICH"
-        detail = string.format(
-            "Änderung %+.2f ignoriert; kleiner Schritt",
-            change
-        )
     end
 
-    trial = nil
-    samples = {}
+    logPrint(string.format("--- [LOG Zyklus #%d] ---", logCounter))
+    logPrint(string.format("  Start EF: %.2f%% | End EF: %.2f%% | Diff: %.2f%%", startEff, endEff, trendDiff))
+    logPrint(string.format("  Aktion: %s", actionType))
+    logPrint(string.format("  Schrittweite: %d", stepSize))
+    logPrint(string.format("  Signal: %d -> Neu: %d", oldSignal, currentSignal))
+    logPrint("------------------------")
+
+    stuckReason = string.format("Diff:%.1f | %s", trendDiff, actionType)
 end
 
-local function drawMonitor()
+-- 6. Grafik auf Monitor zeichnen
+local function drawUI()
     if not monitor then return end
 
-    local ok = pcall(function()
-        monitor.setTextScale(CFG.monitorScale)
+    local logicMode, caseTemp, efficiency, errorLevel = getReactorData()
+    updateStats(efficiency, errorLevel, caseTemp)
 
-        local width, height = monitor.getSize()
-
-        monitor.setBackgroundColor(colors.black)
-        monitor.setTextColor(colors.white)
-        monitor.clear()
-
-        local function line(y, text, color)
-            if y > height then return end
-
-            monitor.setCursorPos(1, y)
-            monitor.setTextColor(color or colors.white)
-            monitor.write(tostring(text):sub(1, width))
-        end
-
-        line(1, "BETTER FUSION REACTOR", colors.cyan)
-        line(2, "Adapter: " .. tostring(reactorName))
-        line(3, "Modus: " .. logicMode)
-        line(4, "Automatik: " .. (auto and "AN" or "AUS"),
-            auto and colors.lime or colors.orange)
-        line(5, "Status: " .. status)
-
-        line(6, "Effizienz: " ..
-            (data.efficiency and string.format("%.2f%%", data.efficiency)
-                or "N/A"))
-
-        line(7, "Bestwert: " ..
-            (bestEfficiency and string.format("%.2f%%", bestEfficiency)
-                or "N/A"))
-
-        line(8, "Fehlerlevel: " ..
-            (data.errorLevel and string.format("%.2f", data.errorLevel)
-                or "N/A"),
-            data.errorLevel and data.errorLevel >= CFG.warningError
-                and colors.red or colors.white)
-
-        line(9, "Gehäusetemp.: " ..
-            (data.caseTemp and string.format("%.1f K", data.caseTemp)
-                or "N/A"))
-
-        line(10, "Signal: " .. signal .. "/15 Schritt: " .. step)
-        line(11, "Richtung: " ..
-            (direction > 0 and "ERHOEHEN" or "VERRINGERN"))
-        line(12, "Mindestziel: " .. CFG.targetEfficiency .. "%")
-        line(13, "Zyklen: " .. cycles)
-        line(14, "Aktion: " .. lastAction)
-        line(15, "Info: " .. detail)
-
-        if lastError then
-            line(16, "Fehler: " .. lastError, colors.red)
-        end
-
-        line(height, "A=Automatik | Q=Beenden", colors.lightGray)
-        monitor.setTextColor(colors.white)
-    end)
-
-    if not ok then
-        monitor = nil
-        monitorName = nil
-    end
-end
-
-local function drawTerminal()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
-    term.setCursorPos(1, 1)
-
-    print("Better Fusion Reactor Controller")
-    print("Adapter: " .. tostring(reactorName or "nicht gefunden"))
-    print("Monitor: " .. tostring(monitorName or "nicht gefunden"))
-    print("Modus: " .. logicMode)
-    print("Status: " .. status)
-    print("Automatik: " .. (auto and "AN" or "AUS"))
-
-    print("Effizienz: " ..
-        (data.efficiency and string.format("%.2f%%", data.efficiency)
-            or "N/A"))
-
-    print("Fehlerlevel: " ..
-        (data.errorLevel and string.format("%.2f", data.errorLevel)
-            or "N/A"))
-
-    print("Gehäusetemperatur: " ..
-        (data.caseTemp and string.format("%.1f K", data.caseTemp)
-            or "N/A"))
-
-    print("Signal: " .. signal .. "/15 | Schritt: " .. step)
-    print("Richtung: " ..
-        (direction > 0 and "ERHOEHEN" or "VERRINGERN"))
-
-    print("Info: " .. detail)
-
-    if lastError then
-        print("Lesefehler: " .. lastError)
+    local statusText = "STANDBY"
+    if efficiency > 0 then
+        statusText = "RUN"
+    elseif efficiency == 0 then
+        statusText = "CRUSH"
+    else
+        statusText = "STANDBY"
     end
 
-    print("")
-    print("A = Automatik umschalten")
-    print("Q = Beenden und Ausgaenge loeschen")
-end
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write(" === FUSION REACTOR CONTROL === ")
+    monitor.setBackgroundColor(colors.black)
 
-local function shutdown()
-    auto = false
-    running = false
-    clearOutputs()
-    status = "BEENDET"
-    detail = "Ausgaenge auf 0 gesetzt"
-end
-
-local function main()
-    print("Suche Reaktoradapter und Monitor...")
-
-    if not scanPeripherals() then
-        print("Kein kompatibler Reaktoradapter gefunden.")
-
-        for _, name in ipairs(peripheral.getNames()) do
-            print(name .. " (" ..
-                tostring(peripheral.getType(name)) .. ")")
-        end
-
-        return
+    monitor.setCursorPos(1, 3)
+    monitor.clearLine()
+    monitor.write("Modus: ")
+    if statusText == "RUN" then
+        monitor.setTextColor(colors.green)
+    elseif statusText == "CRUSH" then
+        monitor.setTextColor(colors.red)
+    else
+        monitor.setTextColor(colors.orange)
     end
+    monitor.write(statusText .. "    ")
+    monitor.setTextColor(colors.white)
 
-    clearOutputs()
+    monitor.setCursorPos(1, 5)
+    monitor.clearLine()
+    monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
 
-    status = "PAUSIERT"
-    detail = "Messwerte und Verkabelung prüfen; dann A drücken"
+    monitor.setCursorPos(1, 7)
+    monitor.clearLine()
+    monitor.setTextColor(colors.yellow)
+    monitor.write(string.format("EF (Eff):  %.2f%% (Min:%.2f Max:%.2f)", efficiency, stats.minEff == math.huge and 0 or stats.minEff, stats.maxEff))
+    monitor.setTextColor(colors.white)
 
-    local sampleTimer = os.startTimer(CFG.sampleInterval)
-    local displayTimer = os.startTimer(CFG.displayInterval)
+    monitor.setCursorPos(1, 8)
+    monitor.clearLine()
+    if errorLevel > 50 then monitor.setTextColor(colors.red) end
+    monitor.write(string.format("ER (Err):  %.2f%% (Min:%.2f Max:%.2f)", errorLevel, stats.minErr == math.huge and 0 or stats.minErr, stats.maxErr))
+    monitor.setTextColor(colors.white)
 
-    drawTerminal()
-    drawMonitor()
+    monitor.setCursorPos(1, 10)
+    monitor.clearLine()
+    monitor.write("Fuel Type: D-T Fuel")
 
-    while running do
-        local event, p1 = os.pullEvent()
+    monitor.setCursorPos(1, 11)
+    monitor.clearLine()
+    local signText = (controlDirection == 1) and "+" or "-"
+    monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, REDSTONE_SIDE))
 
-        if event == "key" then
-            if p1 == keys.q then
-                shutdown()
+    monitor.setCursorPos(1, 13)
+    monitor.clearLine()
+    monitor.setTextColor(colors.cyan)
+    monitor.write("Diag: " .. string.sub(stuckReason, 1, 30))
 
-            elseif p1 == keys.a then
-                auto = not auto
-
-                if not auto then
-                    clearOutputs()
-                    trial = nil
-                    samples = {}
-                    status = "PAUSIERT"
-                    detail = "Ausgaenge auf 0 gesetzt"
-                else
-                    trial = nil
-                    samples = {}
-                    status = "AUTOMATIK AKTIVIERT"
-                    detail = "Sicherheitspruefung vor Regelung"
-                end
-
-                drawTerminal()
-                drawMonitor()
-
-            end
-
-        elseif event == "peripheral"
-            or event == "peripheral_detach"
-        then
-            scanPeripherals()
-
-            if not reactor then
-                auto = false
-                clearOutputs()
-                trial = nil
-                status = "ADAPTER VERLOREN"
-                detail = "Regelung pausiert"
-            end
-
-            drawTerminal()
-            drawMonitor()
-
-        elseif event == "timer" then
-            if p1 == sampleTimer then
-                local ok, err = readData()
-
-                if not ok then
-                    lastError = err
-                    auto = false
-                    clearOutputs()
-                    trial = nil
-                    samples = {}
-
-                    status = "LESEFEHLER - PAUSIERT"
-                    detail = "Keine Regelaktion bei ungueltigen Werten"
-
-                else
-                    lastError = nil
-
-                    if trial then
-                        samples[#samples + 1] = data.efficiency
-
-                        status = string.format(
-                            "MESSUNG %d/%d",
-                            #samples,
-                            CFG.samplesPerTrial
-                        )
-
-                        if #samples >= CFG.samplesPerTrial then
-                            finishTrial()
-                        end
-
-                    elseif auto then
-                        beginTrial()
-                    else
-                        status = "PAUSIERT"
-                    end
-                end
-
-                sampleTimer = os.startTimer(CFG.sampleInterval)
-
-            elseif p1 == displayTimer then
-                drawTerminal()
-                drawMonitor()
-
-                displayTimer = os.startTimer(CFG.displayInterval)
-            end
-        end
-    end
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.lightGray)
 end
 
-local ok, err = pcall(main)
-
--- Auch bei einem Lua-Fehler die konfigurierten Ausgänge löschen.
-clearOutputs()
-
-if not ok then
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
-    term.setCursorPos(1, 1)
-
-    print("Controller-Fehler:")
-    print(tostring(err))
-    print("Konfigurierte Redstone-Ausgaenge wurden geloescht.")
+-- 7. Hauptschleife (mit UI-Aktualisierung vor jedem Regel-Zyklus)
+while true do
+    drawUI()
+    runControlLoop()
 end
