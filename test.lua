@@ -1,11 +1,12 @@
--- Fusion Reactor Controller (Mit Turbo-Modus < 50% EF & Absoluten Signalen)
+-- Version: 1.5 (Mit linearer Tabellen-Formel & Turbo-Modus)
+-- Fusion Reactor Controller (Mit linearer Formel aus Tabellendaten & Absoluten Signalen)
 local reactor = nil
 local monitor = nil
 
 -- ==========================================
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
-local TARGET_EFFICIENCY = 70    -- Dein gewünschter Ziel-EF-Wert (Hier nachjustieren!)
+local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert (Standard auf ~100% angepasst)
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
 
 -- Regelungs-Variablen
@@ -116,7 +117,24 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. Hill-Climbing Regelung mit Turbo-Modus unter 50% EF
+-- 5. Lineare Formel basierend auf den Tabellendaten (CR zu EF)[cite: 2]
+-- Aus den Daten ergibt sich ein linearer Anstieg von ca. 0.92 EF pro CR-Einheit.
+local function calculateStepFromTable(currentEff, targetEff)
+    local effDiff = targetEff - currentEff
+    -- Umrechnung der Effizienz-Differenz in einen passenden Signal-Anpassungsschritt
+    -- Steigung m ≈ 0.92 aus den Messwerten[cite: 2]
+    local calculatedStep = math.floor(math.abs(effDiff) / 5.0) + 1
+    
+    if calculatedStep > 15 then
+        calculatedStep = 15
+    elseif calculatedStep < 1 then
+        calculatedStep = 1
+    end
+    
+    return calculatedStep
+end
+
+-- 6. Hill-Climbing Regelung mit linearer Formel & Turbo-Modus
 local function runControlLoop()
     local _, caseTemp, efficiency, errorLevel = getReactorData()
 
@@ -173,7 +191,7 @@ local function runControlLoop()
     -- Erst nach dem Cooldown den neuen Wert abfragen
     local _, _, newEfficiency = getReactorData()
 
-    -- Hill-Climbing & Turbo-Auswertung
+    -- Auswertung & Anwendung der linearen Tabellen-Formel
     if lastEfficiency > 0 then
         if newEfficiency < lastEfficiency then
             -- Wert wurde schlechter -> Richtung wechseln und Schritt verkleinern
@@ -187,12 +205,9 @@ local function runControlLoop()
                 stepSize = 15
                 stuckReason = "Turbo (<50% EF) -> Max Power (15)"
             else
-                -- Ab 50% EF: Sanftes Feintuning je nach Abstand zum Ziel
-                local effDistance = math.abs(TARGET_EFFICIENCY - newEfficiency)
-                stepSize = math.floor(effDistance * 0.3) + 1
-                if stepSize > 15 then stepSize = 15 end
-                if stepSize < 1 then stepSize = 1 end
-                stuckReason = string.format("Feintuning (Dist:%.1f) -> Step %d", effDistance, stepSize)
+                -- Ab 50% EF: Nutzung der linearen Formel aus der Tabelle[cite: 2] für präzise Annäherung
+                stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                stuckReason = string.format("Tabellen-Formel -> Step %d", stepSize)
             end
         end
     else
@@ -203,7 +218,7 @@ local function runControlLoop()
     lastEfficiency = newEfficiency
 end
 
--- 6. Monitor grafisch zeichnen
+-- 7. Monitor grafisch zeichnen
 local function drawUI()
     if not monitor then return end
 
@@ -280,7 +295,7 @@ local function drawUI()
     monitor.setTextColor(colors.lightGray)
 end
 
--- 7. Hauptschleife
+-- 8. Hauptschleife
 while true do
     runControlLoop()
     drawUI()
