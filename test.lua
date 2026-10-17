@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.56 (Entkoppelte Brain-Arm Architektur mit verzögertem Log-Vergleich)
+-- SCRIPT VERSION 2.57 (Entkoppelte Brain-Arm Architektur & Angepasste Step-Formel)
 -- ==========================================
-local SCRIPT_VERSION = "v2.56"
+local SCRIPT_VERSION = "v2.57"
 
 local reactor = nil
 local monitor = nil
@@ -216,18 +216,22 @@ local function applyControlAction(direction, strength)
     end
 end
 
--- 3. DYNAMISCHE FORMEL (Berechnet die Schrittgröße über den Abstand 43)
+-- 3. DYNAMISCHE FORMEL (Berechnet die Schrittgröße abgerundet ohne +1)
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
 
     if effDiff >= FULL_POWER_DISTANCE then
         return 15
-    elseif effDiff <= 2 then
+    elseif effDiff <= 0 then
         return 1
     end
 
-    local calculatedStep = math.floor((effDiff / FULL_POWER_DISTANCE) * 14) + 1
-    if calculatedStep > 15 then calculatedStep = 15 elseif calculatedStep < 1 then calculatedStep = 1 end
+    local calculatedStep = math.floor((effDiff / FULL_POWER_DISTANCE) * 15)
+    if calculatedStep > 15 then 
+        calculatedStep = 15 
+    elseif calculatedStep < 1 then 
+        calculatedStep = 1 
+    end
     
     return calculatedStep
 end
