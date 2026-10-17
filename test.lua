@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.67 (Mit präziser Sekunden-Bereichs-Hysterese)
+-- SCRIPT VERSION 2.68 (Mit Redstone-Puls-Messung von unten)
 -- ==========================================
-local SCRIPT_VERSION = "v2.67"
+local SCRIPT_VERSION = "v2.68"
 
 local reactor = nil
 local monitor = nil
@@ -13,7 +13,7 @@ local relay = nil
 local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
 
--- ADAPTIVE / LOW PERFORMANCE EINSTELLUNGEN
+-- ADAPTIVE / LOW PERFORMANCE EINSTELLUNGEN (Redstone-Puls-basiert)
 local ENABLE_LOW_PERF_MODE = true    -- Schaltet die automatische Takt-Anpassung ein/aus
 local POLL_INTERVAL_TICKS = 4        -- Feste Basis-Tickrate (0.2 Sekunden)
 local lowPerfMultiplier = 1          -- Startet mit Multiplikator 1 (effektiv 4 Ticks)
@@ -52,10 +52,10 @@ local lastPollEF = -1
 local unchangedPollCount = 0
 local previousLoggedEff = -1
 
--- Variablen für die Go-Frequenz-Messung & Hysterese (Low Performance Mode)
-local goIntervalTracker = 0
-local targetMultiplier = 1
-local streakCount = 0
+-- Variablen für die Redstone-Puls-Messung & Hysterese von unten
+local lastPulseTime = os.clock()
+local pulseTargetMultiplier = 1
+local pulseStreakCount = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -244,7 +244,52 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. ADAPTIVE SENSOR-SCHLEIFE (Mit Sekunden-Bereichs-Hysterese)
+-- 4. SEPARATER EVENT-LISTENER FÜR REDSTONE-PULSE VON UNTEN
+local function pulseListenerLoop()
+    while true do
+        os.pullEvent("redstone")
+        
+        if ENABLE_LOW_PERF_MODE and redstone.getInput("bottom") then
+            local now = os.clock()
+            local deltaT = now - lastPulseTime
+            lastPulseTime = now
+            
+            -- Filter gegen extreme Ausreißer
+            if deltaT >= 0.05 and deltaT <= 3.0 then
+                local desiredMultiplier = 1
+                
+                if deltaT >= 0.75 then
+                    desiredMultiplier = 1 -- 2.0s - 0.75s -> 4t (Multiplikator 1)
+                elseif deltaT >= 0.375 then
+                    desiredMultiplier = 2 -- 0.74s - 0.375s -> 8t (Multiplikator 2)
+                elseif deltaT >= 0.187 then
+                    desiredMultiplier = 4 -- 0.374s - 0.187s -> 16t (Multiplikator 4)
+                else
+                    desiredMultiplier = 8 -- 0.186s - 0.05s -> 32t (Multiplikator 8)
+                end
+                
+                -- Hysterese: Erst umschalten, wenn der Bereich 3 mal hintereinander erreicht wurde
+                if desiredMultiplier ~= lowPerfMultiplier then
+                    if desiredMultiplier == pulseTargetMultiplier then
+                        pulseStreakCount = pulseStreakCount + 1
+                        if pulseStreakCount >= 3 then
+                            lowPerfMultiplier = desiredMultiplier
+                            pulseStreakCount = 0
+                        end
+                    else
+                        pulseTargetMultiplier = desiredMultiplier
+                        pulseStreakCount = 1
+                    end
+                else
+                    pulseTargetMultiplier = lowPerfMultiplier
+                    pulseStreakCount = 0
+                end
+            end
+        end
+    end
+end
+
+-- 5. ADAPTIVE SENSOR-SCHLEIFE
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -275,48 +320,11 @@ local function backgroundSensorLoop()
             if unchangedPollCount >= 2 then
                 executionGo = true
                 unchangedPollCount = 0
-                
-                -- Adaptives Anpassen nach Sekundebereichen mit 3-Zyklen-Hysterese
-                if ENABLE_LOW_PERF_MODE then
-                    local secondsBetweenGo = goIntervalTracker / 20
-                    goIntervalTracker = 0 
-                    
-                    local desiredMultiplier = 1
-                    if secondsBetweenGo <= 4 then
-                        desiredMultiplier = 1 -- 0-4s -> mal 1 (4t)
-                    elseif secondsBetweenGo <= 8 then
-                        desiredMultiplier = 2 -- 5-8s -> mal 2 (8t)
-                    elseif secondsBetweenGo <= 18 then
-                        desiredMultiplier = 4 -- 9-18s -> mal 4 (16t)
-                    else
-                        desiredMultiplier = 8 -- 19-32s -> mal 8 (32t)
-                    end
-                    
-                    if desiredMultiplier ~= lowPerfMultiplier then
-                        if desiredMultiplier == targetMultiplier then
-                            streakCount = streakCount + 1
-                            if streakCount >= 3 then
-                                lowPerfMultiplier = desiredMultiplier
-                                streakCount = 0
-                            end
-                        else
-                            targetMultiplier = desiredMultiplier
-                            streakCount = 1
-                        end
-                    else
-                        targetMultiplier = lowPerfMultiplier
-                        streakCount = 0
-                    end
-                end
             end
         else
             unchangedPollCount = 0
         end
         lastPollEF = eff
-
-        if ENABLE_LOW_PERF_MODE then
-            goIntervalTracker = goIntervalTracker + effectiveTicks
-        end
 
         if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
             wakeupTickCounter = wakeupTickCounter + effectiveTicks
@@ -364,7 +372,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 5. AUSFÜHRUNGS-SCHLEIFE (Verwendet LOG_JUMP_THRESHOLD für die Log-Diagnose)
+-- 6. AUSFÜHRUNGS-SCHLEIFE (Verwendet LOG_JUMP_THRESHOLD für die Log-Diagnose)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -441,7 +449,7 @@ local function executionLoop()
     end
 end
 
--- 6. MONITOR-UI SCHLEIFE (Anzeige mit dynamischem Tick-Anzeiger)
+-- 7. MONITOR-UI SCHLEIFE (Anzeige mit dynamischem Tick-Anzeiger)
 local function uiLoop()
     while true do
         if monitor then
@@ -525,5 +533,5 @@ local function uiLoop()
     end
 end
 
--- 7. Parallele Ausführung aller Prozesse
-parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
+-- 8. Parallele Ausführung aller Prozesse (inklusive Puls-Listener)
+parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop, pulseListenerLoop)
