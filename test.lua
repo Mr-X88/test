@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.14 (Standby-Log-Spam behoben)
+-- SCRIPT VERSION 2.15 (Mit ER- und Zeitmessung in den Logs)
 -- ==========================================
-local SCRIPT_VERSION = "v2.14"
+local SCRIPT_VERSION = "v2.15"
 
 local reactor = nil
 local monitor = nil
@@ -213,14 +213,14 @@ local function controlLoop()
         local efficiency = liveEF
         local errorLevel = liveER
 
-        -- ECHTER STANDBY-SCHUTZ: Solange EF 0 ist oder der Reaktor aus ist, passiert absolut gar nichts (kein Log-Spam!)
+        -- ECHTER STANDBY-SCHUTZ: Solange EF 0 ist oder der Reaktor aus ist, passiert absolut gar nichts
         if not liveIsRunning or efficiency == 0 then
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
                 redstone.setAnalogOutput("right", 0)
             end)
             lastEfficiency = 0 
-            maxEfficiencySeen = 0 -- Reset für den nächsten Start
+            maxEfficiencySeen = 0 
             stuckReason = "Reaktor in Standby"
             sleep(1.0)
         elseif efficiency >= HARD_STOP_EF or efficiency >= IDLE_THRESHOLD then
@@ -238,6 +238,7 @@ local function controlLoop()
             end
 
             local startEffForLog = efficiency
+            local cycleStartTime = os.clock() -- Zeitmessung für den Zyklus starten
 
             applyControlAction(controlDirection, stepSize)
 
@@ -257,7 +258,9 @@ local function controlLoop()
                 waitTimer = waitTimer + 0.1
             end
 
+            local cycleDuration = os.clock() - cycleStartTime -- Verstrichene Zeit in Sekunden berechnen
             local newEfficiency = liveEF
+            local recordedER = liveER -- ER-Wert für den Log festhalten
 
             if lastEfficiency > 0 then
                 local effDelta = newEfficiency - lastEfficiency
@@ -293,14 +296,19 @@ local function controlLoop()
             lastEfficiency = newEfficiency
             logCounter = logCounter + 1
 
-            local signChar = (controlDirection == 1) and "+" or "-"
-            local shortDiag = string.sub(stuckReason, 1, 18)
-            local compactLog = string.format("#%03d|%s%d|EF:%.1f->%.1f|%s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, shortDiag)
-            table.insert(logHistory, 1, compactLog)
-            
-            local maxLogLines = math.max(5, monitorHeight - 9)
-            if #logHistory > maxLogLines then
-                table.remove(logHistory)
+            -- Log-Eintrag erstellen (Nur wenn Logs aktiv sind, inklusive ER und Zyklus-Dauer in Sekunden)
+            if ENABLE_MONITOR_LOGS then
+                local signChar = (controlDirection == 1) and "+" or "-"
+                local shortDiag = string.sub(stuckReason, 1, 10) -- Etwas kompakter für die erweiterte Anzeige
+                local compactLog = string.format("#%03d|%s%d|%.1f->%.1f|ER:%d|%ds|%s", 
+                    logCounter, signChar, stepSize, startEffForLog, newEfficiency, math.floor(recordedER + 0.5), math.floor(cycleDuration + 0.5), shortDiag)
+                
+                table.insert(logHistory, 1, compactLog)
+                
+                local maxLogLines = math.max(5, monitorHeight - 9)
+                if #logHistory > maxLogLines then
+                    table.remove(logHistory)
+                end
             end
         end
     end
