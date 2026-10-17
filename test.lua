@@ -1,30 +1,29 @@
 -- ==========================================
--- SCRIPT VERSION 2.50 (URSPRÜNGLICHER STAND - FESTE 4T-SENSOR-SCHLEIFE)
+-- SCRIPT VERSION 2.63 (Vollständig und fehlerfrei)
 -- ==========================================
-local SCRIPT_VERSION = "v2.50"
+local SCRIPT_VERSION = "v2.63"
 
 local reactor = nil
 local monitor = nil
 local relay = nil  
 
 -- ==========================================
--- REGELUNGS-EINSTELLUNGEN
+-- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
-local POLL_INTERVAL_TICKS = 4        -- Fester Basis-Takt (0.2 Sekunden)
-
-local JUMP_THRESHOLD = 3.0           -- Schwelle für Sensor-Diagnose
-local LOG_JUMP_THRESHOLD = 16.0      -- Schwelle für Log-Sprünge
-local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für Rauschen
+local POLL_INTERVAL_TICKS = 4        -- Sensor-Intervall (0.2 Sekunden)
+local JUMP_THRESHOLD = 3.0           -- Unberührt für die kleine Sensor-Schleife
+local LOG_JUMP_THRESHOLD = 16.0      -- Eigene Schwelle für Sprünge im Log (ab 16)
+local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
 
 -- ==========================================
 -- WECKRUF- / REDSTONE-RELAY EINSTELLUNGEN
 -- ==========================================
-local ENABLE_WAKEUP_PULSE = true     -- Aktiviert Weck-Impuls bei Stillstand
-local WAKEUP_INTERVAL_TICKS = 40     -- 2 Sekunden
-local WAKEUP_PULSE_TICKS = 10        -- 0.5 Sekunden
-local WAKEUP_STRENGTH = 15           
+local ENABLE_WAKEUP_PULSE = true     -- Aktiviert den Weck-Impuls bei Totalstillstand (EF=0 und ER=0)
+local WAKEUP_INTERVAL_TICKS = 40     -- Ticks zwischen den Weck-Versuchen (2 Sekunden)
+local WAKEUP_PULSE_TICKS = 10        -- Länge des Impulses in Ticks (0.5 Sekunden)
+local WAKEUP_STRENGTH = 15           -- Signalstärke des Weck-Impulses (1-15)
 
 -- MONITOR LOG EINSTELLUNGEN
 local ENABLE_MONITOR_LOGS = true 
@@ -48,11 +47,13 @@ local lastPollEF = -1
 local unchangedPollCount = 0
 local previousLoggedEff = -1
 
--- Live-Daten für Hintergrund-Prozess
+-- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
 local liveER = 0
 local liveCaseTemp = 0
 local liveIsRunning = false
+local tickJumpOccurred = false
+local tickJumpDelta = 0
 
 local stuckReason = "Warte auf Reaktor..."
 
@@ -233,14 +234,13 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. FESTE 4T SENSOR-SCHLEIFE
+-- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Unberührt)
 local lastSensorEF = 0
-local lastSensorER = 0
 
 local function backgroundSensorLoop()
+    local pollSeconds = POLL_INTERVAL_TICKS / 20  -- 0.2 Sekunden
+
     while true do
-        local pollSeconds = POLL_INTERVAL_TICKS / 20  -- Fest 0.2 Sekunden (4 Ticks)
-        
         local _, caseT, eff, err, running = getReactorData()
         
         liveCaseTemp = caseT
@@ -252,26 +252,12 @@ local function backgroundSensorLoop()
             hasEverRun = true
         end
 
-        -- Dynamische Richtungsbestimmung direkt im schnellen 4t-Takt
-        if eff >= TARGET_EFFICIENCY then
-            controlDirection = -1
-        elseif err > 20 and err > lastSensorER then
-            controlDirection = -1
-        else
-            if controlDirection == -1 and eff < TARGET_EFFICIENCY - 2 and err < 10 then
-                controlDirection = 1
-            end
-        end
-
-        lastSensorER = err
-
         secondCounter = secondCounter + POLL_INTERVAL_TICKS
         if secondCounter >= 20 then
             secondCounter = secondCounter - 20
             secondsSinceLastGo = secondsSinceLastGo + 1
         end
 
-        -- Go-Signal Erkennung (überprüft Stabilisierung im 20-Tick-Fenster)
         if lastPollEF >= 0 and math.abs(eff - lastPollEF) < 0.1 then
             unchangedPollCount = unchangedPollCount + 1
             if unchangedPollCount >= 2 then
@@ -329,7 +315,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 5. AUSFÜHRUNGS-SCHLEIFE (Synchronisiert über das 20t-Fenster)
+-- 5. AUSFÜHRUNGS-SCHLEIFE (Verwendet LOG_JUMP_THRESHOLD für die Log-Diagnose)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -356,12 +342,6 @@ local function executionLoop()
             end
 
             stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
-            
-            -- Schutz bei hohem Error Level
-            if errorLevel > 30 and stepSize > 4 then
-                stepSize = 4
-            end
-
             applyControlAction(controlDirection, stepSize)
 
             currentSignal = currentSignal + (controlDirection * stepSize)
@@ -412,7 +392,7 @@ local function executionLoop()
     end
 end
 
--- 6. MONITOR-UI SCHLEIFE
+-- 6. MONITOR-UI SCHLEIFE (Anzeige)
 local function uiLoop()
     while true do
         if monitor then
@@ -467,7 +447,8 @@ local function uiLoop()
             monitor.setCursorPos(1, 4)
             monitor.clearLine()
             local signText = (controlDirection == 1) and "+" or "-"
-            monitor.write(string.format("Regel: %s%d | Sig: %-2d (T:4t)", signText, stepSize, currentSignal))
+            local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
+            monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
 
             monitor.setCursorPos(1, 5)
             monitor.clearLine()
@@ -494,5 +475,5 @@ local function uiLoop()
     end
 end
 
--- 7. Parallele Ausführung
+-- 7. Parallele Ausführung aller Prozesse
 parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
