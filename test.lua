@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.50 (Entkoppelte Brain-Arm Architektur)
+-- SCRIPT VERSION 2.51 (Entkoppelte Brain-Arm Architektur mit Go-Sync)
 -- ==========================================
-local SCRIPT_VERSION = "v2.50"
+local SCRIPT_VERSION = "v2.51"
 
 local reactor = nil
 local monitor = nil
@@ -10,36 +10,41 @@ local relay = nil
 -- ==========================================
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
-local TARGET_EFFICIENCY = 100       -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 95.0         -- Ab hier direkt Idle & Stopp
-local FULL_POWER_DISTANCE = 43      -- Volle Power ab 43 Punkten Restabstand
-local POLL_INTERVAL_TICKS = 4       -- Sensor-Intervall (0.2 Sekunden)
-local EXECUTION_INTERVAL_TICKS = 20 -- Ausführungs-Takt für Befehle & Logs (20 Ticks = 1 Sekunde)
-local JUMP_THRESHOLD = 3.0          -- Schwellenwert für Tick-Sprünge/-Einbrüche
-local EFF_TOLERANCE = 0.8           -- Toleranz-Schwelle für normales Rauschen
+local TARGET_EFFICIENCY = 100        -- Ziel-EF-Wert
+local IDLE_THRESHOLD = 95.0          -- Ab hier direkt Idle & Stopp
+local FULL_POWER_DISTANCE = 43       -- Volle Power ab 43 Punkten Restabstand
+local POLL_INTERVAL_TICKS = 4        -- Sensor-Intervall (0.2 Sekunden)
+local EXECUTION_INTERVAL_TICKS = 20  -- Ausführungs-Takt für Befehle & Logs (20 Ticks = 1 Sekunde)
+local JUMP_THRESHOLD = 3.0           -- Schwellenwert für Tick-Sprünge/-Einbrüche
+local EFF_TOLERANCE = 0.8            -- Toleranz-Schwelle für normales Rauschen
 
 -- ==========================================
 -- WECKRUF- / REDSTONE-RELAY EINSTELLUNGEN
 -- ==========================================
-local ENABLE_WAKEUP_PULSE = true    -- Aktiviert den Weck-Impuls bei Totalstillstand (EF=0 und ER=0)
-local WAKEUP_INTERVAL_TICKS = 40    -- Ticks zwischen den Weck-Versuchen (2 Sekunden)
-local WAKEUP_PULSE_TICKS = 10       -- Länge des Impulses in Ticks (0.5 Sekunden)
-local WAKEUP_STRENGTH = 15          -- Signalstärke des Weck-Impulses (1-15)
+local ENABLE_WAKEUP_PULSE = true     -- Aktiviert den Weck-Impuls bei Totalstillstand (EF=0 und ER=0)
+local WAKEUP_INTERVAL_TICKS = 40     -- Ticks zwischen den Weck-Versuchen (2 Sekunden)
+local WAKEUP_PULSE_TICKS = 10        -- Länge des Impulses in Ticks (0.5 Sekunden)
+local WAKEUP_STRENGTH = 15           -- Signalstärke des Weck-Impulses (1-15)
 
 -- MONITOR LOG EINSTELLUNGEN
 local ENABLE_MONITOR_LOGS = true 
 local monitorWidth, monitorHeight = 39, 25
 
 -- Regelungs-Variablen
-local currentSignal = 8         
+local currentSignal = 8              
 local controlDirection = 1      -- 1 = Erhöhen (+), -1 = Senken (-)
-local stepSize = 4              
+local stepSize = 4               
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
 local hasEverRun = false        
 local logCounter = 0
 local logHistory = {}           
 local wakeupTickCounter = 0     
+
+-- Synchronisations-Variablen für Brain-Arm
+local executionTickCounter = 0
+local executionGo = false
+local elapsedSeconds = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -224,11 +229,11 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend & Richtung)
+-- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung & Taktgeber)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
-    local pollSeconds = POLL_INTERVAL_TICKS / 20 
+    local pollSeconds = POLL_INTERVAL_TICKS / 20  -- 0.2 Sekunden
 
     while true do
         local _, caseT, eff, err, running = getReactorData()
@@ -240,6 +245,14 @@ local function backgroundSensorLoop()
         
         if eff > 0 then
             hasEverRun = true
+        end
+
+        -- Taktgeber & Go-Signal für die 20-Tick Ausführungs-Schleife (alle 20 Ticks = 1 Sekunde)
+        executionTickCounter = executionTickCounter + POLL_INTERVAL_TICKS
+        if executionTickCounter >= EXECUTION_INTERVAL_TICKS then
+            executionTickCounter = 0
+            executionGo = true
+            elapsedSeconds = elapsedSeconds + 1
         end
 
         -- Weckruf-Prüfung bei absolutem Stillstand
@@ -295,12 +308,16 @@ local function backgroundSensorLoop()
     end
 end
 
--- 5. KONFIGURIERBARE 20-TICK AUSFÜHRUNGS-SCHLEIFE (Der "Arm" & Protokoll)
+-- 5. KONFIGURIERBARE 20-TICK AUSFÜHRUNGS-SCHLEIFE (Der "Arm" & Protokoll, wartet auf Go)
 local function executionLoop()
-    local executionSeconds = EXECUTION_INTERVAL_TICKS / 20
-
     while true do
-        sleep(executionSeconds)
+        -- Solange kein Go vorliegt, wird gewartet (kein Signal, kein Log, aber Berechnung läuft im Hintergrund)
+        while not executionGo do
+            sleep(0.05)
+        end
+        
+        -- Go sofort wieder verlieren, bis der nächste Takt ein neues Go gibt
+        executionGo = false
 
         local efficiency = liveEF
         local errorLevel = liveER
@@ -326,8 +343,8 @@ local function executionLoop()
             if ENABLE_MONITOR_LOGS then
                 local signChar = (controlDirection == 1) and "+" or "-"
                 local shortDiag = string.sub(stuckReason, 1, 10) 
-                local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d|%s", 
-                    logCounter, signChar, stepSize, startEffForLog, efficiency, math.floor(errorLevel + 0.5), shortDiag)
+                local compactLog = string.format("[%ds] #%03d|%s%d|%.0f->%.0f|ER:%d|%s", 
+                    elapsedSeconds, logCounter, signChar, stepSize, startEffForLog, efficiency, math.floor(errorLevel + 0.5), shortDiag)
                 
                 table.insert(logHistory, 1, compactLog)
                 local maxLogLines = math.max(5, monitorHeight - 7)
