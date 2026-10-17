@@ -1,46 +1,45 @@
 -- ==========================================
--- SCRIPT VERSION 2.43 (Mit Redstone-Relay Weckruf & 43er Full-Power-Abstand)
+-- SCRIPT VERSION 2.44 (Relay-Rundum-Signal & Weckruf-Optimierung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.43"
+local SCRIPT_VERSION = "v2.44"
 
 local reactor = nil
 local monitor = nil
-local relay = nil  -- Variable für das Redstone Relay / Modem
+local relay = nil  
 
 -- ==========================================
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100       -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0         -- Ab hier direkt Idle & Stopp
-local FULL_POWER_DISTANCE = 43      -- Auf 43 erhöht für längeren Voll-Power-Bereich
+local FULL_POWER_DISTANCE = 43      -- Volle Power ab 43 Punkten Restabstand
 local POLL_INTERVAL_TICKS = 4       -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0          -- Strikte Mindestwartezeit pro Zyklus in Sekunden
 local JUMP_THRESHOLD = 3.0          -- Schwellenwert für Tick-Sprünge/-Einbrüche
 local EFF_TOLERANCE = 0.8           -- Toleranz-Schwelle für normales Rauschen
 
 -- ==========================================
--- WECKHOF- / REDSTONE-RELAY EINSTELLUNGEN
+-- WECKRUF- / REDSTONE-RELAY EINSTELLUNGEN
 -- ==========================================
 local ENABLE_WAKEUP_PULSE = true    -- Aktiviert den Weck-Impuls bei Totalstillstand (EF=0 und ER=0)
 local WAKEUP_INTERVAL_TICKS = 40    -- Ticks zwischen den Weck-Versuchen (40 Ticks = 2 Sekunden)
 local WAKEUP_PULSE_TICKS = 10       -- Länge des Impulses in Ticks (10 Ticks = 0.5 Sekunden)
 local WAKEUP_STRENGTH = 15          -- Signalstärke des Weck-Impulses (1-15)
-local WAKEUP_SIDE = "left"          -- Standard-Redstone-Seite (falls kein Relay-Peripheral gefunden wird)
 
 -- MONITOR LOG EINSTELLUNGEN
 local ENABLE_MONITOR_LOGS = true 
 local monitorWidth, monitorHeight = 39, 25
 
 -- Regelungs-Variablen
-local currentSignal = 8         -- Startwert in der Mitte (1-15)
-local controlDirection = 1      -- 1 = Links / Erhöhen (+), -1 = Rechts / Senken (-)
-local stepSize = 4              -- Start-Suchschrittweite
+local currentSignal = 8         
+local controlDirection = 1      
+local stepSize = 4              
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
-local hasEverRun = false        -- Merker für Crash-Erkennung
+local hasEverRun = false        
 local logCounter = 0
-local logHistory = {}           -- Speicher für die Monitor-Logs
-local wakeupTickCounter = 0     -- Zähler für den Weck-Intervall
+local logHistory = {}           
+local wakeupTickCounter = 0     
 
 -- Live-Daten für den Hintergrund-Prozess
 local liveEF = 0
@@ -48,10 +47,8 @@ local liveER = 0
 local liveCaseTemp = 0
 local liveIsRunning = false
 
--- Diagnose-Variable
 local stuckReason = "Warte auf Reaktor..."
 
--- Statistiken für Min/Max
 local stats = {
     minEff = math.huge, maxEff = -math.huge,
     minErr = math.huge, maxErr = -math.huge,
@@ -62,7 +59,7 @@ print("==========================================")
 print(" FUSION REACTOR CONTROLLER " .. SCRIPT_VERSION)
 print("==========================================")
 
--- 1. Peripherie automatisch erkennen (inkl. Redstone Relay / Modem)
+-- 1. Peripherie automatisch erkennen
 local function scanPeripherals()
     reactor = nil
     monitor = nil
@@ -129,7 +126,6 @@ local function getReactorData()
     return logicMode, caseTemp, efficiency, errorLevel, isRunning
 end
 
--- 3. Statistiken aktualisieren
 local function updateStats(eff, err, caseT)
     if eff > 0 then
         if eff < stats.minEff then stats.minEff = eff end
@@ -141,37 +137,45 @@ local function updateStats(eff, err, caseT)
     if caseT > stats.maxCase then stats.maxCase = caseT end
 end
 
--- 4. Universelle Redstone- / Relay-Impuls-Funktion
+-- 4. Universeller Weckruf: Sendet Signal an ALLE Seiten gleichzeitig
+local sides = {"top", "bottom", "left", "right", "front", "back"}
+
 local function sendWakeupPulse()
     pcall(function()
         if relay then
-            if type(relay.setAnalogOutput) == "function" then
-                relay.setAnalogOutput(WAKEUP_SIDE, WAKEUP_STRENGTH)
-            elseif type(relay.setOutput) == "function" then
-                relay.setOutput(WAKEUP_SIDE, true)
+            for _, side in ipairs(sides) do
+                if type(relay.setAnalogOutput) == "function" then
+                    relay.setAnalogOutput(side, WAKEUP_STRENGTH)
+                elseif type(relay.setOutput) == "function" then
+                    relay.setOutput(side, true)
+                end
             end
         else
-            redstone.setAnalogOutput(WAKEUP_SIDE, WAKEUP_STRENGTH)
+            for _, side in ipairs(sides) do
+                redstone.setAnalogOutput(side, WAKEUP_STRENGTH)
+            end
         end
     end)
     
-    -- Impuls-Länge in Sekunden umgerechnet (1 Tick = 0.05s)
     sleep(WAKEUP_PULSE_TICKS * 0.05)
     
     pcall(function()
         if relay then
-            if type(relay.setAnalogOutput) == "function" then
-                relay.setAnalogOutput(WAKEUP_SIDE, 0)
-            elseif type(relay.setOutput) == "function" then
-                relay.setOutput(WAKEUP_SIDE, false)
+            for _, side in ipairs(sides) do
+                if type(relay.setAnalogOutput) == "function" then
+                    relay.setAnalogOutput(side, 0)
+                elseif type(relay.setOutput) == "function" then
+                    relay.setOutput(side, false)
+                end
             end
         else
-            redstone.setAnalogOutput(WAKEUP_SIDE, 0)
+            for _, side in ipairs(sides) do
+                redstone.setAnalogOutput(side, 0)
+            end
         end
     end)
 end
 
--- Steuerungs-Funktion
 local function applyControlAction(direction, strength)
     if strength > 15 then strength = 15 end
     local success = false
@@ -185,18 +189,37 @@ local function applyControlAction(direction, strength)
     
     if not success then
         local sideName = (direction == 1) and "left" or "right"
-        pcall(function() redstone.setAnalogOutput(sideName, strength) end)
+        pcall(function() 
+            if relay then
+                relay.setAnalogOutput(sideName, strength)
+            else
+                redstone.setAnalogOutput(sideName, strength)
+            end
+        end)
         sleep(0.1)
-        pcall(function() redstone.setAnalogOutput(sideName, 0) end)
+        pcall(function() 
+            if relay then
+                relay.setAnalogOutput(sideName, 0)
+            else
+                redstone.setAnalogOutput(sideName, 0)
+            end
+        end)
     end
 end
 
 pcall(function()
-    redstone.setAnalogOutput("left", 0)
-    redstone.setAnalogOutput("right", 0)
+    if relay then
+        for _, side in ipairs(sides) do
+            relay.setAnalogOutput(side, 0)
+        end
+    else
+        for _, side in ipairs(sides) do
+            redstone.setAnalogOutput(side, 0)
+        end
+    end
 end)
 
--- 5. DYNAMISCHE FORMEL (mit FULL_POWER_DISTANCE = 43)
+-- 5. DYNAMISCHE FORMEL
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
 
@@ -217,7 +240,6 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks / 0.2s Takt + Weckruf-Logik)
 local lastTickEF = 0
 local tickJumpOccurred = false
 local tickJumpDelta = 0
@@ -228,7 +250,6 @@ local function backgroundSensorLoop()
     while true do
         local _, caseT, eff, err, running = getReactorData()
         
-        -- Weckruf-Prüfung: Wenn EF == 0 und ER == 0 (vollkommener Stillstand/Aus)
         if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
             wakeupTickCounter = wakeupTickCounter + POLL_INTERVAL_TICKS
             if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS then
@@ -260,7 +281,6 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit Deadlock-Schutz
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -272,8 +292,11 @@ local function controlLoop()
 
         if not liveIsRunning or efficiency == 0 then
             pcall(function()
-                redstone.setAnalogOutput("left", 0)
-                redstone.setAnalogOutput("right", 0)
+                if relay then
+                    for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
+                else
+                    for _, side in ipairs(sides) do redstone.setAnalogOutput(side, 0) end
+                end
             end)
             lastEfficiency = 0 
             maxEfficiencySeen = 0 
@@ -281,8 +304,11 @@ local function controlLoop()
             sleep(1.0)
         elseif efficiency >= IDLE_THRESHOLD then
             pcall(function()
-                redstone.setAnalogOutput("left", 0)
-                redstone.setAnalogOutput("right", 0)
+                if relay then
+                    for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
+                else
+                    for _, side in ipairs(sides) do redstone.setAnalogOutput(side, 0) end
+                end
             end)
             lastEfficiency = efficiency
             stuckReason = string.format("Idle & Stopp (>=%.1f%%)", efficiency)
@@ -368,7 +394,6 @@ local function controlLoop()
     end
 end
 
--- 7. Monitor-UI Schleife
 local function uiLoop()
     while true do
         if monitor then
@@ -387,14 +412,12 @@ local function uiLoop()
 
             monitor.setBackgroundColor(colors.black)
             
-            -- Zeile 1: Titelleiste
             monitor.setCursorPos(1, 1)
             monitor.setBackgroundColor(colors.blue)
             monitor.setTextColor(colors.white)
             monitor.write(string.format("=== FUSION CONTROL %s ===", SCRIPT_VERSION))
             monitor.setBackgroundColor(colors.black)
 
-            -- Zeile 2: Status & EF
             monitor.setCursorPos(1, 2)
             monitor.clearLine()
             monitor.write("Modus: ")
@@ -414,7 +437,6 @@ local function uiLoop()
             monitor.setTextColor(colors.white)
             monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
 
-            -- Zeile 3: Case Temperatur & Error Level
             monitor.setCursorPos(1, 3)
             monitor.clearLine()
             monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
@@ -423,21 +445,18 @@ local function uiLoop()
             monitor.write(string.format("%.1f%%", errorLevel))
             monitor.setTextColor(colors.white)
 
-            -- Zeile 4: Regelung & Signal
             monitor.setCursorPos(1, 4)
             monitor.clearLine()
             local signText = (controlDirection == 1) and "+" or "-"
-            local sideText = relay and "RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
+            local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
             monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
 
-            -- Zeile 5: Diagnose
             monitor.setCursorPos(1, 5)
             monitor.clearLine()
             monitor.setTextColor(colors.cyan)
             monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
             monitor.setTextColor(colors.white)
 
-            -- Zeile 7+: MONITOR-LOGS
             if ENABLE_MONITOR_LOGS then
                 monitor.setCursorPos(1, 7)
                 monitor.setTextColor(colors.lightGray)
@@ -457,5 +476,4 @@ local function uiLoop()
     end
 end
 
--- 8. Parallele Ausführung aller Prozesse
 parallel.waitForAll(backgroundSensorLoop, controlLoop, uiLoop)
