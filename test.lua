@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.51 (Entkoppelte Brain-Arm Architektur mit Go-Sync)
+-- SCRIPT VERSION 2.52 (Entkoppelte Brain-Arm Architektur mit Go-Sync & Sekundenzähler)
 -- ==========================================
-local SCRIPT_VERSION = "v2.51"
+local SCRIPT_VERSION = "v2.52"
 
 local reactor = nil
 local monitor = nil
@@ -43,8 +43,9 @@ local wakeupTickCounter = 0
 
 -- Synchronisations-Variablen für Brain-Arm
 local executionTickCounter = 0
+local secondCounter = 0
+local secondsSinceLastGo = 0
 local executionGo = false
-local elapsedSeconds = 0
 
 -- Live-Daten für den Hintergrund-Prozess (Geteilter Zustand)
 local liveEF = 0
@@ -229,7 +230,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung & Taktgeber)
+-- 4. SCHNELLE 4-TICK SENSOR-SCHLEIFE (Das "Gehirn" / Trend, Richtung, Taktgeber & Sekundenzähler)
 local lastSensorEF = 0
 
 local function backgroundSensorLoop()
@@ -247,12 +248,18 @@ local function backgroundSensorLoop()
             hasEverRun = true
         end
 
-        -- Taktgeber & Go-Signal für die 20-Tick Ausführungs-Schleife (alle 20 Ticks = 1 Sekunde)
+        -- Taktgeber, Go-Signal und Sekunden-Zähler
         executionTickCounter = executionTickCounter + POLL_INTERVAL_TICKS
+        secondCounter = secondCounter + POLL_INTERVAL_TICKS
+
+        if secondCounter >= 20 then
+            secondCounter = secondCounter - 20
+            secondsSinceLastGo = secondsSinceLastGo + 1
+        end
+
         if executionTickCounter >= EXECUTION_INTERVAL_TICKS then
             executionTickCounter = 0
             executionGo = true
-            elapsedSeconds = elapsedSeconds + 1
         end
 
         -- Weckruf-Prüfung bei absolutem Stillstand
@@ -319,6 +326,10 @@ local function executionLoop()
         -- Go sofort wieder verlieren, bis der nächste Takt ein neues Go gibt
         executionGo = false
 
+        -- Sekunden für diesen Zyklus sichern und Zähler für den nächsten Zyklus auf 0 zurücksetzen
+        local logSeconds = secondsSinceLastGo
+        secondsSinceLastGo = 0
+
         local efficiency = liveEF
         local errorLevel = liveER
 
@@ -343,8 +354,8 @@ local function executionLoop()
             if ENABLE_MONITOR_LOGS then
                 local signChar = (controlDirection == 1) and "+" or "-"
                 local shortDiag = string.sub(stuckReason, 1, 10) 
-                local compactLog = string.format("[%ds] #%03d|%s%d|%.0f->%.0f|ER:%d|%s", 
-                    elapsedSeconds, logCounter, signChar, stepSize, startEffForLog, efficiency, math.floor(errorLevel + 0.5), shortDiag)
+                local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s", 
+                    logCounter, signChar, stepSize, startEffForLog, efficiency, math.floor(errorLevel + 0.5), logSeconds, shortDiag)
                 
                 table.insert(logHistory, 1, compactLog)
                 local maxLogLines = math.max(5, monitorHeight - 7)
@@ -394,59 +405,4 @@ local function uiLoop()
             monitor.clearLine()
             monitor.write("Modus: ")
             if efficiency >= IDLE_THRESHOLD then
-                monitor.setTextColor(colors.cyan)
-                monitor.write("IDLE ")
-            elseif statusText == "RUN" then
-                monitor.setTextColor(colors.green)
-                monitor.write("RUN  ")
-            elseif statusText == "CRUSH" then
-                monitor.setTextColor(colors.red)
-                monitor.write("CRUSH")
-            else
-                monitor.setTextColor(colors.orange)
-                monitor.write("STAND")
-            end
-            monitor.setTextColor(colors.white)
-            monitor.write(string.format(" | EF: %.1f%% (Z:%d)", efficiency, TARGET_EFFICIENCY))
-
-            monitor.setCursorPos(1, 3)
-            monitor.clearLine()
-            monitor.write(string.format("Case: %.1fM K", caseTemp / 1000000))
-            monitor.write(" | ER: ")
-            if errorLevel > 50 then monitor.setTextColor(colors.red) end
-            monitor.write(string.format("%.1f%%", errorLevel))
-            monitor.setTextColor(colors.white)
-
-            monitor.setCursorPos(1, 4)
-            monitor.clearLine()
-            local signText = (controlDirection == 1) and "+" or "-"
-            local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
-            monitor.write(string.format("Regel: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
-
-            monitor.setCursorPos(1, 5)
-            monitor.clearLine()
-            monitor.setTextColor(colors.cyan)
-            monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
-            monitor.setTextColor(colors.white)
-
-            if ENABLE_MONITOR_LOGS then
-                monitor.setCursorPos(1, 7)
-                monitor.setTextColor(colors.lightGray)
-                monitor.write("--- ZYKLEN-LOGS ---")
-
-                local maxLogLines = math.max(5, monitorHeight - 7)
-                for i = 1, maxLogLines do
-                    monitor.setCursorPos(1, 7 + i)
-                    monitor.clearLine()
-                    if logHistory[i] then
-                        monitor.write(logHistory[i])
-                    end
-                end
-            end
-        end
-        sleep(0.25)
-    end
-end
-
--- 7. Parallele Ausführung aller Prozesse
-parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop)
+                monitor.setTextColor
