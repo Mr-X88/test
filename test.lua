@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.37 (Tick-basierte Richtungs-Intelligenz & Fallback)
+-- SCRIPT VERSION 2.38 (Vereinigter Idle/Stop & Intelligente Crash-Erkennung)
 -- ==========================================
-local SCRIPT_VERSION = "v2.37"
+local SCRIPT_VERSION = "v2.38"
 
 local reactor = nil
 local monitor = nil
@@ -10,8 +10,7 @@ local monitor = nil
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
-local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
-local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
+local IDLE_THRESHOLD = 95.0     -- Ab hier direkt Idle & Stopp (ersetzt Hard-Stop)
 local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local MIN_CYCLE_WAIT = 5.0      -- Strikte Mindestwartezeit pro Zyklus in Sekunden
 local JUMP_THRESHOLD = 3.0      -- Schwellenwert für Tick-Sprünge
@@ -27,6 +26,7 @@ local controlDirection = 1      -- 1 = Links / Erhöhen (+), -1 = Rechts / Senke
 local stepSize = 4              -- Start-Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
+local hasEverRun = false        -- Merker, ob der Reaktor schon mal lief (für Crash-Erkennung)
 local logCounter = 0
 local logHistory = {}           -- Speicher für die Monitor-Logs
 
@@ -209,11 +209,16 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit intelligenter Tick-Sprung Auswertung
+-- 6. Haupt-Regelungsschleife mit vereinheitlichtem Idle-Stopp
 local function controlLoop()
     while true do
         local efficiency = liveEF
         local errorLevel = liveER
+
+        -- Crash-Erkennung & Status-Tracker im Hintergrund
+        if efficiency > 0 then
+            hasEverRun = true
+        end
 
         if not liveIsRunning or efficiency == 0 then
             pcall(function()
@@ -222,15 +227,15 @@ local function controlLoop()
             end)
             lastEfficiency = 0 
             maxEfficiencySeen = 0 
-            stuckReason = "Standby"
+            stuckReason = (hasEverRun and efficiency == 0) and "CRASH erkannt!" or "Standby"
             sleep(1.0)
-        elseif efficiency >= HARD_STOP_EF or efficiency >= IDLE_THRESHOLD then
+        elseif efficiency >= IDLE_THRESHOLD then
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
                 redstone.setAnalogOutput("right", 0)
             end)
             lastEfficiency = efficiency
-            stuckReason = string.format("Ziel erreicht (>=%.1f%%)", efficiency)
+            stuckReason = string.format("Idle & Stopp (>=%.1f%%)", efficiency)
             sleep(1.0)
         else
             if efficiency > maxEfficiencySeen then
@@ -273,7 +278,7 @@ local function controlLoop()
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Sprung (+)"
                     else
-                        -- Negativer Tick-Sprung (Einbruch): Sofortige Richtungs-Umkehr, wenn Richtung bekannt
+                        -- Negativer Tick-Sprung (Einbruch): Sofortige Richtungs-Umkehr
                         controlDirection = -controlDirection
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Einbruch (Wechsel)"
@@ -293,7 +298,6 @@ local function controlLoop()
                     end
                 end
             else
-                -- Fall, wenn keine Historie da ist (Init) und ein Tick-Einbruch passiert
                 if tickJumpOccurred and tickJumpDelta < 0 then
                     controlDirection = -controlDirection
                     stepSize = 2
@@ -324,7 +328,7 @@ local function controlLoop()
     end
 end
 
--- 7. Monitor-UI Schleife
+-- 7. Monitor-UI Schleife mit intelligenter CRASH-Anzeige
 local function uiLoop()
     while true do
         if monitor then
@@ -335,8 +339,8 @@ local function uiLoop()
             local statusText = "STANDBY"
             if efficiency > 0 then
                 statusText = "RUN"
-            elseif maxEfficiencySeen > 0 and efficiency == 0 then
-                statusText = "CRUSH"
+            elseif hasEverRun and efficiency == 0 then
+                statusText = "CRUSH"  -- Neuer Crash-Status
             else
                 statusText = "STANDBY"
             end
