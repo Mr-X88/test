@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.10 (Mit paralleler Hintergrund-Überwachung)
+-- SCRIPT VERSION 2.11 (Mit optimiertem Polling & Tiefst-EF-Schutz)
 -- ==========================================
-local SCRIPT_VERSION = "v2.10"
+local SCRIPT_VERSION = "v2.11"
 
 local reactor = nil
 local monitor = nil
@@ -11,7 +11,7 @@ local monitor = nil
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 90.0     -- Sicherer Idle-Punkt bei 90%
-local POLL_INTERVAL_TICKS = 4  -- Abfrage-Intervall in Ticks (20 Ticks = 1s). 10 Ticks = 0.5s
+local POLL_INTERVAL_TICKS = 4   -- GEÄNDERT: Abfrage-Intervall auf 4 Ticks (super schnell!)[cite: 5]
 local STABILITY_EPSILON = 0.03  -- Ab welcher EF-Änderung gilt der Wert als "stabil"
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
@@ -176,9 +176,9 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- PARALLELE HINTERGRUND-ÜBERWACHUNG (Läuft permanent im Ticks-Takt)
+-- PARALLELE HINTERGRUND-ÜBERWACHUNG (Mit 4 Ticks Takt)
 local function backgroundSensorLoop()
-    local pollSeconds = POLL_INTERVAL_TICKS / 20 -- Umrechnung Ticks in Sekunden
+    local pollSeconds = POLL_INTERVAL_TICKS / 20 
     local lastRecordedEF = 0
     local stableCount = 0
 
@@ -191,7 +191,6 @@ local function backgroundSensorLoop()
         
         updateStats(eff, err, caseT)
 
-        -- Prüfen ob sich der Wert eingependelt hat (Zyklus-Erkennung)
         local diff = math.abs(eff - lastRecordedEF)
         if diff < STABILITY_EPSILON then
             stableCount = stableCount + 1
@@ -207,19 +206,24 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife (Steuert den Reaktor im Hintergrund)
+-- 6. Haupt-Regelungsschleife
 local function controlLoop()
     while true do
         local efficiency = liveEF
         local errorLevel = liveER
 
-        if not liveIsRunning or efficiency == 0 and maxEfficiencySeen > 0 then
+        -- SICHERHEIT: Wenn Reaktor aus ist oder im kritischen Tiefst-Bereich (< 20% EF), keine sinnlosen Zyklen feuern!
+        if not liveIsRunning or efficiency == 0 or efficiency < 20.0 then
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
                 redstone.setAnalogOutput("right", 0)
             end)
             lastEfficiency = 0 
-            stuckReason = "Reaktor STANDBY/CRUSH"
+            if efficiency < 20.0 and efficiency > 0 then
+                stuckReason = "EF zu niedrig (<20%) -> Schutz"
+            else
+                stuckReason = "Reaktor STANDBY/CRUSH"
+            end
             sleep(1.0)
         elseif efficiency >= IDLE_THRESHOLD then
             pcall(function()
@@ -236,7 +240,6 @@ local function controlLoop()
 
             local startEffForLog = efficiency
 
-            -- Befehl senden
             applyControlAction(controlDirection, stepSize)
 
             currentSignal = currentSignal + (controlDirection * stepSize)
@@ -248,12 +251,11 @@ local function controlLoop()
                 controlDirection = 1 
             end
 
-            -- Warten, bis der Hintergrund-Sensor signalisiert, dass der Zyklus fertig ist
             cycleIsComplete = false
             local waitTimer = 0
             while not cycleIsComplete and waitTimer < 20.0 do
-                sleep(0.2)
-                waitTimer = waitTimer + 0.2
+                sleep(0.1)
+                waitTimer = waitTimer + 0.1
             end
 
             local newEfficiency = liveEF
@@ -265,8 +267,8 @@ local function controlLoop()
                 if isSpontaneousJump then
                     if effDelta < 0 then
                         controlDirection = 1   
-                        stepSize = 14          
-                        stuckReason = "TR-Drift Einbruch! BLITZ-REC (+14)"
+                        stepSize = 12          -- Etwas gedämpft, um Übersteuerung zu verhindern
+                        stuckReason = "TR-Drift Einbruch! BLITZ-REC"
                     else
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = string.format("Sprung+, Ziel nah (Step %d)", stepSize)
@@ -274,8 +276,8 @@ local function controlLoop()
                 else
                     if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
                         controlDirection = -controlDirection
-                        stepSize = math.max(3, calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY))
-                        stuckReason = "Sinkt (>Tol) -> Aggressiver Wechsel"
+                        stepSize = math.max(2, calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY))
+                        stuckReason = "Sinkt (>Tol) -> Wechsel"
                     elseif newEfficiency >= lastEfficiency then
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = string.format("Stabil/Besser -> Step %d", stepSize)
@@ -292,7 +294,6 @@ local function controlLoop()
             lastEfficiency = newEfficiency
             logCounter = logCounter + 1
 
-            -- Log-Eintrag hinzufügen
             local signChar = (controlDirection == 1) and "+" or "-"
             local shortDiag = string.sub(stuckReason, 1, 18)
             local compactLog = string.format("#%03d|%s%d|EF:%.1f->%.1f|%s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, shortDiag)
@@ -306,7 +307,7 @@ local function controlLoop()
     end
 end
 
--- 7. Monitor-UI Schleife (Aktualisiert den Monitor reibungslos)
+-- 7. Monitor-UI Schleife
 local function uiLoop()
     while true do
         if monitor then
@@ -391,9 +392,9 @@ local function uiLoop()
                 end
             end
         end
-        sleep(0.25) -- UI aktualisiert sich 4x pro Sekunde butterweich
+        sleep(0.25)
     end
 end
 
--- 8. Parallele Ausführung aller drei Prozesse
+-- 8. Parallele Ausführung aller Prozesse
 parallel.waitForAll(backgroundSensorLoop, controlLoop, uiLoop)
