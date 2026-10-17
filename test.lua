@@ -7,7 +7,7 @@ local monitor = nil
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert (Standard auf ~100% angepasst)
-local COOLDOWN_WAIT = 6.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
+local COOLDOWN_WAIT = 1.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
 
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
