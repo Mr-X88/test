@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.75 (Mit 3s-Cooldown & 2x-Go Richtungswechsel)
+-- SCRIPT VERSION 2.77 (Bereinigte, zentrale Trend-Logik)
 -- ==========================================
-local SCRIPT_VERSION = "v2.75"
+local SCRIPT_VERSION = "v2.77"
 
 local reactor = nil
 local monitor = nil
@@ -52,8 +52,7 @@ local executionGo = false
 local lastPollEF = -1
 local unchangedPollCount = 0
 local previousLoggedEff = -1
-local lastExecutionTime = 0     -- Timer für die 3-Sekunden-Mindestdauer
-local consecutiveGoStuck = 0    -- Zählt aufeinanderfolgende Go-Signale ohne Effizienzänderung
+local lastExecutionTime = 0     
 
 -- Variablen für die Redstone-Puls-Messung & Hysterese von unten
 local lastPulseTime = os.clock()
@@ -61,7 +60,7 @@ local pulseTargetMultiplier = 1
 local pulseStreakCount = 0
 
 -- Variablen für die Monitor-Seiten & Redstone-Log
-local currentPage = 1                -- 1 = Haupt-UI & Logs, 2 = Redstone-Diagnose & Puls-Logs
+local currentPage = 1                
 local pulseCountTotal = 0
 local lastDeltaT = 0
 local pulseLogHistory = {}
@@ -265,21 +264,19 @@ local function pulseListenerLoop()
             lastDeltaT = deltaT
             pulseCountTotal = pulseCountTotal + 1
             
-            -- Filter gegen extreme Ausreißer
             if deltaT >= 0.05 and deltaT <= 3.0 then
                 local desiredMultiplier = 1
                 
                 if deltaT >= 0.75 then
-                    desiredMultiplier = 1 -- Faktor 1 (4t)
+                    desiredMultiplier = 1 
                 elseif deltaT >= 0.375 then
-                    desiredMultiplier = 2 -- Faktor 2 (8t)
+                    desiredMultiplier = 2 
                 elseif deltaT >= 0.187 then
-                    desiredMultiplier = 4 -- Faktor 4 (16t)
+                    desiredMultiplier = 4 
                 else
-                    desiredMultiplier = 8 -- Faktor 8 (32t)
+                    desiredMultiplier = 8 
                 end
                 
-                -- Puls in die Log-Historie aufnehmen
                 local pulseLogLine = string.format("#%03d|Dt:%.3fs|Faktor:%d", pulseCountTotal, deltaT, desiredMultiplier)
                 table.insert(pulseLogHistory, 1, pulseLogLine)
                 local maxPulseLines = math.max(5, monitorHeight - 8)
@@ -287,7 +284,6 @@ local function pulseListenerLoop()
                     table.remove(pulseLogHistory)
                 end
 
-                -- Hysterese: Erst umschalten, wenn der Bereich 3 mal hintereinander erreicht wurde
                 if desiredMultiplier ~= lowPerfMultiplier then
                     if desiredMultiplier == pulseTargetMultiplier then
                         pulseStreakCount = pulseStreakCount + 1
@@ -326,8 +322,9 @@ local function touchListenerLoop()
     end
 end
 
--- 6. ADAPTIVE SENSOR-SCHLEIFE
+-- 6. ADAPTIVE SENSOR-SCHLEIFE (Zentrale Trend- & Richtungserkennung)
 local lastSensorEF = 0
+local lastSensorER = 0
 
 local function backgroundSensorLoop()
     while true do
@@ -344,6 +341,29 @@ local function backgroundSensorLoop()
         if eff > 0 then
             hasEverRun = true
         end
+
+        -- ZENTRALE TREND-ERFOLGS-PRÜFUNG
+        if eff >= TARGET_EFFICIENCY then
+            controlDirection = -1 -- Ziel erreicht -> Senken
+        else
+            if lastSensorEF > 0 then
+                local effDelta = eff - lastSensorEF
+                -- Wenn Erhöhen (+) zu einem Effizienz-Einbruch führt -> Sofort umkehren!
+                if controlDirection == 1 and effDelta < -1.0 then
+                    controlDirection = -1
+                -- Wenn Senken (-) ebenfalls zu einem Einbruch führt -> Wieder erhöhen!
+                elseif controlDirection == -1 and effDelta < -1.0 and err < 30 then
+                    controlDirection = 1
+                end
+            end
+            
+            -- Standard: Unter dem Ziel und stabil -> Erhöhen
+            if controlDirection == -1 and eff < TARGET_EFFICIENCY - 3 and err < 15 then
+                controlDirection = 1
+            end
+        end
+
+        lastSensorER = err
 
         secondCounter = secondCounter + effectiveTicks
         if secondCounter >= 20 then
@@ -409,7 +429,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 7. AUSFÜHRUNGS-SCHLEIFE (Mit 3s-Cooldown & 2x-Go Richtungswechsel)
+-- 7. AUSFÜHRUNGS-SCHLEIFE (Bereinigt von konkurrierenden Richtungswechseln)
 local function executionLoop()
     while true do
         while not executionGo do
@@ -418,10 +438,9 @@ local function executionLoop()
         
         executionGo = false
 
-        -- 3-SEKUNDEN-MINDESTDAUER PRÜFUNG (Cooldown)
+        -- 3-Sekunden Cooldown Prüfung
         local currentTime = os.clock()
         if (currentTime - lastExecutionTime) < EXECUTION_COOLDOWN then
-            -- Wenn noch keine 3 Sekunden vergangen sind, verwerfen wir diesen Ausführungs-Zyklus
             goto continueExecution
         end
         lastExecutionTime = currentTime
@@ -443,19 +462,12 @@ local function executionLoop()
                 maxEfficiencySeen = currentEfficiency
             end
 
-            -- 2x-GO RICHTUNGSWECHSEL BEI STILLSTAND / FESTHÄNGEN (z.B. bei 0 oder 100)
-            local effChange = math.abs(currentEfficiency - startEffForLog)
-            if effChange < 1.0 then
-                consecutiveGoStuck = consecutiveGoStuck + 1
-                if consecutiveGoStuck >= 2 then
-                    controlDirection = -controlDirection -- Richtung umkehren!
-                    consecutiveGoStuck = 0
-                end
-            else
-                consecutiveGoStuck = 0
+            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
+            if errorLevel > 30 and stepSize > 4 then
+                stepSize = 4
             end
 
-            stepSize = calculateStepFromTable(currentEfficiency, TARGET_EFFICIENCY)
+            -- Nutzt direkt die saubere controlDirection aus der Sensor-Schleife
             applyControlAction(controlDirection, stepSize)
 
             currentSignal = currentSignal + (controlDirection * stepSize)
@@ -508,7 +520,7 @@ local function executionLoop()
     end
 end
 
--- 8. MONITOR-UI SCHLEIFE (Zwei Seiten mit Klick-Navigation & Log-Button)
+-- 8. MONITOR-UI SCHLEIFE
 local function uiLoop()
     while true do
         if monitor then
@@ -516,7 +528,6 @@ local function uiLoop()
             monitor.clear()
 
             if currentPage == 1 then
-                -- === SEITE 1: HAUPT-UI & ZYKLEN-LOGS ===
                 local efficiency = liveEF
                 local caseTemp = liveCaseTemp
                 local errorLevel = liveER
@@ -567,7 +578,6 @@ local function uiLoop()
                 monitor.setCursorPos(1, 4)
                 monitor.clearLine()
                 local signText = (controlDirection == 1) and "+" or "-"
-                local sideText = relay and "ALL-RELAY" or ((reactor and type(reactor.adjustReactivity) == "function") and "API" or "RED")
                 monitor.write(string.format("Regel: %s%d | Sig: %-2d (T:%dt)", signText, stepSize, currentSignal, effectiveTicks))
 
                 monitor.setCursorPos(1, 5)
@@ -576,7 +586,6 @@ local function uiLoop()
                 monitor.write("Diag: " .. string.sub(stuckReason, 1, 28))
                 monitor.setTextColor(colors.white)
 
-                -- Klickbarer Log-Header in Zeile 7
                 monitor.setCursorPos(1, 7)
                 monitor.clearLine()
                 monitor.setTextColor(colors.lightGray)
@@ -606,7 +615,6 @@ local function uiLoop()
                     monitor.write("  (Logs sind deaktiviert)")
                 end
 
-                -- Footer / Button für Seitenwechsel
                 monitor.setCursorPos(1, monitorHeight)
                 monitor.setBackgroundColor(colors.gray)
                 monitor.setTextColor(colors.yellow)
@@ -614,7 +622,6 @@ local function uiLoop()
                 monitor.setBackgroundColor(colors.black)
 
             else
-                -- === SEITE 2: REDSTONE-DIAGNOSE & PULS-LOGS ===
                 monitor.setCursorPos(1, 1)
                 monitor.setBackgroundColor(colors.blue)
                 monitor.setTextColor(colors.white)
@@ -648,7 +655,6 @@ local function uiLoop()
                     end
                 end
 
-                -- Footer / Button für Seitenwechsel
                 monitor.setCursorPos(1, monitorHeight)
                 monitor.setBackgroundColor(colors.gray)
                 monitor.setTextColor(colors.yellow)
@@ -660,5 +666,5 @@ local function uiLoop()
     end
 end
 
--- 9. Parallele Ausführung aller Prozesse (inkl. Touch- und Puls-Listener)
+-- 9. Parallele Ausführung aller Prozesse
 parallel.waitForAll(backgroundSensorLoop, executionLoop, uiLoop, pulseListenerLoop, touchListenerLoop)
