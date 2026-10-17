@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.39 (Präzise Tick-Einbruchs-Erkennung & Formel-Regelung)
+-- SCRIPT VERSION 2.40 (Dynamische Restabstands-Formel & Tick-Intelligenz)
 -- ==========================================
-local SCRIPT_VERSION = "v2.39"
+local SCRIPT_VERSION = "v2.40"
 
 local reactor = nil
 local monitor = nil
@@ -157,16 +157,19 @@ end
 redstone.setAnalogOutput("left", 0)
 redstone.setAnalogOutput("right", 0)
 
--- 5. Intelligente Formel mit +15 Start-Boost unter 30% EF
+-- 5. NEUE DYNAMISCHE FORMEL (Skaliert fließend über den Restabstand effDiff)
 local function calculateStepFromTable(currentEff, targetEff)
-    if currentEff < 30.0 then
-        return 15  -- Unter 30% EF konsequent maximale Power (+15)
-    elseif currentEff >= 85.0 then
+    local effDiff = targetEff - currentEff
+
+    -- Solange der Abstand zum Ziel groß ist (>= 25 Punkte), volle Power (+15)
+    if effDiff >= 25 then
+        return 15
+    elseif effDiff <= 2 then
         return 1
     end
 
-    local effDiff = targetEff - currentEff
-    local calculatedStep = math.floor(math.abs(effDiff) * 0.18) + 1
+    -- Fließende Skalierung im oberen Bereich (wenn effDiff von 25 auf 2 schrumpft)
+    local calculatedStep = math.floor((effDiff / 25) * 14) + 1
     
     if calculatedStep > 15 then
         calculatedStep = 15
@@ -177,7 +180,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- VERBESSERTE PARALLELE HINTERGRUND-ÜBERWACHUNG (Erkennt abrupte Ticksprünge & -einbrüche sofort)
+-- PARALLELE HINTERGRUND-ÜBERWACHUNG (4 Ticks / 0.2s Takt)
 local lastTickEF = 0
 local tickJumpOccurred = false
 local tickJumpDelta = 0
@@ -209,7 +212,7 @@ local function backgroundSensorLoop()
     end
 end
 
--- 6. Haupt-Regelungsschleife mit präziser Fallback- und Formel-Logik
+-- 6. Haupt-Regelungsschleife
 local function controlLoop()
     while true do
         local efficiency = liveEF
@@ -244,14 +247,14 @@ local function controlLoop()
             local startEffForLog = efficiency
             local cycleStartTime = os.clock() 
 
-            -- Flags vor dem Zyklus zurücksetzen
+            -- Flags zurücksetzen
             tickJumpOccurred = false
             tickJumpDelta = 0
 
-            -- Befehl an den Reaktor senden
+            -- Befehl senden
             applyControlAction(controlDirection, stepSize)
 
-            -- Signal aktualisieren ohne Richtungs-Überschreibung
+            -- Signal aktualisieren
             currentSignal = currentSignal + (controlDirection * stepSize)
             if currentSignal > 15 then 
                 currentSignal = 15 
@@ -259,7 +262,7 @@ local function controlLoop()
                 currentSignal = 1 
             end
 
-            -- UNUMSTÖSSLICHE PAUSENSICHERUNG: Volle 5 Sekunden warten
+            -- Pausensicherung (5 Sekunden)
             local elapsedWait = 0
             while elapsedWait < MIN_CYCLE_WAIT do
                 sleep(0.25)
@@ -273,18 +276,14 @@ local function controlLoop()
             if lastEfficiency > 0 then
                 if tickJumpOccurred then
                     if tickJumpDelta > 0 then
-                        -- Positiver Tick-Sprung: Richtung beibehalten & per Formel beschleunigen!
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Sprung (+)"
                     else
-                        -- Negativer Tick-Sprung (Einbruch): Richtung umkehren
                         controlDirection = -controlDirection
-                        -- Da wir die Richtung kennen, nutzen wir die normale Formel zur Berechnung statt starrem Fallback!
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Einbruch (Wechsel)"
                     end
                 else
-                    -- Standard-Logik ohne Tick-Sprung
                     if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
                         controlDirection = -controlDirection
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
@@ -298,7 +297,6 @@ local function controlLoop()
                     end
                 end
             else
-                -- Nur wenn wir im absoluten Init-Blindflug sind und ein Einbruch passiert, greift der +2 Fallback
                 if tickJumpOccurred and tickJumpDelta < 0 then
                     controlDirection = -controlDirection
                     stepSize = 2
