@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.12 (Mit Reaktor-Sprung-Log & Ziel-Stopp)
+-- SCRIPT VERSION 2.13 (Start-Sperre behoben)
 -- ==========================================
-local SCRIPT_VERSION = "v2.12"
+local SCRIPT_VERSION = "v2.13"
 
 local reactor = nil
 local monitor = nil
@@ -11,8 +11,8 @@ local monitor = nil
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0     -- Sicherer Idle-Punkt
-local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel, um Übersteuern zu verhindern
-local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)[cite: 5]
+local HARD_STOP_EF = 98.0       -- Sofortiger Stopp kurz vor dem Ziel
+local POLL_INTERVAL_TICKS = 4   -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
 local STABILITY_EPSILON = 0.03  -- Ab welcher EF-Änderung gilt der Wert als "stabil"
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 5.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
@@ -213,21 +213,17 @@ local function controlLoop()
         local efficiency = liveEF
         local errorLevel = liveER
 
-        -- Wenn Reaktor aus ist oder im Tiefst-Bereich (< 20% EF)
-        if not liveIsRunning or efficiency == 0 or efficiency < 20.0 then
+        -- KORRIGIERT: Blockiert nur noch, wenn der Reaktor wirklich aus ist oder nach einem Lauf auf 0 steht (Crush)
+        if not liveIsRunning or (efficiency == 0 and maxEfficiencySeen > 0) then
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
                 redstone.setAnalogOutput("right", 0)
             end)
             lastEfficiency = 0 
-            if efficiency < 20.0 and efficiency > 0 then
-                stuckReason = "EF zu niedrig (<20%) -> Schutz"
-            else
-                stuckReason = "Reaktor STANDBY/CRUSH"
-            end
+            stuckReason = "Reaktor STANDBY/CRUSH"
             sleep(1.0)
         elseif efficiency >= HARD_STOP_EF or efficiency >= IDLE_THRESHOLD then
-            -- Harter Stopp kurz vor dem Ziel, um Überschießen zu verhindern!
+            -- Harter Stopp kurz vor dem Ziel
             pcall(function()
                 redstone.setAnalogOutput("left", 0)
                 redstone.setAnalogOutput("right", 0)
@@ -268,18 +264,15 @@ local function controlLoop()
 
                 if isSpontaneousJump then
                     if effDelta < 0 then
-                        -- Eindeutiger Reaktor-Einbruch durch internen TR-Drift
                         controlDirection = 1   
                         stepSize = 12          
                         stuckReason = "[REAKTOR-SPRUNG (-)] Einbruch!"
                     else
-                        -- Eindeutiger positiver Reaktor-Sprung
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "[REAKTOR-SPRUNG (+)] Boost!"
                     end
                 else
                     if newEfficiency < (lastEfficiency - EFF_TOLERANCE) then
-                        -- Wert sinkt -> Sofort konsequent die Richtung wechseln!
                         controlDirection = -controlDirection
                         stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                         stuckReason = "Sinkt -> Richtungswechsel"
