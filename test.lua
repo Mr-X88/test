@@ -1,21 +1,19 @@
--- Fusion Reactor Controller (Mit Anti-Ping-Pong, Low-Signal-Schutz & Pause-Modus)
+-- Fusion Reactor Controller (Reine Absolute Steuerung ohne Impuls-Widerspruch)
 local reactor = nil
 local monitor = nil
 
 -- REGELUNGS-EINSTELLUNGEN
-local TARGET_EFFICIENCY = 70    -- Dein gewünschter Ziel-EF-Wert
-local REDSTONE_SIDE = "back"    -- Feste Seite für das analoge Steuersignal
+local REDSTONE_SIDE = "back"    -- Feste Seite für das absolute analoge Steuersignal (1-15)
 
 -- Regelungs-Variablen
-local currentSignal = 8         
-local controlDirection = 1     
-local stepSize = 1             
-local recoveryCounter = 0      
-local isPaused = true          -- STARTET IM PAUSIERTEN ZUSTAND!
+local currentSignal = 8         -- Startwert in der Mitte (1-15)
+local controlDirection = 1      -- 1 = Erhöhen (+), -1 = Senken (-)
+local stepSize = 1              -- Suchschrittweite
+local lastEfficiency = 0
+local maxEfficiencySeen = 0     
 
--- Diagnose- & Log-Variablen
-local stuckReason = "Pausiert - Warte auf Start..."
-local logCounter = 0
+-- Diagnose-Variable
+local stuckReason = "Warte auf Reaktor..."
 
 -- Statistiken für Min/Max
 local stats = {
@@ -51,12 +49,12 @@ end
 scanPeripherals()
 
 if not reactor then
-    print("[FEHLER] Kein Fusion Reactor Logic Adapter gefunden!")
+    print("[DIAGNOSE FEHLER] Kein Fusion Reactor Logic Adapter gefunden!")
     return
 end
 
 if monitor then
-    monitor.setTextScale(0.5) 
+    monitor.setTextScale(0.5)
     monitor.clear()
 end
 
@@ -94,7 +92,7 @@ local function updateStats(eff, err, caseT)
     if caseT > stats.maxCase then stats.maxCase = caseT end
 end
 
--- 4. Absolutes Redstone-Signal setzen
+-- 4. Absolutes Redstone-Signal direkt setzen (Keine flüchtigen Impulse!)
 local function setSignalOutput(signal)
     if signal < 1 then signal = 1 end
     if signal > 15 then signal = 15 end
@@ -105,226 +103,158 @@ local function setSignalOutput(signal)
     end)
 end
 
-local function logPrint(msg)
-    print(msg)
-end
-
--- Initiales Signal beim Start setzen (Standard: 8)
+-- Initiales Signal beim Start anlegen
 setSignalOutput(currentSignal)
 
--- ==========================================
--- ROUTINEN FÜR PARALLELE AUSFÜHRUNG
--- ==========================================
+-- 5. Hill-Climbing Regelung mit 5 Sekunden Cooldown
+local function runControlLoop()
+    local _, caseTemp, efficiency, errorLevel = getReactorData()
 
--- A. Der eigentliche Regelkreis (läuft im Hintergrund mit eigenen Pausen)
-local function controlRoutine()
-    while true do
-        if isPaused then
-            stuckReason = "Pausiert - Manueller Test aktiv"
-            sleep(0.5)
+    if (errorLevel >= 100) then
+        pcall(function() reactor.stop() end)
+        setSignalOutput(0)
+        stuckReason = "NOTSTOPP: Fehlerlevel >= 100"
+        return
+    end
+
+    if efficiency > maxEfficiencySeen then
+        maxEfficiencySeen = efficiency
+    end
+
+    -- Status bestimmen (Standby / Run / Crush)
+    local statusText = "STANDBY"
+    if efficiency > 0 then
+        statusText = "RUN"
+    elseif maxEfficiencySeen > 0 and efficiency == 0 then
+        statusText = "CRUSH"
+    else
+        statusText = "STANDBY"
+    end
+
+    -- Wenn Standby oder Crush: Signal auf 0 setzen
+    if statusText == "STANDBY" or statusText == "CRUSH" then
+        setSignalOutput(0)
+        lastEfficiency = 0 
+        stuckReason = "Reaktor in " .. statusText
+        return
+    end
+
+    -- Neuen absoluten Zielwert berechnen und direkt anlegen
+    local targetSignal = currentSignal + (controlDirection * stepSize)
+    
+    -- Anschlag-Schutz (1 bis 15)
+    if targetSignal > 15 then
+        targetSignal = 15
+        controlDirection = -1 -- Richtung umkehren
+    elseif targetSignal < 1 then
+        targetSignal = 1
+        controlDirection = 1  -- Richtung umkehren
+    end
+
+    setSignalOutput(targetSignal)
+
+    -- WICHTIG: Exakt 5 Sekunden Cooldown abwarten
+    stuckReason = "Cooldown (5s)..."
+    sleep(5.0)
+
+    -- Erst nach dem Cooldown den neuen Wert abfragen
+    local _, _, newEfficiency = getReactorData()
+
+    -- Hill-Climbing Auswertung
+    if lastEfficiency > 0 then
+        if newEfficiency < lastEfficiency then
+            -- Wert wurde schlechter -> Richtung wechseln und Schritt verkleinern/halten
+            controlDirection = -controlDirection
+            stuckReason = "Schlechter -> Richtung gewechselt"
         else
-            logCounter = logCounter + 1
-            local _, caseTemp, startEff, errorLevel = getReactorData()
-
-            if (errorLevel >= 100) then
-                pcall(function() reactor.stop() end)
-                pcall(function() redstone.setAnalogOutput(REDSTONE_SIDE, 0) end)
-                stuckReason = "NOTSTOPP: Fehlerlevel >= 100"
-                logPrint(string.format("[LOG #%d] NOTSTOPP ausgelöst!", logCounter))
-                isPaused = true
-                return
-            end
-
-            local statusText = "STANDBY"
-            if startEff > 0 then
-                statusText = "RUN"
-            elseif startEff == 0 then
-                statusText = "CRUSH"
-            end
-
-            if statusText == "STANDBY" or statusText == "CRUSH" then
-                pcall(function() redstone.setAnalogOutput(REDSTONE_SIDE, 0) end)
-                currentSignal = 8
-                controlDirection = 1
-                stepSize = 1
-                recoveryCounter = 0
-                stuckReason = "Reaktor in " .. statusText
-                sleep(1.0)
-            else
-                -- Anschlag-Schutz & Richtungswechsel
-                if currentSignal >= 15 and controlDirection == 1 then
-                    controlDirection = -1
-                    stepSize = 1
-                elseif currentSignal <= 1 and controlDirection == -1 then
-                    controlDirection = 1
-                    stepSize = 1
-                end
-
-                local oldSignal = currentSignal
-                local targetSignal = currentSignal + (controlDirection * stepSize)
-                setSignalOutput(targetSignal)
-
-                stuckReason = "Cooldown: Ticks sammeln..."
-
-                local efficiencyReadings = { startEff }
-                for i = 1, 5 do
-                    sleep(1.0)
-                    -- Falls in der Zwischenzeit pausiert wird, abbrechen
-                    if isPaused then break end
-                    local _, _, currentEff = getReactorData()
-                    table.insert(efficiencyReadings, currentEff)
-                end
-
-                if not isPaused then
-                    local endEff = efficiencyReadings[#efficiencyReadings]
-                    local trendDiff = endEff - startEff
-                    local actionType = ""
-
-                    if trendDiff < -0.5 then
-                        controlDirection = -controlDirection
-                        stepSize = 1
-                        recoveryCounter = 4 
-                        actionType = string.format("STURZ (%.2f) -> Sperre", trendDiff)
-                    else
-                        if recoveryCounter > 0 then
-                            recoveryCounter = recoveryCounter - 1
-                            stepSize = 1 
-                            actionType = string.format("Erholung (%d)", recoveryCounter)
-                        else
-                            if currentSignal <= 4 then
-                                stepSize = 1
-                                actionType = string.format("Low-Signal Safe (%.2f)", trendDiff)
-                            else
-                                actionType = string.format("Stabil (%.2f) -> Formel", trendDiff)
-                                local effDistance = math.abs(TARGET_EFFICIENCY - endEff)
-                                stepSize = math.floor(effDistance * 0.3) + 1
-                                if stepSize > 15 then stepSize = 15 end
-                                if stepSize < 1 then stepSize = 1 end
-                            end
-                        end
-                    end
-
-                    logPrint(string.format("--- [LOG Zyklus #%d] ---", logCounter))
-                    logPrint(string.format("  Start EF: %.2f%% | End EF: %.2f%% | Diff: %.2f%%", startEff, endEff, trendDiff))
-                    logPrint(string.format("  Aktion: %s", actionType))
-                    logPrint(string.format("  Schrittweite: %d", stepSize))
-                    logPrint(string.format("  Signal: %d -> Neu: %d", oldSignal, currentSignal))
-                    logPrint("------------------------")
-
-                    stuckReason = string.format("Diff:%.1f | %s", trendDiff, actionType)
-                end
-            end
+            -- Wert wurde besser oder blieb gleich -> Richtung beibehalten
+            stuckReason = "Besser -> Richtung gehalten"
         end
+    else
+        stuckReason = "Initialisierung (Suche)"
     end
+
+    lastEfficiency = newEfficiency
 end
 
--- B. UI-Aktualisierungs-Routine (lädt flüssig alle 0.3 Sekunden neu)
-local function uiRoutine()
-    while true do
-        if monitor then
-            local logicMode, caseTemp, efficiency, errorLevel = getReactorData()
-            updateStats(efficiency, errorLevel, caseTemp)
+-- 6. Monitor grafisch zeichnen
+local function drawUI()
+    if not monitor then return end
 
-            local statusText = "STANDBY"
-            if efficiency > 0 then
-                statusText = "RUN"
-            elseif efficiency == 0 then
-                statusText = "CRUSH"
-            end
+    local logicMode, caseTemp, efficiency, errorLevel = getReactorData()
+    updateStats(efficiency, errorLevel, caseTemp)
 
-            monitor.setCursorPos(1, 1)
-            if isPaused then
-                monitor.setBackgroundColor(colors.orange)
-            else
-                monitor.setBackgroundColor(colors.blue)
-            end
-            monitor.setTextColor(colors.white)
-            monitor.write(isPaused and " === PAUSIERT (KLICK ZUM START) === " or " === FUSION REACTOR CONTROL === ")
-            monitor.setBackgroundColor(colors.black)
-
-            monitor.setCursorPos(1, 3)
-            monitor.clearLine()
-            monitor.write("Status: ")
-            if isPaused then
-                monitor.setTextColor(colors.orange)
-                monitor.write("PAUSIERT      ")
-            elseif statusText == "RUN" then
-                monitor.setTextColor(colors.green)
-                monitor.write("RUN           ")
-            elseif statusText == "CRUSH" then
-                monitor.setTextColor(colors.red)
-                monitor.write("CRUSH         ")
-            else
-                monitor.setTextColor(colors.yellow)
-                monitor.write("STANDBY       ")
-            end
-            monitor.setTextColor(colors.white)
-
-            monitor.setCursorPos(1, 5)
-            monitor.clearLine()
-            monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
-
-            monitor.setCursorPos(1, 7)
-            monitor.clearLine()
-            monitor.setTextColor(colors.yellow)
-            monitor.write(string.format("EF (Eff):  %.2f%% (Min:%.2f Max:%.2f)", efficiency, stats.minEff == math.huge and 0 or stats.minEff, stats.maxEff))
-            monitor.setTextColor(colors.white)
-
-            monitor.setCursorPos(1, 8)
-            monitor.clearLine()
-            if errorLevel > 50 then monitor.setTextColor(colors.red) end
-            monitor.write(string.format("ER (Err):  %.2f%% (Min:%.2f Max:%.2f)", errorLevel, stats.minErr == math.huge and 0 or stats.minErr, stats.maxErr))
-            monitor.setTextColor(colors.white)
-
-            monitor.setCursorPos(1, 10)
-            monitor.clearLine()
-            monitor.write("Fuel Type: D-T Fuel")
-
-            monitor.setCursorPos(1, 11)
-            monitor.clearLine()
-            local signText = (controlDirection == 1) and "+" or "-"
-            monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, REDSTONE_SIDE))
-
-            monitor.setCursorPos(1, 13)
-            monitor.clearLine()
-            monitor.setTextColor(colors.cyan)
-            monitor.write("Diag: " .. string.sub(stuckReason, 1, 30))
-
-            monitor.setBackgroundColor(colors.black)
-            monitor.setTextColor(colors.lightGray)
-        end
-        sleep(0.3)
+    local statusText = "STANDBY"
+    if efficiency > 0 then
+        statusText = "RUN"
+    elseif maxEfficiencySeen > 0 and efficiency == 0 then
+        statusText = "CRUSH"
+    else
+        statusText = "STANDBY"
     end
+
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write(" === FUSION REACTOR CONTROL === ")
+    monitor.setBackgroundColor(colors.black)
+
+    -- Status
+    monitor.setCursorPos(1, 3)
+    monitor.clearLine()
+    monitor.write("Modus: ")
+    if statusText == "RUN" then
+        monitor.setTextColor(colors.green)
+    elseif statusText == "CRUSH" then
+        monitor.setTextColor(colors.red)
+    else
+        monitor.setTextColor(colors.orange)
+    end
+    monitor.write(statusText .. "    ")
+    monitor.setTextColor(colors.white)
+
+    -- Case Temperatur
+    monitor.setCursorPos(1, 5)
+    monitor.clearLine()
+    monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
+
+    -- EF (Efficiency)
+    monitor.setCursorPos(1, 7)
+    monitor.clearLine()
+    monitor.setTextColor(colors.yellow)
+    monitor.write(string.format("EF (Eff):  %.2f%% (Min:%.2f Max:%.2f)", efficiency, stats.minEff == math.huge and 0 or stats.minEff, stats.maxEff))
+    monitor.setTextColor(colors.white)
+
+    -- ER (Error Level)
+    monitor.setCursorPos(1, 8)
+    monitor.clearLine()
+    if errorLevel > 50 then monitor.setTextColor(colors.red) end
+    monitor.write(string.format("ER (Err):  %.2f%% (Min:%.2f Max:%.2f)", errorLevel, stats.minErr == math.huge and 0 or stats.minErr, stats.maxErr))
+    monitor.setTextColor(colors.white)
+
+    -- Fuel Type
+    monitor.setCursorPos(1, 10)
+    monitor.clearLine()
+    monitor.write("Fuel Type: D-T Fuel")
+
+    -- Regelung, Signalstärke und Seite
+    monitor.setCursorPos(1, 11)
+    monitor.clearLine()
+    local signText = (controlDirection == 1) and "+" or "-"
+    monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, REDSTONE_SIDE))
+
+    -- Diagnose-Zeile
+    monitor.setCursorPos(1, 13)
+    monitor.clearLine()
+    monitor.setTextColor(colors.cyan)
+    monitor.write("Diag: " .. string.sub(stuckReason, 1, 24))
+
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.lightGray)
 end
 
--- C. Event-Routine für Benutzereingaben (Tastatur & Monitor-Klicks)
-local function eventRoutine()
-    while true do
-        local event, p1, p2, p3 = os.pullEvent()
-        if event == "key" then
-            -- Leertaste oder Enter schaltet Pause um
-            if p1 == keys.space or p1 == keys.enter then
-                isPaused = not isPaused
-                if isPaused then
-                    print("[INFO] Regelung PAUSIERT.")
-                else
-                    print("[INFO] Regelung GESTARTET.")
-                end
-            end
-        elseif event == "monitor_touch" then
-            -- Klick auf den Monitor schaltet ebenfalls die Pause um
-            isPaused = not isPaused
-            if isPaused then
-                print("[INFO] Regelung per Monitor PAUSIERT.")
-            else
-                print("[INFO] Regelung per Monitor GESTARTET.")
-            end
-        end
-    end
+-- 7. Hauptschleife
+while true do
+    runControlLoop()
+    drawUI()
 end
-
--- 7. Start aller drei Prozesse parallel
-print("Skript gestartet. Status: PAUSIERT.")
-print("Drücke LEERTASTE am Computer oder klicke auf den Monitor, um die Regelung zu starten.")
-
-parallel.waitForAll(controlRoutine, uiRoutine, eventRoutine)
