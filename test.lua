@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.44 (Relay-Rundum-Signal & Weckruf-Optimierung)
+-- SCRIPT VERSION 2.45 (Echtzeit 4-Tick Regelungs- & Richtungs-Logik)
 -- ==========================================
-local SCRIPT_VERSION = "v2.44"
+local SCRIPT_VERSION = "v2.45"
 
 local reactor = nil
 local monitor = nil
@@ -14,7 +14,6 @@ local TARGET_EFFICIENCY = 100       -- Ziel-EF-Wert
 local IDLE_THRESHOLD = 95.0         -- Ab hier direkt Idle & Stopp
 local FULL_POWER_DISTANCE = 43      -- Volle Power ab 43 Punkten Restabstand
 local POLL_INTERVAL_TICKS = 4       -- Abfrage-Intervall auf 4 Ticks (0.2 Sekunden)
-local MIN_CYCLE_WAIT = 5.0          -- Strikte Mindestwartezeit pro Zyklus in Sekunden
 local JUMP_THRESHOLD = 3.0          -- Schwellenwert für Tick-Sprünge/-Einbrüche
 local EFF_TOLERANCE = 0.8           -- Toleranz-Schwelle für normales Rauschen
 
@@ -32,7 +31,7 @@ local monitorWidth, monitorHeight = 39, 25
 
 -- Regelungs-Variablen
 local currentSignal = 8         
-local controlDirection = 1      
+local controlDirection = 1      -- 1 = Links / Erhöhen (+), -1 = Rechts / Senken (-)
 local stepSize = 4              
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
@@ -137,7 +136,6 @@ local function updateStats(eff, err, caseT)
     if caseT > stats.maxCase then stats.maxCase = caseT end
 end
 
--- 4. Universeller Weckruf: Sendet Signal an ALLE Seiten gleichzeitig
 local sides = {"top", "bottom", "left", "right", "front", "back"}
 
 local function sendWakeupPulse()
@@ -207,18 +205,6 @@ local function applyControlAction(direction, strength)
     end
 end
 
-pcall(function()
-    if relay then
-        for _, side in ipairs(sides) do
-            relay.setAnalogOutput(side, 0)
-        end
-    else
-        for _, side in ipairs(sides) do
-            redstone.setAnalogOutput(side, 0)
-        end
-    end
-end)
-
 -- 5. DYNAMISCHE FORMEL
 local function calculateStepFromTable(currentEff, targetEff)
     local effDiff = targetEff - currentEff
@@ -240,6 +226,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
+-- 6. SCHNELLERE 4-TICK REGELUNGS- & HINTERGRUND-SCHLEIFE
 local lastTickEF = 0
 local tickJumpOccurred = false
 local tickJumpDelta = 0
@@ -250,6 +237,16 @@ local function backgroundSensorLoop()
     while true do
         local _, caseT, eff, err, running = getReactorData()
         
+        liveCaseTemp = caseT
+        liveEF = eff
+        liveER = err
+        liveIsRunning = running
+        
+        if eff > 0 then
+            hasEverRun = true
+        end
+
+        -- Weckruf-Prüfung bei Stillstand
         if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
             wakeupTickCounter = wakeupTickCounter + POLL_INTERVAL_TICKS
             if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS then
@@ -260,140 +257,78 @@ local function backgroundSensorLoop()
             wakeupTickCounter = 0
         end
 
-        if lastTickEF > 0 and eff > 0 then
-            local delta = eff - lastTickEF
-            if math.abs(delta) >= JUMP_THRESHOLD then
-                tickJumpOccurred = true
-                tickJumpDelta = delta
-            end
-        end
-        if eff > 0 then
-            lastTickEF = eff
-        end
-
-        liveCaseTemp = caseT
-        liveEF = eff
-        liveER = err
-        liveIsRunning = running
-        
-        updateStats(eff, err, caseT)
-        sleep(pollSeconds)
-    end
-end
-
-local function controlLoop()
-    while true do
-        local efficiency = liveEF
-        local errorLevel = liveER
-
-        if efficiency > 0 then
-            hasEverRun = true
-        end
-
-        if not liveIsRunning or efficiency == 0 then
-            pcall(function()
-                if relay then
-                    for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
-                else
-                    for _, side in ipairs(sides) do redstone.setAnalogOutput(side, 0) end
-                end
-            end)
-            lastEfficiency = 0 
-            maxEfficiencySeen = 0 
-            stuckReason = (hasEverRun and efficiency == 0) and "CRASH erkannt!" or "Standby"
-            sleep(1.0)
-        elseif efficiency >= IDLE_THRESHOLD then
-            pcall(function()
-                if relay then
-                    for _, side in ipairs(sides) do relay.setAnalogOutput(side, 0) end
-                else
-                    for _, side in ipairs(sides) do redstone.setAnalogOutput(side, 0) end
-                end
-            end)
-            lastEfficiency = efficiency
-            stuckReason = string.format("Idle & Stopp (>=%.1f%%)", efficiency)
-            sleep(1.0)
+        if not running or eff == 0 then
+            lastEfficiency = 0
+            maxEfficiencySeen = 0
+            stuckReason = (hasEverRun and eff == 0) and "CRASH erkannt!" or "Standby"
+        elseif eff >= IDLE_THRESHOLD then
+            lastEfficiency = eff
+            stuckReason = string.format("Idle & Stopp (>=%.1f%%)", eff)
         else
-            if efficiency > maxEfficiencySeen then
-                maxEfficiencySeen = efficiency
+            if eff > maxEfficiencySeen then
+                maxEfficiencySeen = eff
             end
-
-            local startEffForLog = efficiency
-            local cycleStartTime = os.clock() 
-
-            tickJumpOccurred = false
-            tickJumpDelta = 0
-
-            applyControlAction(controlDirection, stepSize)
-
-            currentSignal = currentSignal + (controlDirection * stepSize)
-            if currentSignal > 15 then 
-                currentSignal = 15 
-            elseif currentSignal < 1 then 
-                currentSignal = 1 
-            end
-
-            local elapsedWait = 0
-            while elapsedWait < MIN_CYCLE_WAIT do
-                sleep(0.25)
-                elapsedWait = os.clock() - cycleStartTime
-            end
-
-            local cycleDuration = os.clock() - cycleStartTime 
-            local newEfficiency = liveEF
-            local recordedER = liveER 
 
             if lastEfficiency > 0 then
-                if tickJumpOccurred then
-                    if tickJumpDelta > 0 then
-                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                local delta = eff - lastEfficiency
+                if math.abs(delta) >= JUMP_THRESHOLD then
+                    if delta > 0 then
+                        stepSize = calculateStepFromTable(eff, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Sprung (+)"
                     else
                         controlDirection = -controlDirection
-                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                        stepSize = calculateStepFromTable(eff, TARGET_EFFICIENCY)
                         stuckReason = "Tick-Einbruch (Wechsel)"
                     end
                 else
-                    if newEfficiency > lastEfficiency then
-                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                    -- Fließende Trend-Prüfung im Takt
+                    if eff > lastEfficiency then
+                        stepSize = calculateStepFromTable(eff, TARGET_EFFICIENCY)
                         stuckReason = string.format("Steigt -> Step %d", stepSize)
-                    else
+                    elseif eff < (lastEfficiency - EFF_TOLERANCE) then
                         controlDirection = -controlDirection
-                        stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
+                        stepSize = calculateStepFromTable(eff, TARGET_EFFICIENCY)
+                        stuckReason = "Sinkt -> Wechsel"
+                    else
+                        -- Bei hartem Stillstand / Hänger nach einigen Ticks Richtung wechseln
+                        controlDirection = -controlDirection
+                        stepSize = calculateStepFromTable(eff, TARGET_EFFICIENCY)
                         stuckReason = "Stillstand -> Wechsel"
                     end
                 end
             else
-                if tickJumpOccurred and tickJumpDelta < 0 then
-                    controlDirection = -controlDirection
-                    stepSize = 2
-                    stuckReason = "Init Einbruch (+2)"
-                else
-                    stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                    stuckReason = "Init"
-                end
+                stepSize = calculateStepFromTable(eff, TARGET_EFFICIENCY)
+                stuckReason = "Init"
             end
 
-            lastEfficiency = newEfficiency
+            -- Direkt im 4-Tick Takt ansteuern
+            applyControlAction(controlDirection, stepSize)
+            currentSignal = currentSignal + (controlDirection * stepSize)
+            if currentSignal > 15 then currentSignal = 15 elseif currentSignal < 1 then currentSignal = 1 end
+
+            lastEfficiency = eff
             logCounter = logCounter + 1
 
             if ENABLE_MONITOR_LOGS then
                 local signChar = (controlDirection == 1) and "+" or "-"
                 local shortDiag = string.sub(stuckReason, 1, 10) 
-                local compactLog = string.format("#%03d|%s%d|%.0f->%.0f|ER:%d-%ds|%s", 
-                    logCounter, signChar, stepSize, startEffForLog, newEfficiency, math.floor(recordedER + 0.5), math.floor(cycleDuration + 0.5), shortDiag)
+                local compactLog = string.format("#%03d|%s%d|->%.0f|ER:%d|%s", 
+                    logCounter, signChar, stepSize, eff, math.floor(err + 0.5), shortDiag)
                 
                 table.insert(logHistory, 1, compactLog)
-                
                 local maxLogLines = math.max(5, monitorHeight - 7)
                 if #logHistory > maxLogLines then
                     table.remove(logHistory)
                 end
             end
         end
+
+        updateStats(eff, err, caseT)
+        sleep(pollSeconds)
     end
 end
 
+-- 7. Monitor-UI Schleife
 local function uiLoop()
     while true do
         if monitor then
@@ -476,4 +411,5 @@ local function uiLoop()
     end
 end
 
-parallel.waitForAll(backgroundSensorLoop, controlLoop, uiLoop)
+-- 8. Parallele Ausführung
+parallel.waitForAll(backgroundSensorLoop, uiLoop)
