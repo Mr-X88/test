@@ -1,13 +1,10 @@
--- Fusion Reactor Controller (Reine Absolute Steuerung ohne Impuls-Widerspruch)
+-- Fusion Reactor Controller (Mit absoluten Signalen auf Links/Rechts)
 local reactor = nil
 local monitor = nil
 
--- REGELUNGS-EINSTELLUNGEN
-local REDSTONE_SIDE = "back"    -- Feste Seite für das absolute analoge Steuersignal (1-15)
-
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
-local controlDirection = 1      -- 1 = Erhöhen (+), -1 = Senken (-)
+local controlDirection = 1      -- 1 = Links (+ / Erhöhen), -1 = Rechts (- / Senken)
 local stepSize = 1              -- Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
@@ -92,19 +89,28 @@ local function updateStats(eff, err, caseT)
     if caseT > stats.maxCase then stats.maxCase = caseT end
 end
 
--- 4. Absolutes Redstone-Signal direkt setzen (Keine flüchtigen Impulse!)
-local function setSignalOutput(signal)
+-- 4. Absolutes Redstone-Signal auf Links oder Rechts setzen
+local function setSignalOutput(direction, signal)
     if signal < 1 then signal = 1 end
     if signal > 15 then signal = 15 end
     
     currentSignal = signal
     pcall(function()
-        redstone.setAnalogOutput(REDSTONE_SIDE, currentSignal)
+        if direction == 1 then
+            -- Richtung Links (+): Linker Port bekommt Signal, Rechter Port wird 0
+            redstone.setAnalogOutput("left", currentSignal)
+            redstone.setAnalogOutput("right", 0)
+        else
+            -- Richtung Rechts (-): Rechter Port bekommt Signal, Linker Port wird 0
+            redstone.setAnalogOutput("right", currentSignal)
+            redstone.setAnalogOutput("left", 0)
+        end
     end)
 end
 
--- Initiales Signal beim Start anlegen
-setSignalOutput(currentSignal)
+-- Alle Ausgänge beim Start sicherheitshalber zurücksetzen
+redstone.setAnalogOutput("left", 0)
+redstone.setAnalogOutput("right", 0)
 
 -- 5. Hill-Climbing Regelung mit 5 Sekunden Cooldown
 local function runControlLoop()
@@ -112,7 +118,8 @@ local function runControlLoop()
 
     if (errorLevel >= 100) then
         pcall(function() reactor.stop() end)
-        setSignalOutput(0)
+        redstone.setAnalogOutput("left", 0)
+        redstone.setAnalogOutput("right", 0)
         stuckReason = "NOTSTOPP: Fehlerlevel >= 100"
         return
     end
@@ -131,27 +138,29 @@ local function runControlLoop()
         statusText = "STANDBY"
     end
 
-    -- Wenn Standby oder Crush: Signal auf 0 setzen
+    -- Wenn Standby oder Crush: Beide Redstone-Signale auf 0 setzen
     if statusText == "STANDBY" or statusText == "CRUSH" then
-        setSignalOutput(0)
+        pcall(function()
+            redstone.setAnalogOutput("left", 0)
+            redstone.setAnalogOutput("right", 0)
+        end)
         lastEfficiency = 0 
         stuckReason = "Reaktor in " .. statusText
         return
     end
 
-    -- Neuen absoluten Zielwert berechnen und direkt anlegen
+    -- Neuen Zielwert berechnen und absolut auf die entsprechende Seite legen
     local targetSignal = currentSignal + (controlDirection * stepSize)
     
-    -- Anschlag-Schutz (1 bis 15)
     if targetSignal > 15 then
         targetSignal = 15
-        controlDirection = -1 -- Richtung umkehren
+        controlDirection = -1 -- Richtung wechseln
     elseif targetSignal < 1 then
         targetSignal = 1
-        controlDirection = 1  -- Richtung umkehren
+        controlDirection = 1  -- Richtung wechseln
     end
 
-    setSignalOutput(targetSignal)
+    setSignalOutput(controlDirection, targetSignal)
 
     -- WICHTIG: Exakt 5 Sekunden Cooldown abwarten
     stuckReason = "Cooldown (5s)..."
@@ -163,7 +172,7 @@ local function runControlLoop()
     -- Hill-Climbing Auswertung
     if lastEfficiency > 0 then
         if newEfficiency < lastEfficiency then
-            -- Wert wurde schlechter -> Richtung wechseln und Schritt verkleinern/halten
+            -- Wert wurde schlechter -> Richtung wechseln
             controlDirection = -controlDirection
             stuckReason = "Schlechter -> Richtung gewechselt"
         else
@@ -237,11 +246,12 @@ local function drawUI()
     monitor.clearLine()
     monitor.write("Fuel Type: D-T Fuel")
 
-    -- Regelung, Signalstärke und Seite
+    -- Regelung, Signalstärke und Seite (Links / Rechts)
     monitor.setCursorPos(1, 11)
     monitor.clearLine()
     local signText = (controlDirection == 1) and "+" or "-"
-    monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, REDSTONE_SIDE))
+    local sideText = (controlDirection == 1) and "Links" or "Rechts"
+    monitor.write(string.format("Regelung: %s%d | Sig: %-2d (%s)", signText, stepSize, currentSignal, sideText))
 
     -- Diagnose-Zeile
     monitor.setCursorPos(1, 13)
