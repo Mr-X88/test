@@ -1,7 +1,7 @@
 -- ==========================================
--- SCRIPT VERSION 2.0
+-- SCRIPT VERSION 2.1
 -- ==========================================
-local SCRIPT_VERSION = "v2.0"
+local SCRIPT_VERSION = "v2.1"
 
 local reactor = nil
 local monitor = nil
@@ -15,12 +15,18 @@ local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldo
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden (für Fallback)
 local JUMP_THRESHOLD = 4.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
 
+-- MONITOR LOG EINSTELLUNGEN
+local ENABLE_MONITOR_LOGS = true -- true (oder 1) = Logs auf Monitor anzeigen, false (oder 0) = Aus
+local MAX_LOG_LINES = 10        -- Maximale Anzahl an gleichzeitigen Log-Zeilen auf dem Monitor
+
 -- Regelungs-Variablen
 local currentSignal = 8         -- Startwert in der Mitte (1-15)
 local controlDirection = 1      -- 1 = Links / Erhöhen (+), -1 = Rechts / Senken (-)
 local stepSize = 2              -- Start-Suchschrittweite
 local lastEfficiency = 0
 local maxEfficiencySeen = 0     
+local logCounter = 0
+local logHistory = {}           -- Speicher für die kompakten Monitor-Logs
 
 -- Diagnose-Variable
 local stuckReason = "Warte auf Reaktor..."
@@ -125,16 +131,13 @@ end
 local function applyControlAction(direction, strength)
     local success = false
     
-    -- Versuche die direkte API-Funktion des Logic Adapters
     if reactor and type(reactor.adjustReactivity) == "function" then
         pcall(function()
-            -- Übergabe mit Vorzeichen: direction (1 oder -1) * strength
             reactor.adjustReactivity(direction * strength)
             success = true
         end)
     end
     
-    -- Wenn adjustReactivity nicht verfügbar ist oder fehlschlägt -> Redstone-Fallback
     if not success then
         local sideName = (direction == 1) and "left" or "right"
         sendPulse(sideName, strength)
@@ -161,6 +164,7 @@ end
 
 -- 6. Hill-Climbing Regelung mit adjustReactivity & Fallback
 local function runControlLoop()
+    logCounter = logCounter + 1
     local _, caseTemp, efficiency, errorLevel = getReactorData()
 
     if (errorLevel >= 100) then
@@ -175,7 +179,6 @@ local function runControlLoop()
         maxEfficiencySeen = efficiency
     end
 
-    -- Status bestimmen (Standby / Run / Crush)
     local statusText = "STANDBY"
     if efficiency > 0 then
         statusText = "RUN"
@@ -185,7 +188,6 @@ local function runControlLoop()
         statusText = "STANDBY"
     end
 
-    -- Wenn Standby oder Crush: Keine Signale senden
     if statusText == "STANDBY" or statusText == "CRUSH" then
         pcall(function()
             redstone.setAnalogOutput("left", 0)
@@ -197,7 +199,6 @@ local function runControlLoop()
         return
     end
 
-    -- Wenn der Reaktor den Schwellenwert (z.B. 95%) erreicht hat -> Warten, bis er wieder sinkt
     if efficiency >= IDLE_THRESHOLD then
         pcall(function()
             redstone.setAnalogOutput("left", 0)
@@ -209,10 +210,12 @@ local function runControlLoop()
         return
     end
 
-    -- Regelungsbefehl senden (Nutzt adjustReactivity oder Redstone-Fallback)
+    -- Vor dem Befehl merken wir uns den Start-EF für das Log
+    local startEffForLog = efficiency
+
+    -- Regelungsbefehl senden
     applyControlAction(controlDirection, stepSize)
 
-    -- Internen Signalwert nachführen
     currentSignal = currentSignal + (controlDirection * stepSize)
     if currentSignal > 15 then 
         currentSignal = 15 
@@ -222,14 +225,11 @@ local function runControlLoop()
         controlDirection = 1 
     end
 
-    -- Cooldown abwarten
     stuckReason = string.format("Cooldown (%.1fs)...", COOLDOWN_WAIT)
     sleep(COOLDOWN_WAIT)
 
-    -- Erst nach dem Cooldown den neuen Wert abfragen
     local _, _, newEfficiency = getReactorData()
 
-    -- Auswertung mit Spontan-Sprung-Erkennung (TR/EF-Schwankungen abfangen)
     if lastEfficiency > 0 then
         local effDelta = newEfficiency - lastEfficiency
         local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
@@ -244,7 +244,7 @@ local function runControlLoop()
             else
                 controlDirection = -controlDirection
                 stepSize = 1
-                stuckReason = "Sprung (-), weg vom Ziel -> Richtung gewechselt"
+                stuckReason = "Sprung (-), weg -> Richtung gewechselt"
             end
         else
             if newEfficiency < lastEfficiency then
@@ -261,10 +261,18 @@ local function runControlLoop()
         stuckReason = "Initialisierung (Suche)"
     end
 
+    -- Kompakten Log-Eintrag erstellen und ganz oben in die Liste einfügen
+    local signChar = (controlDirection == 1) and "+" or "-"
+    local compactLog = string.format("#%03d | %s%d | EF:%.1f->%.1f | %s", logCounter, signChar, stepSize, startEffForLog, newEfficiency, stuckReason)
+    table.insert(logHistory, 1, compactLog)
+    if #logHistory > MAX_LOG_LINES then
+        table.remove(logHistory)
+    end
+
     lastEfficiency = newEfficiency
 end
 
--- 7. Monitor grafisch zeichnen (mit Versionsnummer)
+-- 7. Monitor grafisch zeichnen (mit kompakten Logs, falls aktiviert)
 local function drawUI()
     if not monitor then return end
 
@@ -310,7 +318,7 @@ local function drawUI()
     monitor.clearLine()
     monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
 
-    -- EF (Efficiency) mit Anzeige des Ziels und der Idle-Grenze
+    -- EF (Efficiency)
     monitor.setCursorPos(1, 7)
     monitor.clearLine()
     monitor.setTextColor(colors.yellow)
@@ -329,7 +337,7 @@ local function drawUI()
     monitor.clearLine()
     monitor.write("Fuel Type: D-T Fuel")
 
-    -- Regelung, Signalstärke und Seite (Links / Rechts / API)
+    -- Regelung, Signalstärke und Seite
     monitor.setCursorPos(1, 11)
     monitor.clearLine()
     local signText = (controlDirection == 1) and "+" or "-"
@@ -341,6 +349,21 @@ local function drawUI()
     monitor.clearLine()
     monitor.setTextColor(colors.cyan)
     monitor.write("Diag: " .. string.sub(stuckReason, 1, 24))
+
+    -- KOMPAKTE MONITOR-LOGS (Falls in den Einstellungen aktiviert)
+    if ENABLE_MONITOR_LOGS then
+        monitor.setCursorPos(1, 15)
+        monitor.setTextColor(colors.lightGray)
+        monitor.write("--- LETZTE ZYKLEN-LOGS ---")
+
+        for i = 1, MAX_LOG_LINES do
+            monitor.setCursorPos(1, 15 + i)
+            monitor.clearLine()
+            if logHistory[i] then
+                monitor.write(logHistory[i])
+            end
+        end
+    end
 
     monitor.setBackgroundColor(colors.black)
     monitor.setTextColor(colors.lightGray)
