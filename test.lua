@@ -1,4 +1,8 @@
--- Version: 1.8 (Mit Spontan-Sprung-Erkennung bei TR/EF-Schwankungen & Cooldown-Schutz)
+-- ==========================================
+-- SCRIPT VERSION 1.9
+-- ==========================================
+local SCRIPT_VERSION = "v1.9"
+
 local reactor = nil
 local monitor = nil
 
@@ -6,6 +10,7 @@ local monitor = nil
 -- REGELUNGS-EINSTELLUNGEN (HIER ANPASSBAR)
 -- ==========================================
 local TARGET_EFFICIENCY = 100   -- Ziel-EF-Wert
+local IDLE_THRESHOLD = 95.0     -- EF-Schwelle: Ab hier stoppt die Regelung, bis es wieder sinkt
 local COOLDOWN_WAIT = 5.0       -- Wartezeit in Sekunden für den Reaktor-Cooldown
 local PULSE_LENGTH = 0.15       -- Dauer des Redstone-Impulses in Sekunden
 local JUMP_THRESHOLD = 4.0      -- Schwellenwert für sprunghafte EF-Änderungen durch TR-Drift
@@ -26,6 +31,11 @@ local stats = {
     minErr = math.huge, maxErr = -math.huge,
     minCase = math.huge, maxCase = 0
 }
+
+-- Start-Informationen im Computer-Terminal ausgeben
+print("==========================================")
+print(" FUSION REACTOR CONTROLLER " .. SCRIPT_VERSION)
+print("==========================================")
 
 -- 1. Peripherie automatisch erkennen
 local function scanPeripherals()
@@ -129,7 +139,7 @@ local function calculateStepFromTable(currentEff, targetEff)
     return calculatedStep
 end
 
--- 6. Hill-Climbing Regelung mit Sprung-Erkennung & Cooldown-Schutz
+-- 6. Hill-Climbing Regelung mit Ruhe-Modus bei IDLE_THRESHOLD
 local function runControlLoop()
     local _, caseTemp, efficiency, errorLevel = getReactorData()
 
@@ -167,6 +177,18 @@ local function runControlLoop()
         return
     end
 
+    -- NEU: Wenn der Reaktor den Schwellenwert (z.B. 95%) erreicht hat -> Warten, bis er wieder sinkt
+    if efficiency >= IDLE_THRESHOLD then
+        pcall(function()
+            redstone.setAnalogOutput("left", 0)
+            redstone.setAnalogOutput("right", 0)
+        end)
+        lastEfficiency = efficiency
+        stuckReason = string.format("Ziel erreicht (>=%.1f%%) -> Pausiert", IDLE_THRESHOLD)
+        sleep(1.0)
+        return
+    end
+
     -- Impuls auf die entsprechende Seite senden
     local sideName = (controlDirection == 1) and "left" or "right"
     sendPulse(sideName, stepSize)
@@ -181,7 +203,7 @@ local function runControlLoop()
         controlDirection = 1 
     end
 
-    -- WICHTIG: Voller Cooldown wird strikt abgewartet (egal ob Sprung oder nicht)
+    -- Cooldown abwarten
     stuckReason = string.format("Cooldown (%.1fs)...", COOLDOWN_WAIT)
     sleep(COOLDOWN_WAIT)
 
@@ -194,30 +216,23 @@ local function runControlLoop()
         local isSpontaneousJump = math.abs(effDelta) > JUMP_THRESHOLD
 
         if isSpontaneousJump then
-            -- EF hat sich während des Cooldowns sprunghaft geändert (z.B. durch TR-Änderung)
-            -- Wir prüfen, ob wir trotz des Sprungs näher am Ziel (100%) sind als vorher
             local oldDistance = math.abs(TARGET_EFFICIENCY - lastEfficiency)
             local newDistance = math.abs(TARGET_EFFICIENCY - newEfficiency)
 
             if newDistance < oldDistance then
-                -- Obwohl ein Sprung stattfand, sind wir dem Ziel näher gekommen -> Kurs halten!
                 stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
-                stuckReason = string.format("Sprung (+), aber Ziel näher -> Step %d", stepSize)
+                stuckReason = string.format("Sprung (+), Ziel näher -> Step %d", stepSize)
             else
-                -- Der Sprung hat uns weiter weg gebracht -> Vorsichtig reagieren und Richtung anpassen
                 controlDirection = -controlDirection
                 stepSize = 1
                 stuckReason = "Sprung (-), weg vom Ziel -> Richtung gewechselt"
             end
         else
-            -- Kein extremer Sprung: Normale Hill-Climbing / Tabellen-Auswertung
             if newEfficiency < lastEfficiency then
-                -- Wert wurde schlechter -> Richtung wechseln
                 controlDirection = -controlDirection
                 stepSize = 1
                 stuckReason = "Schlechter -> Richtung gewechselt"
             else
-                -- Wert wurde besser oder gleich -> Tabellen-Formel nutzen[cite: 2]
                 stepSize = calculateStepFromTable(newEfficiency, TARGET_EFFICIENCY)
                 stuckReason = string.format("Tabellen-Formel -> Step %d", stepSize)
             end
@@ -230,7 +245,7 @@ local function runControlLoop()
     lastEfficiency = newEfficiency
 end
 
--- 7. Monitor grafisch zeichnen
+-- 7. Monitor grafisch zeichnen (mit Versionsnummer)
 local function drawUI()
     if not monitor then return end
 
@@ -249,21 +264,26 @@ local function drawUI()
     monitor.setCursorPos(1, 1)
     monitor.setBackgroundColor(colors.blue)
     monitor.setTextColor(colors.white)
-    monitor.write(" === FUSION REACTOR CONTROL === ")
+    monitor.write(" === FUSION CONTROL " .. SCRIPT_VERSION .. " === ")
     monitor.setBackgroundColor(colors.black)
 
     -- Status
     monitor.setCursorPos(1, 3)
     monitor.clearLine()
     monitor.write("Modus: ")
-    if statusText == "RUN" then
+    if efficiency >= IDLE_THRESHOLD then
+        monitor.setTextColor(colors.cyan)
+        monitor.write("IDLE (>= " .. IDLE_THRESHOLD .. "%)")
+    elseif statusText == "RUN" then
         monitor.setTextColor(colors.green)
+        monitor.write("RUN           ")
     elseif statusText == "CRUSH" then
         monitor.setTextColor(colors.red)
+        monitor.write("CRUSH         ")
     else
         monitor.setTextColor(colors.orange)
+        monitor.write("STANDBY       ")
     end
-    monitor.write(statusText .. "    ")
     monitor.setTextColor(colors.white)
 
     -- Case Temperatur
@@ -271,11 +291,11 @@ local function drawUI()
     monitor.clearLine()
     monitor.write(string.format("Case Temp: %.2fM K", caseTemp / 1000000))
 
-    -- EF (Efficiency) mit Anzeige des Ziels
+    -- EF (Efficiency) mit Anzeige des Ziels und der Idle-Grenze
     monitor.setCursorPos(1, 7)
     monitor.clearLine()
     monitor.setTextColor(colors.yellow)
-    monitor.write(string.format("EF: %.1f%% (Ziel:%d Min:%.1f Max:%.1f)", efficiency, TARGET_EFFICIENCY, stats.minEff == math.huge and 0 or stats.minEff, stats.maxEff))
+    monitor.write(string.format("EF: %.1f%% (Ziel:%d Min:%.1f)", efficiency, TARGET_EFFICIENCY, stats.minEff == math.huge and 0 or stats.minEff))
     monitor.setTextColor(colors.white)
 
     -- ER (Error Level)
