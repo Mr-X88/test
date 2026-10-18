@@ -1,19 +1,13 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.83 (Modifiziert)
+-- BETTER FUSION REACTOR CONTROLLER v2.84
 -- Änderungen:
---   * Fester Wert 100 als Bezugspunkt für die Schrittformel in calculateStep.
---   * IDLE_THRESHOLD bleibt unverändert als Abschaltgrenze erhalten.
---   * Adaptive Sensorabfrage 4/8/16/32 Ticks anhand der bottom-Impulsabstände.
---   * Impuls- und Zykluslogs enthalten weiterhin Zeit-, Faktor-, EF- und ER-Werte.
---   * Gleichheit wird exakt mit == geprüft.
---   * Kein Computer-Redstone-Ausgang für die Reaktorsteuerung.
---   * Steuerung bevorzugt adjustReactivity(); andernfalls analoger
---     Redstone-Relay-Impuls auf allen Relay-Seiten.
---   * Deadlock-Bonus bleibt erhalten, bis ein Regelschritt ihn nutzt.
---   * Monitor wird ohne vollständiges Löschen jedes Frames aktualisiert.
---   * Weckimpuls wird unabhängig von der variablen Sensorabfrage beendet.
+--   * Gezielte 4t-Trendsteuerung (explizites Festsetzen statt -controlDirection).
+--   * 10-Zyklen-Deadlock zeigt im Log ein "|STUCK"-Tag an.
+--   * Log-Schalter [AN/AUS] schaltet nun Zyklen- UND Redstone-Logs stumm.
+--   * Bezugspunkt der Schrittformel bleibt fest bei 100.
+--   * IDLE_THRESHOLD (95.0) bleibt als Abschaltgrenze.
 -- ============================================================
-local SCRIPT_VERSION = "v2.83-fixed100"
+local SCRIPT_VERSION = "v2.84"
 
 local reactor = nil
 local monitor = nil
@@ -23,10 +17,6 @@ local monitorHeight = 25
 -- ==================== EINSTELLUNGEN ====================
 local IDLE_THRESHOLD = 95.0          -- Ab hier keine weiteren Regelschritte (Abschaltgrenze)
 
--- Adaptive Sensorabfrage wie in v2.81:
--- 4 Ticks (x1), 8 Ticks (x2), 16 Ticks (x4), 32 Ticks (x8).
--- Der Computer reagiert weiter auf bottom; die Impulsabstände bestimmen
--- den Multiplikator mit einer Hysterese von drei übereinstimmenden Impulsen.
 local ENABLE_LOW_PERF_MODE = true
 local POLL_INTERVAL_TICKS = 4        -- Basis: 4 Ticks = 0,2 Sekunden
 local lowPerfMultiplier = 1
@@ -38,7 +28,6 @@ local LOG_JUMP_THRESHOLD = 16.0
 local EFF_TOLERANCE = 0.8            -- Toleranz nur für Trend-/Logauswertung
 local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
 
--- Weckimpuls: Computer liest bottom ein; das Relay gibt den Impuls aus.
 local ENABLE_WAKEUP_PULSE = true
 local WAKEUP_INTERVAL_TICKS = 40     -- Alle 2 Sekunden
 local WAKEUP_PULSE_TICKS = 10        -- 0,5 Sekunden
@@ -64,16 +53,17 @@ local executionGo = false
 local lastPollEF = nil
 local unchangedPollCount = 0
 local previousLoggedEff = nil
-local lastExecutionTime = -EXECUTION_COOLDOWN -- erster Regelschritt darf sofort erfolgen
+local lastExecutionTime = -EXECUTION_COOLDOWN
 
--- Deadlock-Nudge: Zähl- und Zeitlogik bleibt bei 10 + 2 Sensor-Iterationen.
+-- Deadlock-Nudge & Log-Flag
 local stuckPollCount = 0
 local lastSensorEFForStuck = nil
 local stuckNudgeActive = false
 local stuckNudgeCounter = 0
 local stuckNudgeBonus = 0
+local deadlockTriggeredForLog = false -- Marker für das Log-Tag
 
--- Redstone-Eingangsprotokoll (Computer-bottom; keine Ausgangssteuerung darüber)
+-- Redstone-Eingangsprotokoll
 local lastBottomState = false
 local lastPulseTime = os.clock()
 local lastDeltaT = nil
@@ -91,7 +81,6 @@ local liveCaseTemp = 0
 local liveIsRunning = false
 local liveDataValid = false
 
--- Anzeige des tatsächlichen letzten Regelschritts
 local lastAppliedStep = nil
 local lastAppliedDirection = nil
 local lastActionMode = "Noch kein Schritt"
@@ -165,8 +154,6 @@ if relay and type(relay.setAnalogOutput) ~= "function" then
 end
 
 -- ==================== RELAY-HILFSFUNKTIONEN ====================
--- Setzt alle Seiten des externen Relays. Der Computer selbst gibt keine
--- Redstone-Ausgänge aus; redstone.getInput("bottom") bleibt nur Eingang.
 local function setRelayAll(value, allowDigital)
     if not relay then return false end
 
@@ -258,7 +245,6 @@ end
 
 -- ==================== REGELSCHRITT BERECHNEN ====================
 local function calculateStep(currentEff)
-    -- Fester Wert 100 als Bezugspunkt für die Schrittformel statt IDLE_THRESHOLD
     local difference = 100 - currentEff
     if difference <= 0 then return 1 end
 
@@ -269,8 +255,6 @@ local function calculateStep(currentEff)
     return calculatedStep
 end
 
--- Richtungssteuerung bevorzugt direkt den Logic-Adapter. Falls das nicht
--- verfügbar ist, kommt ein kurzer analoger Impuls auf allen Relay-Seiten.
 local function applyControlAction(direction, strength)
     strength = math.max(1, math.min(15, math.floor(strength)))
 
@@ -377,8 +361,12 @@ local function touchListenerLoop()
             elseif y == 7 then
                 ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
             end
-        elseif currentPage == 2 and y == monitorHeight then
-            currentPage = 1
+        elseif currentPage == 2 then
+            if y == monitorHeight then
+                currentPage = 1
+            elseif y == 5 then
+                ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
+            end
         end
     end
 end
@@ -404,12 +392,19 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
+            -- GEZIELTE TREND-RRICHTUNGSSCHATUNG (Kein -controlDirection)
             if eff < IDLE_THRESHOLD and lastSensorEF ~= nil and lastSensorEF > 0 then
-                if (eff - lastSensorEF) < -EFF_TOLERANCE then
-                    controlDirection = -controlDirection
+                local effDelta = eff - lastSensorEF
+                if effDelta < -EFF_TOLERANCE then
+                    if controlDirection == 1 then
+                        controlDirection = -1 -- Erhöhen war falsch -> gezielt Senken
+                    elseif controlDirection == -1 then
+                        controlDirection = 1  -- Senken war falsch -> gezielt Erhöhen
+                    end
                 end
             end
 
+            -- 10-Zyklen Stillstandserkennung
             if running and eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
                 stuckPollCount = stuckPollCount + 1
@@ -417,6 +412,7 @@ local function backgroundSensorLoop()
                     stuckNudgeActive = true
                     stuckNudgeCounter = 2
                     stuckNudgeBonus = 1
+                    deadlockTriggeredForLog = true -- Fürs Monitor-Log markieren
                     stuckPollCount = 0
                 end
             else
@@ -518,7 +514,10 @@ local function executionLoop()
                         lastAppliedStep = effectiveStep
                         lastAppliedDirection = actionDirection
                         lastActionMode = modeOrError
+                        
+                        local wasDeadlock = deadlockTriggeredForLog
                         if stuckNudgeBonus > 0 then stuckNudgeBonus = 0 end
+                        deadlockTriggeredForLog = false
 
                         logCounter = logCounter + 1
                         if ENABLE_MONITOR_LOGS then
@@ -530,6 +529,10 @@ local function executionLoop()
                                 cycleDiag = "Steigt"
                             elseif delta < -EFF_TOLERANCE then
                                 cycleDiag = "Sinkt"
+                            end
+
+                            if wasDeadlock then
+                                cycleDiag = "STUCK"
                             end
 
                             local signChar = (actionDirection == 1) and "+" or "-"
@@ -713,13 +716,29 @@ local function uiLoop()
 
                 clearLineAt(5)
                 monitor.setTextColor(colors.lightGray)
-                monitor.write("--- EINGANGSIMPULSE (Zeitabstand) ---")
+                monitor.write("--- EINGANGSIMPULSE [")
+                if ENABLE_MONITOR_LOGS then
+                    monitor.setTextColor(colors.green)
+                    monitor.write("AN")
+                else
+                    monitor.setTextColor(colors.red)
+                    monitor.write("AUS")
+                end
+                monitor.setTextColor(colors.lightGray)
+                monitor.write("] ---")
                 monitor.setTextColor(colors.white)
 
-                local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
-                for i = 1, maxPulseLines do
-                    clearLineAt(5 + i)
-                    if pulseLogHistory[i] then monitor.write(pulseLogHistory[i]) end
+                if ENABLE_MONITOR_LOGS then
+                    local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
+                    for i = 1, maxPulseLines do
+                        clearLineAt(5 + i)
+                        if pulseLogHistory[i] then monitor.write(pulseLogHistory[i]) end
+                    end
+                else
+                    clearLineAt(7)
+                    monitor.setTextColor(colors.gray)
+                    monitor.write("  (Logs sind deaktiviert)")
+                    monitor.setTextColor(colors.white)
                 end
 
                 if monitorHeight >= 1 then
