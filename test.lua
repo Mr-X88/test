@@ -1,10 +1,14 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.88
--- Änderungen in v2.88:
---   * Low-Perf-Schwellenwerte an neue Werte angepasst (1->1.7, 2->3, 4->6, 8->12).
---   * Alle anderen Funktionen, Logiken und Strukturen aus v2.87 unverändert übernommen.
+-- BETTER FUSION REACTOR CONTROLLER v2.89
+-- Änderungen in v2.89:
+--   * Low-Perf-Schwellenwerte aktualisiert:
+--     - Faktor 8 ab 8.0s
+--     - Faktor 4 ab 4.0s
+--     - Faktor 2 ab 2.0s
+--     - Faktor 1 darunter (ab 0s)
+--   * Alle anderen Funktionen, Logiken und Strukturen unverändert übernommen[cite: 5].
 -- ============================================================
-local SCRIPT_VERSION = "v2.88"
+local SCRIPT_VERSION = "v2.89"
 
 local reactor = nil
 local monitor = nil
@@ -361,18 +365,17 @@ local function pulseListenerLoop()
             pulseCountTotal = pulseCountTotal + 1
 
             local desiredMultiplier = lowPerfMultiplier
-            local validInterval = deltaT >= 0.05 and deltaT <= 15.0
+            local validInterval = deltaT >= 0.05 and deltaT <= 30.0
 
             if ENABLE_LOW_PERF_MODE and validInterval then
-                -- Angepasste Schwellenwerte: 8->12, 4->6, 2->3, 1->1.7
-                if deltaT >= 12.0 then
+                -- Angepasste Schwellenwerte nach Benutzerwunsch:
+                -- 8 ab 8.0s, 4 ab 4.0s, 2 ab 2.0s, 1 ab 0s
+                if deltaT >= 8.0 then
                     desiredMultiplier = 8
-                elseif deltaT >= 6.0 then
+                elseif deltaT >= 4.0 then
                     desiredMultiplier = 4
-                elseif deltaT >= 3.0 then
+                elseif deltaT >= 2.0 then
                     desiredMultiplier = 2
-                elseif deltaT >= 1.7 then
-                    desiredMultiplier = 1
                 else
                     desiredMultiplier = 1
                 end
