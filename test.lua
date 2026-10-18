@@ -1,15 +1,10 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.87
--- Änderungen in v2.87:
---   * Sprung-Log vergleicht Effizienz vor/nach genau einer Regleraktion.
---   * Richtung wird erst nach der Nachmessung aktualisiert; keine direction-lock-Sperre.
---   * Deadlock-Bonus bleibt bestehen, bis er erfolgreich in einer Aktion verwendet wurde.
---   * Bei Basisschritt 15 wird Nudge +1 separat versucht, nicht stillschweigend gekappt.
---   * Zehn exakte, unveränderte Sensorwerte und die bisherige Zähler-Zeitrechnung bleiben erhalten.
---   * Adaptive 4/8/16/32-t-Sensorabfrage, Monitorseiten, Redstone-Logs und Weckimpuls bleiben erhalten.
---   * Fester Wert 100 bleibt Bezugspunkt der Schrittformel; IDLE_THRESHOLD (95.0) bleibt Abschaltgrenze.
+-- BETTER FUSION REACTOR CONTROLLER v2.88
+-- Änderungen in v2.88:
+--   * Low-Perf-Schwellenwerte an neue Werte angepasst (1->1.7, 2->3, 4->6, 8->12).
+--   * Alle anderen Funktionen, Logiken und Strukturen aus v2.87 unverändert übernommen.
 -- ============================================================
-local SCRIPT_VERSION = "v2.87"
+local SCRIPT_VERSION = "v2.88"
 
 local reactor = nil
 local monitor = nil
@@ -256,10 +251,6 @@ local function calculateStep(currentEff)
     return calculatedStep
 end
 
--- Führt eine Aktion aus. strength bleibt pro Einzelaktion auf 1..15 begrenzt.
--- Falls die normale Schrittstärke bereits 15 ist, wird der Nudge (+1) als
--- separate Aktion gesendet, damit er nicht an math.min(15, ...) verloren geht.
--- Rückgabe: Erfolg, Modus/Diagnose, ob der Nudge tatsächlich ausgeführt wurde.
 local function applyControlAction(direction, strength, separateNudge, nudgeIncluded)
     strength = math.max(1, math.min(15, math.floor(strength)))
     local nudgeApplied = nudgeIncluded == true
@@ -312,9 +303,6 @@ local function applyControlAction(direction, strength, separateNudge, nudgeInclu
     return true, nudgeApplied and "Relay-Puls +Nudge" or "Relay-Puls", nudgeApplied
 end
 
--- Bewertet die Wirkung ERST nach einer späteren Sensorabfrage.
--- Die Messdifferenz beschreibt das beobachtete Ergebnis im Fenster nach der Aktion;
--- sie beweist wegen des periodisch wechselnden TR-Wertes nicht zwingend Kausalität.
 local function finishPendingAction(postEfficiency, postError)
     if not pendingAction then return end
     if os.clock() < pendingAction.evaluateAt then return end
@@ -322,8 +310,6 @@ local function finishPendingAction(postEfficiency, postError)
     local action = pendingAction
     local delta = postEfficiency - action.beforeEfficiency
 
-    -- Richtungsentscheidung nur anhand der Nachmessung zur konkreten Aktion.
-    -- Kein previousDirection-Lock mehr: ein späterer Richtungswechsel bleibt möglich.
     if delta < -EFF_TOLERANCE then
         controlDirection = -action.direction
         stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
@@ -375,17 +361,20 @@ local function pulseListenerLoop()
             pulseCountTotal = pulseCountTotal + 1
 
             local desiredMultiplier = lowPerfMultiplier
-            local validInterval = deltaT >= 0.05 and deltaT <= 3.0
+            local validInterval = deltaT >= 0.05 and deltaT <= 15.0
 
             if ENABLE_LOW_PERF_MODE and validInterval then
-                if deltaT >= 0.75 then
-                    desiredMultiplier = 1
-                elseif deltaT >= 0.375 then
-                    desiredMultiplier = 2
-                elseif deltaT >= 0.187 then
-                    desiredMultiplier = 4
-                else
+                -- Angepasste Schwellenwerte: 8->12, 4->6, 2->3, 1->1.7
+                if deltaT >= 12.0 then
                     desiredMultiplier = 8
+                elseif deltaT >= 6.0 then
+                    desiredMultiplier = 4
+                elseif deltaT >= 3.0 then
+                    desiredMultiplier = 2
+                elseif deltaT >= 1.7 then
+                    desiredMultiplier = 1
+                else
+                    desiredMultiplier = 1
                 end
 
                 lastDesiredMultiplier = desiredMultiplier
@@ -446,7 +435,7 @@ local function touchListenerLoop()
     end
 end
 
--- ==================== ADAPTIVE SENSOR-SCHLEIFE (4t-Schleife mit Trend & History) ====================
+-- ==================== ADAPTIVE SENSOR-SCHLEIFE ====================
 local lastSensorEF = nil
 
 local function backgroundSensorLoop()
@@ -467,12 +456,6 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            -- Die Richtung wird NICHT aus einzelnen 0,2s-Messungen geändert.
-            -- Sie wird später anhand der Nachmessung nach einem konkreten Regelschritt bestimmt.
-
-            -- 10-Zyklen-Deadlock-Erkennung: exakt gleicher Rohmesswert wie zuvor.
-            -- Keine neue Erkennung, solange eine Aktion auf ihre Nachmessung wartet
-            -- oder ein bereits erkannter Nudge noch nicht erfolgreich verbraucht wurde.
             if not pendingAction and not stuckNudgeActive and running and
                eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
@@ -488,8 +471,6 @@ local function backgroundSensorLoop()
             end
             lastSensorEFForStuck = eff
 
-            -- Zeit-/Iterationsrechnung bleibt wie zuvor; der Bonus verfällt aber
-            -- NICHT, nur weil der Zwei-Iterationen-Zähler abgelaufen ist.
             if stuckNudgeActive and stuckNudgeCounter > 0 then
                 stuckNudgeCounter = stuckNudgeCounter - 1
             end
@@ -547,7 +528,6 @@ local function backgroundSensorLoop()
 
             if eff > 0 then lastSensorEF = eff end
 
-            -- Jede Aktion wird anhand eines späteren gültigen Messwerts bewertet.
             finishPendingAction(eff, err)
         else
             liveDataValid = false
@@ -564,8 +544,6 @@ local function executionLoop()
     while true do
         local now = os.clock()
 
-        -- executionGo bleibt gesetzt, solange Cooldown oder Nachmessung blockiert.
-        -- So wird ein gültiger Auslöser nicht versehentlich verworfen.
         if executionGo and not pendingAction and (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
             executionGo = false
 
@@ -608,7 +586,6 @@ local function executionLoop()
                     }
 
                     if nudgeApplied then
-                        -- Erst nach erfolgreichem Einsatz Bonus und Trigger-Markierung löschen.
                         stuckNudgeBonus = 0
                         stuckNudgeActive = false
                         stuckNudgeCounter = 0
