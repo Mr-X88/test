@@ -1,13 +1,15 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.84
+-- BETTER FUSION REACTOR CONTROLLER v2.86
 -- Änderungen:
---   * Gezielte 4t-Trendsteuerung (explizites Festsetzen statt -controlDirection).
---   * 10-Zyklen-Deadlock zeigt im Log ein "|STUCK"-Tag an.
---   * Log-Schalter [AN/AUS] schaltet nun Zyklen- UND Redstone-Logs stumm.
---   * Bezugspunkt der Schrittformel bleibt fest bei 100.
---   * IDLE_THRESHOLD (95.0) bleibt als Abschaltgrenze.
+--   * 4t-Sensor-Schleife aktualisiert controlDirection kontinuierlich (erkennt auch Sprünge mitten im Zyklus).
+--   * Einführung von `previousDirection` in der 4t-Schleife, um ein sofortiges
+--     "Gegensteuern des Gegensteuerns" (Ping-Pong) zu verhindern.
+--   * Log-Schalter [AN/AUS] steuert Zyklen- UND Redstone-Logs synchron.
+--   * Deadlock-Zähler zeigt "|STUCK" im Log.
+--   * Fester Wert 100 als Bezugspunkt für die Schrittformel.
+--   * IDLE_THRESHOLD (95.0) als reine Abschaltgrenze.
 -- ============================================================
-local SCRIPT_VERSION = "v2.84"
+local SCRIPT_VERSION = "v2.86"
 
 local reactor = nil
 local monitor = nil
@@ -25,7 +27,7 @@ local pulseStreakCount = 0
 
 local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
-local EFF_TOLERANCE = 0.8            -- Toleranz nur für Trend-/Logauswertung
+local EFF_TOLERANCE = 0.8            -- Toleranz für Trend-/Erfolgsprüfung
 local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
 
 local ENABLE_WAKEUP_PULSE = true
@@ -39,6 +41,7 @@ local sides = {"top", "bottom", "left", "right", "front", "back"}
 
 -- ==================== REGELUNGSVARIABLEN ====================
 local controlDirection = 1           -- 1 = + / erhöhen, -1 = - / senken
+local previousDirection = 1          -- Merker für die vorige Richtung (gegen Ping-Pong)
 local stepSize = 4
 local hasEverRun = false
 local logCounter = 0
@@ -61,7 +64,7 @@ local lastSensorEFForStuck = nil
 local stuckNudgeActive = false
 local stuckNudgeCounter = 0
 local stuckNudgeBonus = 0
-local deadlockTriggeredForLog = false -- Marker für das Log-Tag
+local deadlockTriggeredForLog = false
 
 -- Redstone-Eingangsprotokoll
 local lastBottomState = false
@@ -371,7 +374,7 @@ local function touchListenerLoop()
     end
 end
 
--- ==================== ADAPTIVE SENSOR-SCHLEIFE ====================
+-- ==================== ADAPTIVE SENSOR-SCHLEIFE (4t-Schleife mit Trend & History) ====================
 local lastSensorEF = nil
 
 local function backgroundSensorLoop()
@@ -392,19 +395,20 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            -- GEZIELTE TREND-RRICHTUNGSSCHATUNG (Kein -controlDirection)
+            -- KONTINUIERLICHE 4t-TREND-STEUERUNG MIT GESICHERTER HISTORIE (Verhindert Ping-Pong)
             if eff < IDLE_THRESHOLD and lastSensorEF ~= nil and lastSensorEF > 0 then
                 local effDelta = eff - lastSensorEF
                 if effDelta < -EFF_TOLERANCE then
-                    if controlDirection == 1 then
-                        controlDirection = -1 -- Erhöhen war falsch -> gezielt Senken
-                    elseif controlDirection == -1 then
-                        controlDirection = 1  -- Senken war falsch -> gezielt Erhöhen
+                    -- Nur umschalten, wenn sich die Richtung von der vorherigen unterscheidet (kein blindes Zurückdrehen)
+                    local targetDir = (controlDirection == 1) and -1 or 1
+                    if targetDir ~= previousDirection then
+                        previousDirection = controlDirection
+                        controlDirection = targetDir
                     end
                 end
             end
 
-            -- 10-Zyklen Stillstandserkennung
+            -- 10-Zyklen Stillstandserkennung für Deadlock-Nudge
             if running and eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
                 stuckPollCount = stuckPollCount + 1
@@ -412,7 +416,7 @@ local function backgroundSensorLoop()
                     stuckNudgeActive = true
                     stuckNudgeCounter = 2
                     stuckNudgeBonus = 1
-                    deadlockTriggeredForLog = true -- Fürs Monitor-Log markieren
+                    deadlockTriggeredForLog = true
                     stuckPollCount = 0
                 end
             else
