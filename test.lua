@@ -1,15 +1,15 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.86
--- Änderungen:
---   * 4t-Sensor-Schleife aktualisiert controlDirection kontinuierlich (erkennt auch Sprünge mitten im Zyklus).
---   * Einführung von `previousDirection` in der 4t-Schleife, um ein sofortiges
---     "Gegensteuern des Gegensteuerns" (Ping-Pong) zu verhindern.
---   * Log-Schalter [AN/AUS] steuert Zyklen- UND Redstone-Logs synchron.
---   * Deadlock-Zähler zeigt "|STUCK" im Log.
---   * Fester Wert 100 als Bezugspunkt für die Schrittformel.
---   * IDLE_THRESHOLD (95.0) als reine Abschaltgrenze.
+-- BETTER FUSION REACTOR CONTROLLER v2.87
+-- Änderungen in v2.87:
+--   * Sprung-Log vergleicht Effizienz vor/nach genau einer Regleraktion.
+--   * Richtung wird erst nach der Nachmessung aktualisiert; keine direction-lock-Sperre.
+--   * Deadlock-Bonus bleibt bestehen, bis er erfolgreich in einer Aktion verwendet wurde.
+--   * Bei Basisschritt 15 wird Nudge +1 separat versucht, nicht stillschweigend gekappt.
+--   * Zehn exakte, unveränderte Sensorwerte und die bisherige Zähler-Zeitrechnung bleiben erhalten.
+--   * Adaptive 4/8/16/32-t-Sensorabfrage, Monitorseiten, Redstone-Logs und Weckimpuls bleiben erhalten.
+--   * Fester Wert 100 bleibt Bezugspunkt der Schrittformel; IDLE_THRESHOLD (95.0) bleibt Abschaltgrenze.
 -- ============================================================
-local SCRIPT_VERSION = "v2.86"
+local SCRIPT_VERSION = "v2.87"
 
 local reactor = nil
 local monitor = nil
@@ -29,6 +29,7 @@ local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
 local EFF_TOLERANCE = 0.8            -- Toleranz für Trend-/Erfolgsprüfung
 local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
+local ACTION_EVAL_DELAY = 1.5        -- Nachmessung nach einer Korrektur (Richtung erst danach bewerten)
 
 local ENABLE_WAKEUP_PULSE = true
 local WAKEUP_INTERVAL_TICKS = 40     -- Alle 2 Sekunden
@@ -41,7 +42,6 @@ local sides = {"top", "bottom", "left", "right", "front", "back"}
 
 -- ==================== REGELUNGSVARIABLEN ====================
 local controlDirection = 1           -- 1 = + / erhöhen, -1 = - / senken
-local previousDirection = 1          -- Merker für die vorige Richtung (gegen Ping-Pong)
 local stepSize = 4
 local hasEverRun = false
 local logCounter = 0
@@ -55,8 +55,8 @@ local secondsSinceLastGo = 0
 local executionGo = false
 local lastPollEF = nil
 local unchangedPollCount = 0
-local previousLoggedEff = nil
 local lastExecutionTime = -EXECUTION_COOLDOWN
+local pendingAction = nil           -- genau eine Aktion wartet auf ihre Nachmessung
 
 -- Deadlock-Nudge & Log-Flag
 local stuckPollCount = 0
@@ -64,7 +64,6 @@ local lastSensorEFForStuck = nil
 local stuckNudgeActive = false
 local stuckNudgeCounter = 0
 local stuckNudgeBonus = 0
-local deadlockTriggeredForLog = false
 
 -- Redstone-Eingangsprotokoll
 local lastBottomState = false
@@ -84,8 +83,7 @@ local liveCaseTemp = 0
 local liveIsRunning = false
 local liveDataValid = false
 
-local lastAppliedStep = nil
-local lastAppliedDirection = nil
+local lastAppliedStepText = nil
 local lastActionMode = "Noch kein Schritt"
 local stuckReason = "Warte auf Reaktor..."
 
@@ -258,33 +256,107 @@ local function calculateStep(currentEff)
     return calculatedStep
 end
 
-local function applyControlAction(direction, strength)
+-- Führt eine Aktion aus. strength bleibt pro Einzelaktion auf 1..15 begrenzt.
+-- Falls die normale Schrittstärke bereits 15 ist, wird der Nudge (+1) als
+-- separate Aktion gesendet, damit er nicht an math.min(15, ...) verloren geht.
+-- Rückgabe: Erfolg, Modus/Diagnose, ob der Nudge tatsächlich ausgeführt wurde.
+local function applyControlAction(direction, strength, separateNudge, nudgeIncluded)
     strength = math.max(1, math.min(15, math.floor(strength)))
+    local nudgeApplied = nudgeIncluded == true
 
     if reactor and type(reactor.adjustReactivity) == "function" then
-        local ok = pcall(function() reactor.adjustReactivity(direction * strength) end)
-        if ok then return true, "Direkt" end
+        local mainOK = pcall(function() reactor.adjustReactivity(direction * strength) end)
+        if mainOK then
+            if separateNudge then
+                local nudgeOK = pcall(function() reactor.adjustReactivity(direction) end)
+                if nudgeOK then
+                    nudgeApplied = true
+                else
+                    return true, "Direkt (Nudge-Fehler)", false
+                end
+            end
+            return true, nudgeApplied and "Direkt +Nudge" or "Direkt", nudgeApplied
+        end
     end
 
     if not relay then
-        return false, "Kein Relay / keine Direktsteuerung"
+        return false, "Kein Relay / keine Direktsteuerung", false
     end
     if type(relay.setAnalogOutput) ~= "function" then
-        return false, "Relay kann keine analoge Schrittstärke senden"
+        return false, "Relay kann keine analoge Schrittstärke senden", false
     end
 
-    local startOK = setRelayAll(strength, false)
-    if not startOK then
+    local function relayPulse(pulseStrength)
+        local startOK = setRelayAll(pulseStrength, false)
+        if not startOK then
+            setRelayAll(0, false)
+            return false
+        end
+        sleep(0.1)
+        local stopOK = setRelayAll(0, false)
+        return stopOK
+    end
+
+    if not relayPulse(strength) then
         setRelayAll(0, false)
-        return false, "Relay-Ausgabe fehlgeschlagen"
+        return false, "Relay-Ausgabe fehlgeschlagen", false
     end
 
-    sleep(0.1)
-    local stopOK = setRelayAll(0, false)
-    if not stopOK then
-        return false, "Relay konnte Impuls nicht sicher zurücksetzen"
+    if separateNudge then
+        if relayPulse(1) then
+            nudgeApplied = true
+        else
+            return true, "Relay-Puls (Nudge-Fehler)", false
+        end
     end
-    return true, "Relay-Puls"
+    return true, nudgeApplied and "Relay-Puls +Nudge" or "Relay-Puls", nudgeApplied
+end
+
+-- Bewertet die Wirkung ERST nach einer späteren Sensorabfrage.
+-- Die Messdifferenz beschreibt das beobachtete Ergebnis im Fenster nach der Aktion;
+-- sie beweist wegen des periodisch wechselnden TR-Wertes nicht zwingend Kausalität.
+local function finishPendingAction(postEfficiency, postError)
+    if not pendingAction then return end
+    if os.clock() < pendingAction.evaluateAt then return end
+
+    local action = pendingAction
+    local delta = postEfficiency - action.beforeEfficiency
+
+    -- Richtungsentscheidung nur anhand der Nachmessung zur konkreten Aktion.
+    -- Kein previousDirection-Lock mehr: ein späterer Richtungswechsel bleibt möglich.
+    if delta < -EFF_TOLERANCE then
+        controlDirection = -action.direction
+        stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
+    elseif delta > EFF_TOLERANCE then
+        controlDirection = action.direction
+        stuckReason = "Nachmessung: Effizienz gestiegen, Richtung gehalten"
+    else
+        controlDirection = action.direction
+        stuckReason = "Nachmessung: kaum Änderung, Richtung gehalten"
+    end
+
+    local cycleDiag = "Stillstand"
+    if math.abs(delta) >= LOG_JUMP_THRESHOLD then
+        cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
+    elseif delta > EFF_TOLERANCE then
+        cycleDiag = "Steigt"
+    elseif delta < -EFF_TOLERANCE then
+        cycleDiag = "Sinkt"
+    end
+    if action.usedNudge then cycleDiag = "STUCK" end
+
+    if ENABLE_MONITOR_LOGS then
+        local compactLog = string.format(
+            "#%03d|%s|%.0f>%.0f|ER:%d/%ds|%s",
+            action.id, action.stepText, action.beforeEfficiency, postEfficiency,
+            math.floor(postError + 0.5), action.cycleSeconds, string.sub(cycleDiag, 1, 10)
+        )
+        table.insert(logHistory, 1, compactLog)
+        local maxLogLines = math.max(1, monitorHeight - 9)
+        while #logHistory > maxLogLines do table.remove(logHistory) end
+    end
+
+    pendingAction = nil
 end
 
 -- ==================== REDSTONE-EINGANGS-LISTENER ====================
@@ -395,28 +467,20 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            -- KONTINUIERLICHE 4t-TREND-STEUERUNG MIT GESICHERTER HISTORIE (Verhindert Ping-Pong)
-            if eff < IDLE_THRESHOLD and lastSensorEF ~= nil and lastSensorEF > 0 then
-                local effDelta = eff - lastSensorEF
-                if effDelta < -EFF_TOLERANCE then
-                    -- Nur umschalten, wenn sich die Richtung von der vorherigen unterscheidet (kein blindes Zurückdrehen)
-                    local targetDir = (controlDirection == 1) and -1 or 1
-                    if targetDir ~= previousDirection then
-                        previousDirection = controlDirection
-                        controlDirection = targetDir
-                    end
-                end
-            end
+            -- Die Richtung wird NICHT aus einzelnen 0,2s-Messungen geändert.
+            -- Sie wird später anhand der Nachmessung nach einem konkreten Regelschritt bestimmt.
 
-            -- 10-Zyklen Stillstandserkennung für Deadlock-Nudge
-            if running and eff > 0 and eff < IDLE_THRESHOLD and
+            -- 10-Zyklen-Deadlock-Erkennung: exakt gleicher Rohmesswert wie zuvor.
+            -- Keine neue Erkennung, solange eine Aktion auf ihre Nachmessung wartet
+            -- oder ein bereits erkannter Nudge noch nicht erfolgreich verbraucht wurde.
+            if not pendingAction and not stuckNudgeActive and running and
+               eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
                 stuckPollCount = stuckPollCount + 1
                 if stuckPollCount >= 10 then
                     stuckNudgeActive = true
                     stuckNudgeCounter = 2
                     stuckNudgeBonus = 1
-                    deadlockTriggeredForLog = true
                     stuckPollCount = 0
                 end
             else
@@ -424,11 +488,13 @@ local function backgroundSensorLoop()
             end
             lastSensorEFForStuck = eff
 
-            if stuckNudgeActive then
+            -- Zeit-/Iterationsrechnung bleibt wie zuvor; der Bonus verfällt aber
+            -- NICHT, nur weil der Zwei-Iterationen-Zähler abgelaufen ist.
+            if stuckNudgeActive and stuckNudgeCounter > 0 then
                 stuckNudgeCounter = stuckNudgeCounter - 1
-                if stuckNudgeCounter <= 0 then
-                    stuckNudgeActive = false
-                end
+            end
+            if stuckNudgeCounter <= 0 and stuckNudgeBonus <= 0 then
+                stuckNudgeActive = false
             end
 
             secondCounter = secondCounter + effectiveTicks
@@ -466,7 +532,7 @@ local function backgroundSensorLoop()
                 if lastSensorEF ~= nil then
                     local delta = eff - lastSensorEF
                     if math.abs(delta) >= JUMP_THRESHOLD then
-                        stuckReason = (delta < 0) and "Einbruch" or "Sprung (+)"
+                        stuckReason = (delta < 0) and "Messsprung (-)" or "Messsprung (+)"
                     elseif delta > EFF_TOLERANCE then
                         stuckReason = "Steigt"
                     elseif delta < -EFF_TOLERANCE then
@@ -480,6 +546,9 @@ local function backgroundSensorLoop()
             end
 
             if eff > 0 then lastSensorEF = eff end
+
+            -- Jede Aktion wird anhand eines späteren gültigen Messwerts bewertet.
+            finishPendingAction(eff, err)
         else
             liveDataValid = false
             executionGo = false
@@ -493,81 +562,75 @@ end
 -- ==================== AUSFÜHRUNGS-SCHLEIFE ====================
 local function executionLoop()
     while true do
-        if executionGo then
+        local now = os.clock()
+
+        -- executionGo bleibt gesetzt, solange Cooldown oder Nachmessung blockiert.
+        -- So wird ein gültiger Auslöser nicht versehentlich verworfen.
+        if executionGo and not pendingAction and (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
             executionGo = false
-            local now = os.clock()
 
-            if (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
-                local currentEfficiency = liveEF
-                local errorLevel = liveER
-                local canControl = liveDataValid and liveIsRunning and
-                    currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD and errorLevel < 100
+            local currentEfficiency = liveEF
+            local errorLevel = liveER
+            local canControl = liveDataValid and liveIsRunning and
+                currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD and errorLevel < 100
 
-                if canControl then
-                    lastExecutionTime = now
+            if canControl then
+                lastExecutionTime = now
 
-                    if previousLoggedEff == nil then previousLoggedEff = currentEfficiency end
-                    local startEffForLog = previousLoggedEff
+                stepSize = calculateStep(currentEfficiency)
+                local nudgeRequested = stuckNudgeBonus > 0
+                local separateNudge = nudgeRequested and stepSize >= 15
+                local nudgeIncluded = nudgeRequested and not separateNudge
+                local effectiveStep = separateNudge and 15 or math.min(15, stepSize + (nudgeIncluded and 1 or 0))
+                local actionDirection = controlDirection
+                local success, modeOrError, nudgeApplied = applyControlAction(
+                    actionDirection, effectiveStep, separateNudge, nudgeIncluded
+                )
 
-                    stepSize = calculateStep(currentEfficiency)
-                    local effectiveStep = math.min(15, stepSize + stuckNudgeBonus)
-                    local actionDirection = controlDirection
-                    local success, modeOrError = applyControlAction(actionDirection, effectiveStep)
+                if success then
+                    local signChar = (actionDirection == 1) and "+" or "-"
+                    local stepText = signChar .. tostring(effectiveStep)
+                    if separateNudge and nudgeApplied then stepText = stepText .. "+1" end
 
-                    if success then
-                        lastAppliedStep = effectiveStep
-                        lastAppliedDirection = actionDirection
-                        lastActionMode = modeOrError
-                        
-                        local wasDeadlock = deadlockTriggeredForLog
-                        if stuckNudgeBonus > 0 then stuckNudgeBonus = 0 end
-                        deadlockTriggeredForLog = false
+                    lastAppliedStepText = stepText
+                    lastActionMode = modeOrError
+                    logCounter = logCounter + 1
 
-                        logCounter = logCounter + 1
-                        if ENABLE_MONITOR_LOGS then
-                            local delta = currentEfficiency - startEffForLog
-                            local cycleDiag = "Stillstand"
-                            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
-                                cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
-                            elseif delta > EFF_TOLERANCE then
-                                cycleDiag = "Steigt"
-                            elseif delta < -EFF_TOLERANCE then
-                                cycleDiag = "Sinkt"
-                            end
+                    pendingAction = {
+                        id = logCounter,
+                        direction = actionDirection,
+                        stepText = stepText,
+                        beforeEfficiency = currentEfficiency,
+                        appliedAt = os.clock(),
+                        evaluateAt = os.clock() + ACTION_EVAL_DELAY,
+                        cycleSeconds = secondsSinceLastGo,
+                        usedNudge = nudgeApplied
+                    }
 
-                            if wasDeadlock then
-                                cycleDiag = "STUCK"
-                            end
-
-                            local signChar = (actionDirection == 1) and "+" or "-"
-                            local compactLog = string.format(
-                                "#%03d|%s%d|%.0f->%.0f|ER:%d/%ds|%s",
-                                logCounter, signChar, effectiveStep, startEffForLog,
-                                currentEfficiency, math.floor(errorLevel + 0.5),
-                                secondsSinceLastGo, string.sub(cycleDiag, 1, 10)
-                            )
-                            table.insert(logHistory, 1, compactLog)
-                            local maxLogLines = math.max(1, monitorHeight - 9)
-                            while #logHistory > maxLogLines do table.remove(logHistory) end
-                        end
-
-                        previousLoggedEff = currentEfficiency
-                        secondsSinceLastGo = 0
-                        stuckReason = "Schritt ausgeführt: " .. modeOrError
-                    else
-                        stuckReason = modeOrError
+                    if nudgeApplied then
+                        -- Erst nach erfolgreichem Einsatz Bonus und Trigger-Markierung löschen.
+                        stuckNudgeBonus = 0
+                        stuckNudgeActive = false
+                        stuckNudgeCounter = 0
+                        stuckPollCount = 0
                     end
-                elseif liveDataValid then
-                    if errorLevel >= 100 then
-                        stuckReason = "SICHERHEIT: ER >= 100"
-                    elseif currentEfficiency >= IDLE_THRESHOLD then
-                        stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
-                    elseif not liveIsRunning or currentEfficiency == 0 then
-                        stuckReason = "Keine Regelung: Standby"
-                    end
+
+                    secondsSinceLastGo = 0
+                    stuckReason = "Schritt ausgeführt: " .. modeOrError .. "; Nachmessung ausstehend"
+                else
+                    stuckReason = modeOrError
+                end
+            elseif liveDataValid then
+                if errorLevel >= 100 then
+                    stuckReason = "SICHERHEIT: ER >= 100"
+                elseif currentEfficiency >= IDLE_THRESHOLD then
+                    stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
+                elseif not liveIsRunning or currentEfficiency == 0 then
+                    stuckReason = "Keine Regelung: Standby"
                 end
             end
         end
+
         sleep(0.05)
     end
 end
@@ -642,9 +705,8 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 clearLineAt(4)
-                local sign = (lastAppliedDirection == -1) and "-" or "+"
-                if lastAppliedStep then
-                    monitor.write(string.format("Schritt: %s%d | Ausgang: %s", sign, lastAppliedStep, lastActionMode))
+                if lastAppliedStepText then
+                    monitor.write(string.format("Schritt: %s | Ausgang: %s", lastAppliedStepText, lastActionMode))
                 else
                     monitor.write("Schritt: -- | Noch keine Aktion")
                 end
