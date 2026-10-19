@@ -1,14 +1,13 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.89
--- Änderungen in v2.89:
---   * Low-Perf-Schwellenwerte aktualisiert:
---     - Faktor 8 ab 8.0s
---     - Faktor 4 ab 4.0s
---     - Faktor 2 ab 2.0s
---     - Faktor 1 darunter (ab 0s)
---   * Alle anderen Funktionen, Logiken und Strukturen unverändert übernommen[cite: 5].
+-- BETTER FUSION REACTOR CONTROLLER v2.90
+-- Änderungen in v2.90:
+--   * Stuck-Erkennung korrigiert: `not pendingAction` entfernt,
+--     damit der Zähler bei eingefrorenen Werten (z.B. 13->13)
+--     auch während ausstehender Aktionen korrekt hochzählt.
+--   * Low-Perf-Schwellenwerte (0/2/4/8) und alle übrigen Features
+--     aus v2.89 unverändert beibehalten[cite: 5].
 -- ============================================================
-local SCRIPT_VERSION = "v2.89"
+local SCRIPT_VERSION = "v2.90"
 
 local reactor = nil
 local monitor = nil
@@ -368,8 +367,6 @@ local function pulseListenerLoop()
             local validInterval = deltaT >= 0.05 and deltaT <= 30.0
 
             if ENABLE_LOW_PERF_MODE and validInterval then
-                -- Angepasste Schwellenwerte nach Benutzerwunsch:
-                -- 8 ab 8.0s, 4 ab 4.0s, 2 ab 2.0s, 1 ab 0s
                 if deltaT >= 8.0 then
                     desiredMultiplier = 8
                 elseif deltaT >= 4.0 then
@@ -459,7 +456,9 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            if not pendingAction and not stuckNudgeActive and running and
+            -- FIX: `not pendingAction` entfernt, damit der Stuck-Zähler bei eingefrorenen Werten
+            -- auch während ausstehender Nachmessungen korrekt hochzählt.
+            if not stuckNudgeActive and running and
                eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
                 stuckPollCount = stuckPollCount + 1
@@ -718,7 +717,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
+                    local maxLogLines = math.max(1, monitorHeight - 9)
                     for i = 1, maxLogLines do
                         clearLineAt(7 + i)
                         if logHistory[i] then monitor.write(logHistory[i]) end
@@ -775,7 +774,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
+                    local maxPulseLines = math.max(1, monitorHeight - 7, 18))
                     for i = 1, maxPulseLines do
                         clearLineAt(5 + i)
                         if pulseLogHistory[i] then monitor.write(pulseLogHistory[i]) end
