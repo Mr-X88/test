@@ -1,13 +1,10 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.90
--- Änderungen in v2.90:
---   * Stuck-Erkennung korrigiert: `not pendingAction` entfernt,
---     damit der Zähler bei eingefrorenen Werten (z.B. 13->13)
---     auch während ausstehender Aktionen korrekt hochzählt.
---   * Low-Perf-Schwellenwerte (0/2/4/8) und alle übrigen Features
---     aus v2.89 unverändert beibehalten[cite: 5].
+-- BETTER FUSION REACTOR CONTROLLER v2.88
+-- Änderungen in v2.88:
+--   * Low-Perf-Schwellenwerte an neue Werte angepasst (1->1.7, 2->3, 4->6, 8->12).
+--   * Alle anderen Funktionen, Logiken und Strukturen aus v2.87 unverändert übernommen.
 -- ============================================================
-local SCRIPT_VERSION = "v2.90"
+local SCRIPT_VERSION = "v2.88"
 
 local reactor = nil
 local monitor = nil
@@ -364,15 +361,18 @@ local function pulseListenerLoop()
             pulseCountTotal = pulseCountTotal + 1
 
             local desiredMultiplier = lowPerfMultiplier
-            local validInterval = deltaT >= 0.05 and deltaT <= 30.0
+            local validInterval = deltaT >= 0.05 and deltaT <= 15.0
 
             if ENABLE_LOW_PERF_MODE and validInterval then
-                if deltaT >= 8.0 then
+                -- Angepasste Schwellenwerte: 8->12, 4->6, 2->3, 1->1.7
+                if deltaT >= 12.0 then
                     desiredMultiplier = 8
-                elseif deltaT >= 4.0 then
+                elseif deltaT >= 6.0 then
                     desiredMultiplier = 4
-                elseif deltaT >= 2.0 then
+                elseif deltaT >= 3.0 then
                     desiredMultiplier = 2
+                elseif deltaT >= 1.7 then
+                    desiredMultiplier = 1
                 else
                     desiredMultiplier = 1
                 end
@@ -456,9 +456,7 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            -- FIX: `not pendingAction` entfernt, damit der Stuck-Zähler bei eingefrorenen Werten
-            -- auch während ausstehender Nachmessungen korrekt hochzählt.
-            if not stuckNudgeActive and running and
+            if not pendingAction and not stuckNudgeActive and running and
                eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
                 stuckPollCount = stuckPollCount + 1
@@ -717,7 +715,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxLogLines = math.max(1, monitorHeight - 9)
+                    local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
                     for i = 1, maxLogLines do
                         clearLineAt(7 + i)
                         if logHistory[i] then monitor.write(logHistory[i]) end
@@ -774,7 +772,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxPulseLines = math.max(1, monitorHeight - 7, 18))
+                    local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
                     for i = 1, maxPulseLines do
                         clearLineAt(5 + i)
                         if pulseLogHistory[i] then monitor.write(pulseLogHistory[i]) end
