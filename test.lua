@@ -1,17 +1,10 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.912 (Sprung-Probe nach unklarer Richtung)
--- Änderungen gegenüber v2.90:
---   * Syntaxfehler in Zeile der Impulszeilen-Berechnung behoben.
---   * Stuck-Erkennung korrigiert: `not pendingAction` entfernt,
---     damit der Zähler bei eingefrorenen Werten (z.B. 13->13)
---     auch während ausstehender Nachmessungen korrekt hochzählt.
---   * Nach unerwarteten Effizienzsprüngen wird bei unklarer Richtung ein Testschritt +/-2 ausgeführt.
---   * Nach Erreichen von 95% bleibt die Regelung inaktiv und wartet ausdrücklich auf einen späteren Sprung.
---   * Nach diesem Sprung wird ein Testschritt +/-2 erlaubt, auch wenn EF noch >=95% ist.
---   * Die Richtung wird nach der Nachmessung bewertet; bei unklarem Ergebnis wird die Gegenrichtung getestet.
---   * Low-Perf-Schwellenwerte und übrige Features bleiben erhalten.
+-- BETTER FUSION REACTOR CONTROLLER v2.93 (Neue Schrittstärken-Formel)
+-- Änderungen gegenüber v2.92:
+--   * Neue Potenzformel (0.022 * (difference ^ 1.5)) in calculateStep()
+--     für präzise und feine Nachregelung im kritischen Bereich 85% - 100%.
 -- ============================================================
-local SCRIPT_VERSION = "v2.912"
+local SCRIPT_VERSION = "v2.93"
 
 local reactor = nil
 local monitor = nil
@@ -257,7 +250,8 @@ local function calculateStep(currentEff)
     local difference = 100 - currentEff
     if difference <= 0 then return 1 end
 
-    local rawStep = (0.0927 * difference) + (0.00464 * (difference ^ 2))
+    -- Neue Potenzformel für exakte Schrittstärkenanpassung
+    local rawStep = 0.022 * (difference ^ 1.5)
     local calculatedStep = math.floor(rawStep)
     if calculatedStep > 15 then calculatedStep = 15 end
     if calculatedStep < 1 then calculatedStep = 1 end
@@ -928,4 +922,3 @@ parallel.waitForAll(
     touchListenerLoop,
     wakeupPulseTimerLoop
 )
-
