@@ -1,10 +1,12 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.93 (Neue Schrittstärken-Formel)
--- Änderungen gegenüber v2.92:
---   * Neue Potenzformel (0.022 * (difference ^ 1.5)) in calculateStep()
---     für präzise und feine Nachregelung im kritischen Bereich 85% - 100%.
+-- BETTER FUSION REACTOR CONTROLLER v2.94 (Idle-Logik korrigiert)
+-- Änderungen gegenüber v2.93:
+--   * Das Skript bleibt nun im Idle-Modus (>= 95%) absolut starr 
+--     und wacht bei Sprüngen in diesem Bereich NICHT mehr auf.
+--   * Erst wenn der EF-Wert wieder unter 95% fällt, wird 
+--     waitingForIdleJump aufgehoben und der Testschritt (+/-2) erzwungen.
 -- ============================================================
-local SCRIPT_VERSION = "v2.93"
+local SCRIPT_VERSION = "v2.94"
 
 local reactor = nil
 local monitor = nil
@@ -250,7 +252,7 @@ local function calculateStep(currentEff)
     local difference = 100 - currentEff
     if difference <= 0 then return 1 end
 
-    -- Neue Potenzformel für exakte Schrittstärkenanpassung
+    -- Potenzformel für präzise Schrittstärkenanpassung
     local rawStep = 0.022 * (difference ^ 1.5)
     local calculatedStep = math.floor(rawStep)
     if calculatedStep > 15 then calculatedStep = 15 end
@@ -319,8 +321,6 @@ local function finishPendingAction(postEfficiency, postError)
     local cycleDiag = "Stillstand"
 
     if action.isProbe then
-        -- Ein Probe-Schritt prüft die Richtung. Bei praktisch unverändertem Wert
-        -- ist die Richtung noch unklar: als Nächstes die Gegenrichtung ausprobieren.
         if delta > EFF_TOLERANCE then
             controlDirection = action.direction
             directionProbePending = false
@@ -341,15 +341,11 @@ local function finishPendingAction(postEfficiency, postError)
             stuckReason = "Richtung unklar: Gegenprobe +/-2 vorgemerkt"
         end
 
-        -- War der Reaktor nach dem Test wieder bei/über der Idle-Grenze,
-        -- wird erneut inaktiv gewartet, bis der nächste externe Sprung kommt.
         if not directionProbePending and postEfficiency >= IDLE_THRESHOLD then
             waitingForIdleJump = true
         end
     else
         if postEfficiency >= IDLE_THRESHOLD then
-            -- Erreichen von 95% beendet die normale Regelung. Der Anstieg,
-            -- der die Grenze erreicht, zählt NICHT als der erwartete Folge-Sprung.
             waitingForIdleJump = true
             directionProbePending = false
             directionKnown = false
@@ -360,11 +356,8 @@ local function finishPendingAction(postEfficiency, postError)
             elseif delta < -EFF_TOLERANCE then
                 cycleDiag = "Sinkt"
             end
-            stuckReason = string.format("Idle >= %.1f%%: warte auf nächsten Sprung", IDLE_THRESHOLD)
+            stuckReason = string.format("Idle >= %.1f%%: warte auf Unterschreitung", IDLE_THRESHOLD)
         elseif math.abs(delta) >= LOG_JUMP_THRESHOLD then
-            -- Große Änderung während einer Aktion kann durch den TR-Zyklus oder
-            -- durch die Aktion entstanden sein. Richtung daher nicht raten:
-            -- nach dieser Messung einen kleinen Testschritt +/-2 vormerken.
             directionProbePending = true
             directionKnown = false
             cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
@@ -515,31 +508,32 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            -- Eine erreichte Idle-Grenze wird als Zustand gemerkt: Danach bleibt die
-            -- normale Regelung aus, bis ein späterer Effizienzsprung beobachtet wird.
-            -- Der Sprung, der die Grenze erstmals erreicht, zählt noch nicht als Folge-Sprung.
             local previousSensorEfficiency = lastSensorEF
-            local wasWaitingForIdleJump = waitingForIdleJump
             local observedJump = previousSensorEfficiency ~= nil and
                 math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
 
-            if eff >= IDLE_THRESHOLD and not directionProbePending then
-                waitingForIdleJump = true
-            end
-
-            -- Bei einer laufenden Nachmessung gehört eine Änderung zunächst zur Aktion.
-            -- Nur externe/unabhängige Sprünge lösen hier eine neue Richtungsprobe aus.
-            if observedJump and pendingAction == nil and running and eff > 0 then
-                if wasWaitingForIdleJump then
+            -- NEUE IDLE-LOGIK:
+            -- 1. Wenn wir im Idle-Modus sind (>= 95%), WACHEN WIR NICHT AUF, 
+            --    selbst wenn es Sprünge gibt. Erst wenn der Wert UNTER 95% fällt:
+            if waitingForIdleJump then
+                if eff < IDLE_THRESHOLD then
                     waitingForIdleJump = false
                     directionProbePending = true
                     directionKnown = false
-                    stuckReason = "Idle-Sprung erkannt: Test +/-2 ausstehend"
-                elseif not waitingForIdleJump and eff < IDLE_THRESHOLD and running then
+                    stuckReason = "Idle verlassen (< 95%): Richtungstest +/-2"
+                end
+            else
+                -- 2. Normale Sprung-Erkennung nur, wenn WIR NICHT IM IDLE SIND (< 95%):
+                if observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
                     directionProbePending = true
                     directionKnown = false
                     stuckReason = "Sprung erkannt: Richtungstest +/-2"
                 end
+            end
+
+            -- Wenn EF >= 95% erreicht, Idle aktivieren (falls nicht gerade ein Test läuft)
+            if eff >= IDLE_THRESHOLD and not directionProbePending then
+                waitingForIdleJump = true
             end
 
             -- Stuck-Erkennung aktiv auch während pendingAction, um Zählen bei Fixwerten zu sichern
@@ -597,7 +591,7 @@ local function backgroundSensorLoop()
             elseif directionProbePending then
                 stuckReason = directionKnown and "Sprung: Testschritt +/-2 ausstehend" or "Richtung unklar: Test +/-2 ausstehend"
             elseif waitingForIdleJump then
-                stuckReason = string.format("Idle >= %.1f%%: warte auf Sprung", IDLE_THRESHOLD)
+                stuckReason = string.format("Idle >= %.1f%%: warte auf Unterschreitung", IDLE_THRESHOLD)
             elseif eff >= IDLE_THRESHOLD then
                 stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
             else
@@ -649,8 +643,6 @@ local function executionLoop()
                 lastExecutionTime = now
 
                 if probeAction then
-                    -- Kleiner Testschritt in einer Richtung; die Nachmessung bestimmt,
-                    -- ob diese Richtung gut war oder eine Gegenprobe erforderlich ist.
                     stepSize = 2
                 else
                     stepSize = calculateStep(currentEfficiency)
@@ -714,7 +706,7 @@ local function executionLoop()
                 elseif directionProbePending then
                     stuckReason = "Richtungstest +/-2 ausstehend"
                 elseif waitingForIdleJump then
-                    stuckReason = "Idle: warte auf nächsten Sprung"
+                    stuckReason = "Idle: warte auf Unterschreitung"
                 elseif currentEfficiency >= IDLE_THRESHOLD then
                     stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
                 elseif not liveIsRunning or currentEfficiency == 0 then
