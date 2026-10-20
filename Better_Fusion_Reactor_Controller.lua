@@ -300,13 +300,13 @@ local function finishPendingAction(postEfficiency, postError)
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "Wayfinding"
+            cycleDiag = "TR JUMP Wayfinding"
             stuckReason = "Direction test: direction confirmed"
         elseif delta < 0 then
             controlDirection = -action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "TR Jump"
+            cycleDiag = "TR JUMP Wayfinding"
             stuckReason = "Direction test: opposite direction confirmed"
         else
             controlDirection = -action.direction
