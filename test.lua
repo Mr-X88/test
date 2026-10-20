@@ -29,7 +29,7 @@ local pulseStreakCount = 0
 
 local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
-local EFF_TOLERANCE = 0.8            -- Toleranz für Trend-/Erfolgsprüfung
+local EFF_TOLERANCE = 0.3            -- Toleranz für Trend-/Erfolgsprüfung
 local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
 local ACTION_EVAL_DELAY = 1.5        -- Nachmessung nach einer Korrektur (Richtung erst danach bewerten)
 
