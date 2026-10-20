@@ -1,5 +1,5 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.91 (Sprung-Probe nach unklarer Richtung)
+-- BETTER FUSION REACTOR CONTROLLER v2.911 (Sprung-Probe nach unklarer Richtung)
 -- Änderungen gegenüber v2.90:
 --   * Syntaxfehler in Zeile der Impulszeilen-Berechnung behoben.
 --   * Stuck-Erkennung korrigiert: `not pendingAction` entfernt,
