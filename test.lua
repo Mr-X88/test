@@ -1,12 +1,10 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.97 (Alte Schritt-Formel reaktiviert)
--- Änderungen gegenüber v2.96:
---   * `calculateStep` nutzt wieder die alte, bewährte Formel
---     ((0.0927 * diff) + (0.00464 * diff^2)), um Überschießen 
---     und Fehltritte zu verhindern.
---   * Intelligente Sprung-Erkennung und starres Idle (>= 95%) bleiben aktiv.
+-- BETTER FUSION REACTOR CONTROLLER v2.98 (Neue angepasste Formel)
+-- Änderungen gegenüber v2.97:
+--   * `calculateStep` verwendet nun die neue Formel:
+--     (0.142 * difference) + (0.0036 * (difference ^ 2))
 -- ============================================================
-local SCRIPT_VERSION = "v2.97"
+local SCRIPT_VERSION = "v2.98"
 
 local reactor = nil
 local monitor = nil
@@ -246,12 +244,12 @@ local function getReactorData()
     return logicMode, caseTemp, efficiency, errorLevel, isRunning, dataValid
 end
 
--- ==================== REGELSCHRITT BERECHNEN (ORIGINALE FORMEL) ====================
+-- ==================== REGELSCHRITT BERECHNEN (NEUE FORMEL) ====================
 local function calculateStep(currentEff)
     local difference = 100 - currentEff
     if difference <= 0 then return 1 end
 
-    local rawStep = (0.0927 * difference) + (0.00464 * (difference ^ 2))
+    local rawStep = (0.142 * difference) + (0.0036 * (difference ^ 2))
     local calculatedStep = math.floor(rawStep)
     if calculatedStep > 15 then calculatedStep = 15 end
     if calculatedStep < 1 then calculatedStep = 1 end
