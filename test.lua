@@ -1,13 +1,17 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.90 (Kompiliert & Korrigiert)
--- Änderungen in v2.90:
+-- BETTER FUSION REACTOR CONTROLLER v2.91 (Sprung-Probe nach unklarer Richtung)
+-- Änderungen gegenüber v2.90:
 --   * Syntaxfehler in Zeile der Impulszeilen-Berechnung behoben.
 --   * Stuck-Erkennung korrigiert: `not pendingAction` entfernt,
 --     damit der Zähler bei eingefrorenen Werten (z.B. 13->13)
 --     auch während ausstehender Nachmessungen korrekt hochzählt.
---   * Low-Perf-Schwellenwerte (0/2/4/8) und alle übrigen Features beibehalten.
+--   * Nach unerwarteten Effizienzsprüngen wird bei unklarer Richtung ein Testschritt +/-2 ausgeführt.
+--   * Nach Erreichen von 95% bleibt die Regelung inaktiv und wartet ausdrücklich auf einen späteren Sprung.
+--   * Nach diesem Sprung wird ein Testschritt +/-2 erlaubt, auch wenn EF noch >=95% ist.
+--   * Die Richtung wird nach der Nachmessung bewertet; bei unklarem Ergebnis wird die Gegenrichtung getestet.
+--   * Low-Perf-Schwellenwerte und übrige Features bleiben erhalten.
 -- ============================================================
-local SCRIPT_VERSION = "v2.90"
+local SCRIPT_VERSION = "v2.91"
 
 local reactor = nil
 local monitor = nil
@@ -55,6 +59,12 @@ local lastPollEF = nil
 local unchangedPollCount = 0
 local lastExecutionTime = -EXECUTION_COOLDOWN
 local pendingAction = nil           -- genau eine Aktion wartet auf ihre Nachmessung
+
+-- Richtungsfindung bei unbekannter Wirkung und nach Idle >= 95%.
+-- waitingForIdleJump hält die normale Regelung an, bis ein echter Messsprung erkannt wird.
+local directionProbePending = false
+local directionKnown = true
+local waitingForIdleJump = false
 
 -- Deadlock-Nudge & Log-Flag
 local stuckPollCount = 0
@@ -312,26 +322,81 @@ local function finishPendingAction(postEfficiency, postError)
 
     local action = pendingAction
     local delta = postEfficiency - action.beforeEfficiency
-
-    if delta < -EFF_TOLERANCE then
-        controlDirection = -action.direction
-        stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
-    elseif delta > EFF_TOLERANCE then
-        controlDirection = action.direction
-        stuckReason = "Nachmessung: Effizienz gestiegen, Richtung gehalten"
-    else
-        controlDirection = action.direction
-        stuckReason = "Nachmessung: kaum Änderung, Richtung gehalten"
-    end
-
     local cycleDiag = "Stillstand"
-    if math.abs(delta) >= LOG_JUMP_THRESHOLD then
-        cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
-    elseif delta > EFF_TOLERANCE then
-        cycleDiag = "Steigt"
-    elseif delta < -EFF_TOLERANCE then
-        cycleDiag = "Sinkt"
+
+    if action.isProbe then
+        -- Ein Probe-Schritt prüft die Richtung. Bei praktisch unverändertem Wert
+        -- ist die Richtung noch unklar: als Nächstes die Gegenrichtung ausprobieren.
+        if delta > EFF_TOLERANCE then
+            controlDirection = action.direction
+            directionProbePending = false
+            directionKnown = true
+            cycleDiag = "TEST OK"
+            stuckReason = "Richtungstest: Richtung bestätigt"
+        elseif delta < -EFF_TOLERANCE then
+            controlDirection = -action.direction
+            directionProbePending = false
+            directionKnown = true
+            cycleDiag = "TEST REV"
+            stuckReason = "Richtungstest: Gegenrichtung bestätigt"
+        else
+            controlDirection = -action.direction
+            directionProbePending = true
+            directionKnown = false
+            cycleDiag = "TEST?"
+            stuckReason = "Richtung unklar: Gegenprobe +/-2 vorgemerkt"
+        end
+
+        -- War der Reaktor nach dem Test wieder bei/über der Idle-Grenze,
+        -- wird erneut inaktiv gewartet, bis der nächste externe Sprung kommt.
+        if not directionProbePending and postEfficiency >= IDLE_THRESHOLD then
+            waitingForIdleJump = true
+        end
+    else
+        if postEfficiency >= IDLE_THRESHOLD then
+            -- Erreichen von 95% beendet die normale Regelung. Der Anstieg,
+            -- der die Grenze erreicht, zählt NICHT als der erwartete Folge-Sprung.
+            waitingForIdleJump = true
+            directionProbePending = false
+            directionKnown = false
+            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
+                cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
+            elseif delta > EFF_TOLERANCE then
+                cycleDiag = "Steigt"
+            elseif delta < -EFF_TOLERANCE then
+                cycleDiag = "Sinkt"
+            end
+            stuckReason = string.format("Idle >= %.1f%%: warte auf nächsten Sprung", IDLE_THRESHOLD)
+        elseif math.abs(delta) >= LOG_JUMP_THRESHOLD then
+            -- Große Änderung während einer Aktion kann durch den TR-Zyklus oder
+            -- durch die Aktion entstanden sein. Richtung daher nicht raten:
+            -- nach dieser Messung einen kleinen Testschritt +/-2 vormerken.
+            directionProbePending = true
+            directionKnown = false
+            cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
+            stuckReason = "Großer Sprung: Richtungstest +/-2 vorgemerkt"
+        else
+            if delta < -EFF_TOLERANCE then
+                controlDirection = -action.direction
+                directionKnown = true
+                stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
+            elseif delta > EFF_TOLERANCE then
+                controlDirection = action.direction
+                directionKnown = true
+                stuckReason = "Nachmessung: Effizienz gestiegen, Richtung gehalten"
+            else
+                controlDirection = action.direction
+                stuckReason = "Nachmessung: kaum Änderung, Richtung gehalten"
+            end
+
+            if delta > EFF_TOLERANCE then
+                cycleDiag = "Steigt"
+            elseif delta < -EFF_TOLERANCE then
+                cycleDiag = "Sinkt"
+            end
+        end
     end
+
     if action.usedNudge then cycleDiag = "STUCK" end
 
     if ENABLE_MONITOR_LOGS then
@@ -341,7 +406,7 @@ local function finishPendingAction(postEfficiency, postError)
             math.floor(postError + 0.5), action.cycleSeconds, string.sub(cycleDiag, 1, 10)
         )
         table.insert(logHistory, 1, compactLog)
-        local maxLogLines = math.max(1, monitorHeight - 9)
+        local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
         while #logHistory > maxLogLines do table.remove(logHistory) end
     end
 
@@ -407,7 +472,7 @@ local function pulseListenerLoop()
                 pulseCountTotal, intervalText, lastDesiredMultiplier, lowPerfMultiplier
             )
             table.insert(pulseLogHistory, 1, pulseLine)
-            local maxPulseLines = math.max(1, monitorHeight - 7, 18)
+            local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
             while #pulseLogHistory > maxPulseLines do table.remove(pulseLogHistory) end
         end
 
@@ -455,6 +520,33 @@ local function backgroundSensorLoop()
             liveDataValid = true
 
             if eff > 0 then hasEverRun = true end
+
+            -- Eine erreichte Idle-Grenze wird als Zustand gemerkt: Danach bleibt die
+            -- normale Regelung aus, bis ein späterer Effizienzsprung beobachtet wird.
+            -- Der Sprung, der die Grenze erstmals erreicht, zählt noch nicht als Folge-Sprung.
+            local previousSensorEfficiency = lastSensorEF
+            local wasWaitingForIdleJump = waitingForIdleJump
+            local observedJump = previousSensorEfficiency ~= nil and
+                math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
+
+            if eff >= IDLE_THRESHOLD and not directionProbePending then
+                waitingForIdleJump = true
+            end
+
+            -- Bei einer laufenden Nachmessung gehört eine Änderung zunächst zur Aktion.
+            -- Nur externe/unabhängige Sprünge lösen hier eine neue Richtungsprobe aus.
+            if observedJump and pendingAction == nil and running and eff > 0 then
+                if wasWaitingForIdleJump then
+                    waitingForIdleJump = false
+                    directionProbePending = true
+                    directionKnown = false
+                    stuckReason = "Idle-Sprung erkannt: Test +/-2 ausstehend"
+                elseif not waitingForIdleJump and eff < IDLE_THRESHOLD and running then
+                    directionProbePending = true
+                    directionKnown = false
+                    stuckReason = "Sprung erkannt: Richtungstest +/-2"
+                end
+            end
 
             -- Stuck-Erkennung aktiv auch während pendingAction, um Zählen bei Fixwerten zu sichern
             if not stuckNudgeActive and running and
@@ -508,6 +600,10 @@ local function backgroundSensorLoop()
 
             if not running or eff == 0 then
                 stuckReason = (hasEverRun and eff == 0) and "CRASH erkannt!" or "Standby"
+            elseif directionProbePending then
+                stuckReason = directionKnown and "Sprung: Testschritt +/-2 ausstehend" or "Richtung unklar: Test +/-2 ausstehend"
+            elseif waitingForIdleJump then
+                stuckReason = string.format("Idle >= %.1f%%: warte auf Sprung", IDLE_THRESHOLD)
             elseif eff >= IDLE_THRESHOLD then
                 stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
             else
@@ -550,17 +646,27 @@ local function executionLoop()
 
             local currentEfficiency = liveEF
             local errorLevel = liveER
-            local canControl = liveDataValid and liveIsRunning and
-                currentEfficiency > 0 and currentEfficiency < IDLE_THRESHOLD and errorLevel < 100
+            local probeAction = directionProbePending
+            local normalControlAllowed = currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump
+            local canControl = liveDataValid and liveIsRunning and currentEfficiency > 0 and
+                errorLevel < 100 and (probeAction or normalControlAllowed)
 
             if canControl then
                 lastExecutionTime = now
 
-                stepSize = calculateStep(currentEfficiency)
-                local nudgeRequested = stuckNudgeBonus > 0
+                if probeAction then
+                    -- Kleiner Testschritt in einer Richtung; die Nachmessung bestimmt,
+                    -- ob diese Richtung gut war oder eine Gegenprobe erforderlich ist.
+                    stepSize = 2
+                else
+                    stepSize = calculateStep(currentEfficiency)
+                end
+
+                local nudgeRequested = (not probeAction) and stuckNudgeBonus > 0
                 local separateNudge = nudgeRequested and stepSize >= 15
                 local nudgeIncluded = nudgeRequested and not separateNudge
-                local effectiveStep = separateNudge and 15 or math.min(15, stepSize + (nudgeIncluded and 1 or 0))
+                local effectiveStep = probeAction and 2 or
+                    (separateNudge and 15 or math.min(15, stepSize + (nudgeIncluded and 1 or 0)))
                 local actionDirection = controlDirection
                 local success, modeOrError, nudgeApplied = applyControlAction(
                     actionDirection, effectiveStep, separateNudge, nudgeIncluded
@@ -568,8 +674,13 @@ local function executionLoop()
 
                 if success then
                     local signChar = (actionDirection == 1) and "+" or "-"
-                    local stepText = signChar .. tostring(effectiveStep)
-                    if separateNudge and nudgeApplied then stepText = stepText .. "+1" end
+                    local stepText
+                    if probeAction then
+                        stepText = "TEST" .. signChar .. "2"
+                    else
+                        stepText = signChar .. tostring(effectiveStep)
+                        if separateNudge and nudgeApplied then stepText = stepText .. "+1" end
+                    end
 
                     lastAppliedStepText = stepText
                     lastActionMode = modeOrError
@@ -583,7 +694,8 @@ local function executionLoop()
                         appliedAt = os.clock(),
                         evaluateAt = os.clock() + ACTION_EVAL_DELAY,
                         cycleSeconds = secondsSinceLastGo,
-                        usedNudge = nudgeApplied
+                        usedNudge = nudgeApplied,
+                        isProbe = probeAction
                     }
 
                     if nudgeApplied then
@@ -594,13 +706,21 @@ local function executionLoop()
                     end
 
                     secondsSinceLastGo = 0
-                    stuckReason = "Schritt ausgeführt: " .. modeOrError .. "; Nachmessung ausstehend"
+                    if probeAction then
+                        stuckReason = "Testschritt +/-2 ausgeführt; Nachmessung ausstehend"
+                    else
+                        stuckReason = "Schritt ausgeführt: " .. modeOrError .. "; Nachmessung ausstehend"
+                    end
                 else
                     stuckReason = modeOrError
                 end
             elseif liveDataValid then
                 if errorLevel >= 100 then
                     stuckReason = "SICHERHEIT: ER >= 100"
+                elseif directionProbePending then
+                    stuckReason = "Richtungstest +/-2 ausstehend"
+                elseif waitingForIdleJump then
+                    stuckReason = "Idle: warte auf nächsten Sprung"
                 elseif currentEfficiency >= IDLE_THRESHOLD then
                     stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
                 elseif not liveIsRunning or currentEfficiency == 0 then
@@ -773,7 +893,7 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxPulseLines = math.max(1, monitorHeight - 7, 18)
+                    local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
                     for i = 1, maxPulseLines do
                         clearLineAt(5 + i)
                         if pulseLogHistory[i] then monitor.write(pulseLogHistory[i]) end
@@ -808,3 +928,4 @@ parallel.waitForAll(
     touchListenerLoop,
     wakeupPulseTimerLoop
 )
+
