@@ -1,13 +1,14 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.99.2 (Optimized Logs & English UI)
+-- BETTER FUSION REACTOR CONTROLLER v2.99.3 (Compact Logs & English UI)
 -- Changes in this version:
---   * Redesigned monitor cycle logs for better readability and clarity (e.g., #001 | St:+12.5 | Eff:56->49% | Err:24 (0s) | Falling).
+--   * Removed | separators and excess spaces from monitor cycle logs.
+--   * Changed "Test Rev" diagnostic text to "TR Jump".
 --   * All descriptions, comments, and variables in English.
 --   * Automatic peripheral re-scan and system reboot on persistent SENSOR? errors.
 --   * Removed redstone relay step control fallback and related calculations.
 --   * Redstone relay outputs a signal when the reactor stops or crashes (EF/ER = 0).
 -- ============================================================
-local SCRIPT_VERSION = "v2.99.2"
+local SCRIPT_VERSION = "v2.99.3"
 
 local reactor = nil
 local monitor = nil
@@ -315,7 +316,7 @@ local function finishPendingAction(postEfficiency, postError)
             controlDirection = -action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "Test Rev"
+            cycleDiag = "TR Jump"
             stuckReason = "Direction test: opposite direction confirmed"
         else
             controlDirection = -action.direction
@@ -376,7 +377,7 @@ local function finishPendingAction(postEfficiency, postError)
 
     if ENABLE_MONITOR_LOGS then
         local compactLog = string.format(
-            "#%03d | St:%s | Eff:%.0f->%.0f%% | Err:%.0f (%ds) | %s",
+            "#%03d St:%s Eff:%.0f->%.0f%% Err:%.0f(%ds) %s",
             action.id, action.stepText, action.beforeEfficiency, postEfficiency,
             postError, action.cycleSeconds, string.sub(cycleDiag, 1, 12)
         )
@@ -443,7 +444,7 @@ local function pulseListenerLoop()
                 intervalText = string.format("Dt:%.3f(out)", deltaT)
             end
             local pulseLine = string.format(
-                "#%03d|%s|Factor:%d|Active:%d",
+                "#%03d %s Fac:%d Act:%d",
                 pulseCountTotal, intervalText, lastDesiredMultiplier, lowPerfMultiplier
             )
             table.insert(pulseLogHistory, 1, pulseLine)
@@ -871,29 +872,29 @@ local function uiLoop()
                 monitor.write("Computer-bottom: ")
                 if bottomState then
                     monitor.setTextColor(colors.green)
-                    monitor.write("ON ")
+                    monitor.write("AN ")
                 else
                     monitor.setTextColor(colors.lightGray)
-                    monitor.write("OFF ")
+                    monitor.write("AUS ")
                 end
                 monitor.setTextColor(colors.white)
                 local dtText = lastDeltaT and string.format("%.3fs", lastDeltaT) or "--"
-                monitor.write(string.format("| Pulses: %d | Dt: %s", pulseCountTotal, dtText))
+                monitor.write(string.format("| Pulse: %d | Dt: %s", pulseCountTotal, dtText))
                 clearLineAt(4)
                 local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
-                monitor.write(string.format("Target tick: x%d | active: x%d (%dt / %.2fs)",
+                monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
                     lastDesiredMultiplier, ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
                     currentTicks, currentTicks / 20))
 
                 clearLineAt(5)
                 monitor.setTextColor(colors.lightGray)
-                monitor.write("--- INPUT PULSES [")
+                monitor.write("--- EINGANGSIMPULSE [")
                 if ENABLE_MONITOR_LOGS then
                     monitor.setTextColor(colors.green)
-                    monitor.write("ON")
+                    monitor.write("AN")
                 else
                     monitor.setTextColor(colors.red)
-                    monitor.write("OFF")
+                    monitor.write("AUS")
                 end
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("] ---")
@@ -910,7 +911,7 @@ local function uiLoop()
                 else
                     clearLineAt(7)
                     monitor.setTextColor(colors.gray)
-                    monitor.write("  (Logs are disabled)")
+                    monitor.write("  (Logs sind deaktiviert)")
                     monitor.setTextColor(colors.white)
                 end
 
@@ -918,7 +919,7 @@ local function uiLoop()
                     clearLineAt(monitorHeight)
                     monitor.setBackgroundColor(colors.gray)
                     monitor.setTextColor(colors.yellow)
-                    monitor.write("[ Click for Page 1: Main UI ]")
+                    monitor.write("[ Klick für Seite 1: Haupt-UI ]")
                     monitor.setBackgroundColor(colors.black)
                     monitor.setTextColor(colors.white)
                 end
