@@ -1,15 +1,4 @@
--- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.96 (Jump Detection + Calibrated Step Formula)
--- Changes vs v2.95:
---   * Sensor jumps use 4t measurement when direction is known instead of flat TEST +/-2.
---   * TEST +/-2 is only used when direction is unknown or a measurement remains unchanged.
---   * After Idle >= 95%, waits for a real jump before performing direction test.
---   * New step formula: 0.142*difference + 0.0036*difference^2, rounded to nearest integer.
---   * Added uptime & last crash timers.
---   * Monitor logs disabled by default.
---   * Automatic peripheral re-scan and system reboot on persistent sensor errors.
--- ============================================================
-local SCRIPT_VERSION = "v2.96"
+local SCRIPT_VERSION = "v3.00"
 
 local reactor = nil
 local monitor = nil
@@ -28,34 +17,16 @@ local pulseStreakCount = 0
 local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
 local EXECUTION_COOLDOWN = 3.0       -- Minimum pause between control steps
-local ACTION_EVAL_DELAY = 1.5        -- Re-evaluation after correction (evaluate direction afterwards)
+local ACTION_EVAL_DELAY = 1.5        -- Re-evaluation delay after correction
 
 local ENABLE_WAKEUP_PULSE = true
 local WAKEUP_INTERVAL_TICKS = 40     -- Every 2 seconds
 local WAKEUP_PULSE_TICKS = 10        -- 0.5 seconds
 local WAKEUP_STRENGTH = 15
 
-local ENABLE_MONITOR_LOGS = false    -- Disabled by default
+local ENABLE_MONITOR_LOGS = true
 
 local sides = {"top", "bottom", "left", "right", "front", "back"}
-
--- ==================== UPTIME & CRASH TIMERS ====================
-local gameStartTime = os.clock()
-local reactorRunSeconds = 0
-local wasRunning = false
-local lastCrashTimeStr = "Never"
-
-local function formatTime(totalSeconds)
-    totalSeconds = math.floor(totalSeconds)
-    local hours = math.floor(totalSeconds / 3600)
-    local minutes = math.floor((totalSeconds % 3600) / 60)
-    local seconds = totalSeconds % 60
-    if hours > 0 then
-        return string.format("%d:%02d:%02d", hours, minutes, seconds)
-    else
-        return string.format("%02d:%02d", minutes, seconds)
-    end
-end
 
 -- ==================== CONTROL VARIABLES ====================
 local controlDirection = 1           -- 1 = + / increase, -1 = - / decrease
@@ -72,13 +43,14 @@ local secondsSinceLastGo = 0
 local executionGo = false
 local lastPollEF = nil
 local unchangedPollCount = 0
+local stableExecutionEfficiency = nil
+local stableExecutionAt = nil
 local lastExecutionTime = -EXECUTION_COOLDOWN
 local pendingAction = nil           -- Exactly one action waiting for re-evaluation
 
 -- Direction finding for unknown effect and after Idle >= 95%.
--- waitingForIdleJump pauses normal control until a real measurement jump is detected.
 local directionProbePending = false
-local directionKnown = false          -- Mark as confirmed only after an evaluable measurement
+local directionKnown = false          -- Confirmed only after an evaluable measurement
 local waitingForIdleJump = false
 
 -- Deadlock-Nudge & Log Flag
@@ -105,6 +77,7 @@ local liveER = 0
 local liveCaseTemp = 0
 local liveIsRunning = false
 local liveDataValid = false
+local invalidReadCount = 0
 
 local lastAppliedStepText = nil
 local lastActionMode = "No action yet"
@@ -158,7 +131,7 @@ local function scanPeripherals()
             local hasDigital = type(wrapped.setOutput) == "function"
             if hasAnalog or hasDigital then
                 relay = wrapped
-                print(" -> Redstone Relay/Integrator: " .. name .. (hasAnalog and " (analog)" or " (digital only)"))
+                print(" -> Redstone Relay/Integrator: " .. name)
             end
         end
     end
@@ -174,9 +147,6 @@ if not reactor then
 end
 
 if monitor then pcall(function() monitor.clear() end) end
-if relay and type(relay.setAnalogOutput) ~= "function" then
-    print("[WARNING] Relay has no setAnalogOutput(); cannot output analog step strength.")
-end
 
 -- ==================== RELAY HELPER FUNCTIONS ====================
 local function setRelayAll(value, allowDigital)
@@ -200,6 +170,13 @@ local function setRelayAll(value, allowDigital)
     return success and usedAny
 end
 
+local function updateCrashRelay()
+    if not relay or wakeupPulseActive then return end
+    local isCrashedOrStopped = hasEverRun and (not liveIsRunning or liveEF == 0)
+    local signalValue = isCrashedOrStopped and 15 or 0
+    setRelayAll(signalValue, true)
+end
+
 local function sendWakeupPulseStart()
     if not relay then
         stuckReason = "Wakeup pulse: no relay"
@@ -217,8 +194,8 @@ end
 
 local function stopWakeupPulseIfDue()
     if wakeupPulseActive and os.clock() >= wakeupPulseEndsAt then
-        setRelayAll(0, true)
         wakeupPulseActive = false
+        updateCrashRelay()
     end
 end
 
@@ -272,14 +249,24 @@ end
 local function calculateStep(currentEff)
     local difference = math.max(0, 100 - currentEff)
     local rawStep = (0.142 * difference) + (0.0036 * (difference ^ 2))
-    local calculatedStep = math.floor(rawStep + 0.5)
-    if calculatedStep > 15 then calculatedStep = 15 end
-    if calculatedStep < 1 then calculatedStep = 1 end
+    local calculatedStep = math.floor(rawStep * 100 + 0.5) / 100
+
+    if calculatedStep < 0.01 then calculatedStep = 0.01 end
     return calculatedStep
 end
 
+local function formatStep(value)
+    local text = string.format("%.2f", value)
+    text = text:gsub("0+$", ""):gsub("%.$", "")
+    return text
+end
+
 local function applyControlAction(direction, strength, separateNudge, nudgeIncluded)
-    strength = math.max(1, math.min(15, math.floor(strength)))
+    if not isFiniteNumber(strength) then
+        return false, "Invalid step strength", false, nil
+    end
+
+    strength = math.max(0.01, math.floor(strength * 100 + 0.5) / 100)
     local nudgeApplied = nudgeIncluded == true
 
     if reactor and type(reactor.adjustReactivity) == "function" then
@@ -290,44 +277,14 @@ local function applyControlAction(direction, strength, separateNudge, nudgeInclu
                 if nudgeOK then
                     nudgeApplied = true
                 else
-                    return true, "Direct (Nudge Error)", false
+                    return true, "Direct unlimited (Nudge Error)", false, strength
                 end
             end
-            return true, nudgeApplied and "Direct +Nudge" or "Direct", nudgeApplied
+            return true, nudgeApplied and "Direct unlimited +Nudge" or "Direct unlimited", nudgeApplied, strength
         end
     end
 
-    if not relay then
-        return false, "No Relay / No Direct Control", false
-    end
-    if type(relay.setAnalogOutput) ~= "function" then
-        return false, "Relay cannot send analog step strength", false
-    end
-
-    local function relayPulse(pulseStrength)
-        local startOK = setRelayAll(pulseStrength, false)
-        if not startOK then
-            setRelayAll(0, false)
-            return false
-        end
-        sleep(0.1)
-        local stopOK = setRelayAll(0, false)
-        return stopOK
-    end
-
-    if not relayPulse(strength) then
-        setRelayAll(0, false)
-        return false, "Relay output failed", false
-    end
-
-    if separateNudge then
-        if relayPulse(1) then
-            nudgeApplied = true
-        else
-            return true, "Relay Pulse (Nudge Error)", false
-        end
-    end
-    return true, nudgeApplied and "Relay Pulse +Nudge" or "Relay Pulse", nudgeApplied
+    return false, "Reactor API unavailable / adjustReactivity failed", false, nil
 end
 
 local function finishPendingAction(postEfficiency, postError)
@@ -336,26 +293,26 @@ local function finishPendingAction(postEfficiency, postError)
 
     local action = pendingAction
     local delta = postEfficiency - action.beforeEfficiency
-    local cycleDiag = "Stalled"
+    local cycleDiag = "Stable"
 
     if action.isProbe then
         if delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "TEST OK"
+            cycleDiag = "Wayfinding"
             stuckReason = "Direction test: direction confirmed"
         elseif delta < 0 then
             controlDirection = -action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "TEST REV"
+            cycleDiag = "TR Jump"
             stuckReason = "Direction test: opposite direction confirmed"
         else
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
-            cycleDiag = "TEST?"
+            cycleDiag = "Test?"
             stuckReason = "Direction unclear: re-probe +/-2 scheduled"
         end
 
@@ -370,7 +327,7 @@ local function finishPendingAction(postEfficiency, postError)
             if math.abs(delta) >= LOG_JUMP_THRESHOLD then
                 cycleDiag = (delta > 0) and "Jump (+)" or "Jump (-)"
             elseif delta > 0 then
-                cycleDiag = "Rising"
+                cycleDiag = "+"
             elseif delta < 0 then
                 cycleDiag = "Falling"
             end
@@ -383,7 +340,7 @@ local function finishPendingAction(postEfficiency, postError)
                 cycleDiag = "Jump (+)"
                 stuckReason = "Large jump (+): direction maintained"
             else
-                cycleDiag = "Rising"
+                cycleDiag = "+"
                 stuckReason = "Re-evaluation: efficiency increased, direction kept"
             end
         elseif delta < 0 then
@@ -401,21 +358,21 @@ local function finishPendingAction(postEfficiency, postError)
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
-            cycleDiag = "TEST?"
+            cycleDiag = "Test?"
             stuckReason = "No change: direction test +/-2 scheduled"
         end
     end
 
-    if action.usedNudge then cycleDiag = "STUCK" end
+    if action.usedNudge then cycleDiag = "Nudge" end
 
     if ENABLE_MONITOR_LOGS then
         local compactLog = string.format(
-            "#%03d|%s|%.0f>%.0f|ER:%d/%ds|%s",
+            "#%03d St:%s Eff:%.0f->%.0f%% Err:%.0f(%ds) %s",
             action.id, action.stepText, action.beforeEfficiency, postEfficiency,
-            math.floor(postError + 0.5), action.cycleSeconds, string.sub(cycleDiag, 1, 10)
+            postError, action.cycleSeconds, string.sub(cycleDiag, 1, 12)
         )
         table.insert(logHistory, 1, compactLog)
-        local maxLogLines = math.max(1, math.min(monitorHeight - 10, 18))
+        local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
         while #logHistory > maxLogLines do table.remove(logHistory) end
     end
 
@@ -477,7 +434,7 @@ local function pulseListenerLoop()
                 intervalText = string.format("Dt:%.3f(out)", deltaT)
             end
             local pulseLine = string.format(
-                "#%03d|%s|Factor:%d|Active:%d",
+                "#%03d %s Fac:%d Act:%d",
                 pulseCountTotal, intervalText, lastDesiredMultiplier, lowPerfMultiplier
             )
             table.insert(pulseLogHistory, 1, pulseLine)
@@ -496,7 +453,7 @@ local function touchListenerLoop()
         if currentPage == 1 then
             if y == monitorHeight then
                 currentPage = 2
-            elseif y == 8 then
+            elseif y == 7 then
                 ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
             end
         elseif currentPage == 2 then
@@ -511,7 +468,6 @@ end
 
 -- ==================== ADAPTIVE SENSOR LOOP ====================
 local lastSensorEF = nil
-local invalidReadCount = 0
 
 local function backgroundSensorLoop()
     while true do
@@ -532,16 +488,7 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
-            -- Update reactor uptime and crash tracking
-            local isRunningNow = running and eff > 0
-            if isRunningNow then
-                reactorRunSeconds = reactorRunSeconds + pollSeconds
-            end
-
-            if wasRunning and (eff == 0 or not running) and hasEverRun then
-                lastCrashTimeStr = formatTime(os.clock() - gameStartTime)
-            end
-            wasRunning = isRunningNow
+            updateCrashRelay()
 
             local previousSensorEfficiency = lastSensorEF
             local observedJump = previousSensorEfficiency ~= nil and
@@ -609,10 +556,15 @@ local function backgroundSensorLoop()
                 unchangedPollCount = unchangedPollCount + 1
                 if unchangedPollCount >= 2 then
                     executionGo = true
+                    stableExecutionEfficiency = eff
+                    stableExecutionAt = os.clock()
                     unchangedPollCount = 0
                 end
             else
                 unchangedPollCount = 0
+                executionGo = false
+                stableExecutionEfficiency = nil
+                stableExecutionAt = nil
             end
             lastPollEF = eff
 
@@ -629,7 +581,7 @@ local function backgroundSensorLoop()
             if not running or eff == 0 then
                 stuckReason = (hasEverRun and eff == 0) and "CRASH detected!" or "Standby"
             elseif directionProbePending then
-                stuckReason = directionKnown and "Jump: test step +/-2 pending" / "Direction unclear: test +/-2 pending" or "Direction unclear: test +/-2 pending"
+                stuckReason = directionKnown and "Jump: test step +/-2 pending" or "Direction unclear: test +/-2 pending"
             elseif waitingForIdleJump then
                 stuckReason = string.format("Idle >= %.1f%%: waiting for jump", IDLE_THRESHOLD)
             elseif eff >= IDLE_THRESHOLD then
@@ -640,9 +592,9 @@ local function backgroundSensorLoop()
                     if math.abs(delta) >= JUMP_THRESHOLD then
                         stuckReason = (delta < 0) and "Sensor jump (-)" or "Sensor jump (+)"
                     elseif delta > 0 then
-                        stuckReason = "Rising"
+                        stuckReason = "+"
                     elseif delta < 0 then
-                        stuckReason = "Falling"
+                        stuckReason = "-"
                     else
                         stuckReason = "Stalled"
                     end
@@ -657,6 +609,9 @@ local function backgroundSensorLoop()
         else
             liveDataValid = false
             executionGo = false
+            stableExecutionEfficiency = nil
+            stableExecutionAt = nil
+            unchangedPollCount = 0
             invalidReadCount = invalidReadCount + 1
             stuckReason = "Sensor read error (" .. invalidReadCount .. ")"
 
@@ -682,10 +637,14 @@ local function executionLoop()
     while true do
         local now = os.clock()
 
-        if executionGo and not pendingAction and (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
+        if executionGo and stableExecutionEfficiency ~= nil and
+           stableExecutionEfficiency == liveEF and not pendingAction and
+           (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
             executionGo = false
 
-            local currentEfficiency = liveEF
+            local currentEfficiency = stableExecutionEfficiency
+            stableExecutionEfficiency = nil
+            stableExecutionAt = nil
             local errorLevel = liveER
             local probeAction = directionProbePending
             local normalControlAllowed = currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump
@@ -704,10 +663,9 @@ local function executionLoop()
                 local nudgeRequested = (not probeAction) and stuckNudgeBonus > 0
                 local separateNudge = nudgeRequested and stepSize >= 15
                 local nudgeIncluded = nudgeRequested and not separateNudge
-                local effectiveStep = probeAction and 2 or
-                    (separateNudge and 15 or math.min(15, stepSize + (nudgeIncluded and 1 or 0)))
+                local effectiveStep = probeAction and 2 or (stepSize + (nudgeIncluded and 1 or 0))
                 local actionDirection = controlDirection
-                local success, modeOrError, nudgeApplied = applyControlAction(
+                local success, modeOrError, nudgeApplied, actualStrength = applyControlAction(
                     actionDirection, effectiveStep, separateNudge, nudgeIncluded
                 )
 
@@ -717,7 +675,8 @@ local function executionLoop()
                     if probeAction then
                         stepText = "TEST" .. signChar .. "2"
                     else
-                        stepText = signChar .. tostring(effectiveStep)
+                        local loggedStrength = actualStrength or effectiveStep
+                        stepText = signChar .. formatStep(loggedStrength)
                         if separateNudge and nudgeApplied then stepText = stepText .. "+1" end
                     end
 
@@ -854,16 +813,13 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 clearLineAt(6)
-                monitor.write(string.format("Uptime: %s | Crash: %s", formatTime(reactorRunSeconds), lastCrashTimeStr))
-
-                clearLineAt(7)
                 local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
                 monitor.write(string.format("Sensor: %dt / %.2fs | Factor x%d%s",
                     currentTicks, currentTicks / 20,
                     ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
                     ENABLE_LOW_PERF_MODE and " AUTO" or " FIX"))
 
-                clearLineAt(8)
+                clearLineAt(7)
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("--- CYCLE LOGS [")
                 if ENABLE_MONITOR_LOGS then
@@ -878,13 +834,13 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxLogLines = math.max(1, monitorHeight - 10)
+                    local maxLogLines = math.max(1, monitorHeight - 9)
                     for i = 1, maxLogLines do
-                        clearLineAt(8 + i)
+                        clearLineAt(7 + i)
                         if logHistory[i] then monitor.write(logHistory[i]) end
                     end
                 else
-                    clearLineAt(9)
+                    clearLineAt(8)
                     monitor.setTextColor(colors.gray)
                     monitor.write("  (Logs are disabled)")
                     monitor.setTextColor(colors.white)
@@ -906,29 +862,29 @@ local function uiLoop()
                 monitor.write("Computer-bottom: ")
                 if bottomState then
                     monitor.setTextColor(colors.green)
-                    monitor.write("ON ")
+                    monitor.write("AN ")
                 else
                     monitor.setTextColor(colors.lightGray)
-                    monitor.write("OFF ")
+                    monitor.write("AUS ")
                 end
                 monitor.setTextColor(colors.white)
                 local dtText = lastDeltaT and string.format("%.3fs", lastDeltaT) or "--"
-                monitor.write(string.format("| Pulses: %d | Dt: %s", pulseCountTotal, dtText))
+                monitor.write(string.format("| Pulse: %d | Dt: %s", pulseCountTotal, dtText))
                 clearLineAt(4)
                 local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
-                monitor.write(string.format("Target tick: x%d | active: x%d (%dt / %.2fs)",
+                monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
                     lastDesiredMultiplier, ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
                     currentTicks, currentTicks / 20))
 
                 clearLineAt(5)
                 monitor.setTextColor(colors.lightGray)
-                monitor.write("--- INPUT PULSES [")
+                monitor.write("--- EINGANGSIMPULSE [")
                 if ENABLE_MONITOR_LOGS then
                     monitor.setTextColor(colors.green)
-                    monitor.write("ON")
+                    monitor.write("AN")
                 else
                     monitor.setTextColor(colors.red)
-                    monitor.write("OFF")
+                    monitor.write("AUS")
                 end
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("] ---")
@@ -945,7 +901,7 @@ local function uiLoop()
                 else
                     clearLineAt(7)
                     monitor.setTextColor(colors.gray)
-                    monitor.write("  (Logs are disabled)")
+                    monitor.write("  (Logs sind deaktiviert)")
                     monitor.setTextColor(colors.white)
                 end
 
@@ -953,7 +909,7 @@ local function uiLoop()
                     clearLineAt(monitorHeight)
                     monitor.setBackgroundColor(colors.gray)
                     monitor.setTextColor(colors.yellow)
-                    monitor.write("[ Click for Page 1: Main UI ]")
+                    monitor.write("[ Klick für Seite 1: Haupt-UI ]")
                     monitor.setBackgroundColor(colors.black)
                     monitor.setTextColor(colors.white)
                 end
