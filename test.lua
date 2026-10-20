@@ -327,7 +327,7 @@ local function finishPendingAction(postEfficiency, postError)
             if math.abs(delta) >= LOG_JUMP_THRESHOLD then
                 cycleDiag = (delta > 0) and "Jump (+)" or "Jump (-)"
             elseif delta > 0 then
-                cycleDiag = "Rising"
+                cycleDiag = "+"
             elseif delta < 0 then
                 cycleDiag = "Falling"
             end
@@ -340,7 +340,7 @@ local function finishPendingAction(postEfficiency, postError)
                 cycleDiag = "Jump (+)"
                 stuckReason = "Large jump (+): direction maintained"
             else
-                cycleDiag = "Rising"
+                cycleDiag = "+"
                 stuckReason = "Re-evaluation: efficiency increased, direction kept"
             end
         elseif delta < 0 then
