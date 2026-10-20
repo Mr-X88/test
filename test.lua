@@ -1,13 +1,12 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.96 (Intelligente Sprung-Erkennung)
--- Änderungen gegenüber v2.95:
---   * Sprünge erzwingen nicht mehr blind den Step-2-Modus.
---   * Das Skript wertet das Vorzeichen des Sprungs (delta) aus:
---     - Steigt der Wert durch den Sprung (> 0), wird die Richtung beibehalten.
---     - Sinkt der Wert durch den Sprung (< 0), wird die Richtung direkt umgekehrt.
---   * Testschritte (+/-2) werden nur noch bei unklarem Delta genutzt.
+-- BETTER FUSION REACTOR CONTROLLER v2.97 (Alte Schritt-Formel reaktiviert)
+-- Änderungen gegenüber v2.96:
+--   * `calculateStep` nutzt wieder die alte, bewährte Formel
+--     ((0.0927 * diff) + (0.00464 * diff^2)), um Überschießen 
+--     und Fehltritte zu verhindern.
+--   * Intelligente Sprung-Erkennung und starres Idle (>= 95%) bleiben aktiv.
 -- ============================================================
-local SCRIPT_VERSION = "v2.96"
+local SCRIPT_VERSION = "v2.97"
 
 local reactor = nil
 local monitor = nil
@@ -247,12 +246,12 @@ local function getReactorData()
     return logicMode, caseTemp, efficiency, errorLevel, isRunning, dataValid
 end
 
--- ==================== REGELSCHRITT BERECHNEN ====================
+-- ==================== REGELSCHRITT BERECHNEN (ORIGINALE FORMEL) ====================
 local function calculateStep(currentEff)
     local difference = 100 - currentEff
     if difference <= 0 then return 1 end
 
-    local rawStep = 0.022 * (difference ^ 1.5)
+    local rawStep = (0.0927 * difference) + (0.00464 * (difference ^ 2))
     local calculatedStep = math.floor(rawStep)
     if calculatedStep > 15 then calculatedStep = 15 end
     if calculatedStep < 1 then calculatedStep = 1 end
@@ -357,7 +356,6 @@ local function finishPendingAction(postEfficiency, postError)
             end
             stuckReason = string.format("Idle >= %.1f%%: warte auf Unterschreitung", IDLE_THRESHOLD)
         elseif math.abs(delta) >= LOG_JUMP_THRESHOLD then
-            -- Intelligente Auswertung statt blindem Step 2
             if delta > 0 then
                 directionKnown = true
                 directionProbePending = false
@@ -540,7 +538,6 @@ local function backgroundSensorLoop()
                     end
                 end
             else
-                -- INTELLIGENTE SPRUNG-AUSWERTUNG ANSTATT BLINDEM STEP 2
                 if observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
                     local delta = eff - previousSensorEfficiency
                     if delta > 0 then
