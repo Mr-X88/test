@@ -5,6 +5,8 @@
 --   * TEST +/-2 wird nur verwendet, wenn die Richtung unbekannt ist oder eine Messung unverändert bleibt.
 --   * Nach Idle >= 95% wird auf einen echten Sprung gewartet, bevor der Richtungstest erfolgt.
 --   * Neue Schrittformel: 0.142*difference + 0.0036*difference^2, auf nächste Ganzzahl gerundet.
+--   * Timer für Reaktor-Laufzeit und letzten Crash hinzugefügt.
+--   * Monitor-Logs standardmäßig auf deaktiviert gestellt.
 -- ============================================================
 local SCRIPT_VERSION = "v2.96"
 
@@ -32,9 +34,27 @@ local WAKEUP_INTERVAL_TICKS = 40     -- Alle 2 Sekunden
 local WAKEUP_PULSE_TICKS = 10        -- 0,5 Sekunden
 local WAKEUP_STRENGTH = 15
 
-local ENABLE_MONITOR_LOGS = true
+local ENABLE_MONITOR_LOGS = false    -- Standardmäßig auf deaktiviert gestellt
 
 local sides = {"top", "bottom", "left", "right", "front", "back"}
+
+-- ==================== LAUFZEIT & CRASH-TIMER ====================
+local gameStartTime = os.clock()
+local reactorRunSeconds = 0
+local wasRunning = false
+local lastCrashTimeStr = "Nie"
+
+local function formatTime(totalSeconds)
+    totalSeconds = math.floor(totalSeconds)
+    local hours = math.floor(totalSeconds / 3600)
+    local minutes = math.floor((totalSeconds % 3600) / 60)
+    local seconds = totalSeconds % 60
+    if hours > 0 then
+        return string.format("%d:%02d:%02d", hours, minutes, seconds)
+    else
+        return string.format("%02d:%02d", minutes, seconds)
+    end
+end
 
 -- ==================== REGELUNGSVARIABLEN ====================
 local controlDirection = 1           -- 1 = + / erhöhen, -1 = - / senken
@@ -248,12 +268,8 @@ end
 
 -- ==================== REGELSCHRITT BERECHNEN ====================
 local function calculateStep(currentEff)
-    -- Neue empirische Formel aus den bereitgestellten CR/TR/EF-Messwerten.
-    -- Difference bezieht sich auf 100 %, die Schrittstärke bleibt auf 1..15 begrenzt.
     local difference = math.max(0, 100 - currentEff)
     local rawStep = (0.142 * difference) + (0.0036 * (difference ^ 2))
-
-    -- Rundung auf die nächste Ganzzahl statt pauschalem Abrunden.
     local calculatedStep = math.floor(rawStep + 0.5)
     if calculatedStep > 15 then calculatedStep = 15 end
     if calculatedStep < 1 then calculatedStep = 1 end
@@ -321,7 +337,6 @@ local function finishPendingAction(postEfficiency, postError)
     local cycleDiag = "Stillstand"
 
     if action.isProbe then
-        -- Ein TEST +/-2 ist nur zur Richtungsfindung da.
         if delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
@@ -335,7 +350,6 @@ local function finishPendingAction(postEfficiency, postError)
             cycleDiag = "TEST REV"
             stuckReason = "Richtungstest: Gegenrichtung bestätigt"
         else
-            -- Keine messbare Reaktion: Richtung kann nicht abgeleitet werden.
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
@@ -348,7 +362,6 @@ local function finishPendingAction(postEfficiency, postError)
         end
     else
         if postEfficiency >= IDLE_THRESHOLD then
-            -- Wie gewünscht: inaktiv bleiben, aber den nächsten echten Sprung merken.
             waitingForIdleJump = true
             directionProbePending = false
             directionKnown = false
@@ -361,8 +374,6 @@ local function finishPendingAction(postEfficiency, postError)
             end
             stuckReason = string.format("Idle >= %.1f%%: warte auf Sprung", IDLE_THRESHOLD)
         elseif delta > 0 then
-            -- Auch bei einem großen Sprung ist die Richtung durch das Vorzeichen erkennbar.
-            -- Eine große Änderung ist kein automatischer Grund für den TEST +/-2-Modus.
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
@@ -385,7 +396,6 @@ local function finishPendingAction(postEfficiency, postError)
                 stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
             end
         else
-            -- Nur wenn der Messwert exakt unverändert bleibt, ist die Richtung nicht ableitbar.
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
@@ -403,7 +413,7 @@ local function finishPendingAction(postEfficiency, postError)
             math.floor(postError + 0.5), action.cycleSeconds, string.sub(cycleDiag, 1, 10)
         )
         table.insert(logHistory, 1, compactLog)
-        local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
+        local maxLogLines = math.max(1, math.min(monitorHeight - 10, 18))
         while #logHistory > maxLogLines do table.remove(logHistory) end
     end
 
@@ -484,7 +494,7 @@ local function touchListenerLoop()
         if currentPage == 1 then
             if y == monitorHeight then
                 currentPage = 2
-            elseif y == 7 then
+            elseif y == 8 then
                 ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
             end
         elseif currentPage == 2 then
@@ -518,14 +528,22 @@ local function backgroundSensorLoop()
 
             if eff > 0 then hasEverRun = true end
 
+            -- Reaktor-Laufzeit und Crash-Tracking aktualisieren
+            local isRunningNow = running and eff > 0
+            if isRunningNow then
+                reactorRunSeconds = reactorRunSeconds + pollSeconds
+            end
+
+            if wasRunning and (eff == 0 or not running) and hasEverRun then
+                lastCrashTimeStr = formatTime(os.clock() - gameStartTime)
+            end
+            wasRunning = isRunningNow
+
             local previousSensorEfficiency = lastSensorEF
             local observedJump = previousSensorEfficiency ~= nil and
                 math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
 
             if waitingForIdleJump then
-                -- Nach Erreichen von 95 % bleibt die Regelung inaktiv, bis wirklich
-                -- ein Sprung (mindestens JUMP_THRESHOLD) gemessen wurde. Erst dann
-                -- wird der +/-2-Test ausgeführt, auch wenn EF noch >= 95 % beträgt.
                 if observedJump then
                     waitingForIdleJump = false
                     directionProbePending = true
@@ -534,9 +552,6 @@ local function backgroundSensorLoop()
                 end
             elseif observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
                 if directionKnown then
-                    -- Ein Sprung wird mit dem 4t-Sensor anhand seines Vorzeichens
-                    -- ausgewertet. Positiv: bisherige Richtung halten; negativ:
-                    -- Richtung umkehren. Große Sprünge lösen nicht pauschal TEST +/-2 aus.
                     directionProbePending = false
                     if eff > previousSensorEfficiency then
                         stuckReason = "Sprung (+): Richtung aus Sensor bestätigt"
@@ -544,20 +559,16 @@ local function backgroundSensorLoop()
                         controlDirection = -controlDirection
                         stuckReason = "Sprung (-): Richtung aus Sensor umgekehrt"
                     else
-                        -- Sicherheits-Fallback: falls trotz Sprung keine Richtung ableitbar ist.
                         directionProbePending = true
                         directionKnown = false
                         stuckReason = "Sprung uneindeutig: Richtungstest +/-2"
                     end
                 else
-                    -- Nur wenn die bisherige Richtung unbekannt ist, wird getestet.
                     directionProbePending = true
                     stuckReason = "Sprung: Richtung unbekannt, Test +/-2"
                 end
             end
 
-            -- Nur außerhalb einer laufenden Nachmessung in den Idle-Merker wechseln.
-            -- Die Aktion, die gerade die 95%-Grenze erreicht, wird zuerst ausgewertet.
             if eff >= IDLE_THRESHOLD and not directionProbePending and pendingAction == nil then
                 waitingForIdleJump = true
             end
@@ -826,13 +837,16 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 clearLineAt(6)
+                monitor.write(string.format("Laufzeit: %s | Crash: %s", formatTime(reactorRunSeconds), lastCrashTimeStr))
+
+                clearLineAt(7)
                 local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
                 monitor.write(string.format("Sensor: %dt / %.2fs | Faktor x%d%s",
                     currentTicks, currentTicks / 20,
                     ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
                     ENABLE_LOW_PERF_MODE and " AUTO" or " FIX"))
 
-                clearLineAt(7)
+                clearLineAt(8)
                 monitor.setTextColor(colors.lightGray)
                 monitor.write("--- ZYKLEN-LOGS [")
                 if ENABLE_MONITOR_LOGS then
@@ -847,13 +861,13 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 if ENABLE_MONITOR_LOGS then
-                    local maxLogLines = math.max(1, monitorHeight - 9)
+                    local maxLogLines = math.max(1, monitorHeight - 10)
                     for i = 1, maxLogLines do
-                        clearLineAt(7 + i)
+                        clearLineAt(8 + i)
                         if logHistory[i] then monitor.write(logHistory[i]) end
                     end
                 else
-                    clearLineAt(8)
+                    clearLineAt(9)
                     monitor.setTextColor(colors.gray)
                     monitor.write("  (Logs sind deaktiviert)")
                     monitor.setTextColor(colors.white)
