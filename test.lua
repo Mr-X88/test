@@ -1,10 +1,12 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.98 (Neue angepasste Formel)
--- Änderungen gegenüber v2.97:
---   * `calculateStep` verwendet nun die neue Formel:
---     (0.142 * difference) + (0.0036 * (difference ^ 2))
+-- BETTER FUSION REACTOR CONTROLLER v2.96 (Sprungerkennung + kalibrierte Schrittformel)
+-- Änderungen gegenüber v2.95:
+--   * Sensor-Sprünge nutzen bei bekannter Richtung die 4t-Messung statt pauschal TEST +/-2.
+--   * TEST +/-2 wird nur verwendet, wenn die Richtung unbekannt ist oder eine Messung unverändert bleibt.
+--   * Nach Idle >= 95% wird auf einen echten Sprung gewartet, bevor der Richtungstest erfolgt.
+--   * Neue Schrittformel: 0.142*difference + 0.0036*difference^2, auf nächste Ganzzahl gerundet.
 -- ============================================================
-local SCRIPT_VERSION = "v2.98"
+local SCRIPT_VERSION = "v2.96"
 
 local reactor = nil
 local monitor = nil
@@ -55,7 +57,7 @@ local pendingAction = nil           -- genau eine Aktion wartet auf ihre Nachmes
 -- Richtungsfindung bei unbekannter Wirkung und nach Idle >= 95%.
 -- waitingForIdleJump hält die normale Regelung an, bis ein echter Messsprung erkannt wird.
 local directionProbePending = false
-local directionKnown = true
+local directionKnown = false          -- Erst nach einer auswertbaren Messung als bestätigt markieren
 local waitingForIdleJump = false
 
 -- Deadlock-Nudge & Log-Flag
@@ -244,13 +246,15 @@ local function getReactorData()
     return logicMode, caseTemp, efficiency, errorLevel, isRunning, dataValid
 end
 
--- ==================== REGELSCHRITT BERECHNEN (NEUE FORMEL) ====================
+-- ==================== REGELSCHRITT BERECHNEN ====================
 local function calculateStep(currentEff)
-    local difference = 100 - currentEff
-    if difference <= 0 then return 1 end
-
+    -- Neue empirische Formel aus den bereitgestellten CR/TR/EF-Messwerten.
+    -- Difference bezieht sich auf 100 %, die Schrittstärke bleibt auf 1..15 begrenzt.
+    local difference = math.max(0, 100 - currentEff)
     local rawStep = (0.142 * difference) + (0.0036 * (difference ^ 2))
-    local calculatedStep = math.floor(rawStep)
+
+    -- Rundung auf die nächste Ganzzahl statt pauschalem Abrunden.
+    local calculatedStep = math.floor(rawStep + 0.5)
     if calculatedStep > 15 then calculatedStep = 15 end
     if calculatedStep < 1 then calculatedStep = 1 end
     return calculatedStep
@@ -317,6 +321,7 @@ local function finishPendingAction(postEfficiency, postError)
     local cycleDiag = "Stillstand"
 
     if action.isProbe then
+        -- Ein TEST +/-2 ist nur zur Richtungsfindung da.
         if delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
@@ -330,6 +335,7 @@ local function finishPendingAction(postEfficiency, postError)
             cycleDiag = "TEST REV"
             stuckReason = "Richtungstest: Gegenrichtung bestätigt"
         else
+            -- Keine messbare Reaktion: Richtung kann nicht abgeleitet werden.
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
@@ -342,6 +348,7 @@ local function finishPendingAction(postEfficiency, postError)
         end
     else
         if postEfficiency >= IDLE_THRESHOLD then
+            -- Wie gewünscht: inaktiv bleiben, aber den nächsten echten Sprung merken.
             waitingForIdleJump = true
             directionProbePending = false
             directionKnown = false
@@ -352,39 +359,38 @@ local function finishPendingAction(postEfficiency, postError)
             elseif delta < 0 then
                 cycleDiag = "Sinkt"
             end
-            stuckReason = string.format("Idle >= %.1f%%: warte auf Unterschreitung", IDLE_THRESHOLD)
-        elseif math.abs(delta) >= LOG_JUMP_THRESHOLD then
-            if delta > 0 then
-                directionKnown = true
-                directionProbePending = false
+            stuckReason = string.format("Idle >= %.1f%%: warte auf Sprung", IDLE_THRESHOLD)
+        elseif delta > 0 then
+            -- Auch bei einem großen Sprung ist die Richtung durch das Vorzeichen erkennbar.
+            -- Eine große Änderung ist kein automatischer Grund für den TEST +/-2-Modus.
+            controlDirection = action.direction
+            directionProbePending = false
+            directionKnown = true
+            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
                 cycleDiag = "Sprung (+)"
-                stuckReason = "Großer Sprung (+): Richtung bestätigt"
+                stuckReason = "Großer Sprung (+): Richtung beibehalten"
             else
-                controlDirection = -controlDirection
-                directionKnown = true
-                directionProbePending = false
+                cycleDiag = "Steigt"
+                stuckReason = "Nachmessung: Effizienz gestiegen, Richtung gehalten"
+            end
+        elseif delta < 0 then
+            controlDirection = -action.direction
+            directionProbePending = false
+            directionKnown = true
+            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
                 cycleDiag = "Sprung (-)"
                 stuckReason = "Großer Sprung (-): Richtung umgekehrt"
+            else
+                cycleDiag = "Sinkt"
+                stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
             end
         else
-            if delta < 0 then
-                controlDirection = -action.direction
-                directionKnown = true
-                stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
-            elseif delta > 0 then
-                controlDirection = action.direction
-                directionKnown = true
-                stuckReason = "Nachmessung: Effizienz gestiegen, Richtung gehalten"
-            else
-                controlDirection = action.direction
-                stuckReason = "Nachmessung: kaum Änderung, Richtung gehalten"
-            end
-
-            if delta > 0 then
-                cycleDiag = "Steigt"
-            elseif delta < 0 then
-                cycleDiag = "Sinkt"
-            end
+            -- Nur wenn der Messwert exakt unverändert bleibt, ist die Richtung nicht ableitbar.
+            controlDirection = -action.direction
+            directionProbePending = true
+            directionKnown = false
+            cycleDiag = "TEST?"
+            stuckReason = "Keine Änderung: Richtungstest +/-2 vorgemerkt"
         end
     end
 
@@ -517,45 +523,42 @@ local function backgroundSensorLoop()
                 math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
 
             if waitingForIdleJump then
-                if eff < IDLE_THRESHOLD then
+                -- Nach Erreichen von 95 % bleibt die Regelung inaktiv, bis wirklich
+                -- ein Sprung (mindestens JUMP_THRESHOLD) gemessen wurde. Erst dann
+                -- wird der +/-2-Test ausgeführt, auch wenn EF noch >= 95 % beträgt.
+                if observedJump then
                     waitingForIdleJump = false
-                    local delta = previousSensorEfficiency and (eff - previousSensorEfficiency) or 0
-                    if delta > 0 then
-                        directionKnown = true
-                        directionProbePending = false
-                        stuckReason = "Idle verlassen (+): Richtung bestätigt"
-                    elseif delta < 0 then
-                        controlDirection = -controlDirection
-                        directionKnown = true
-                        directionProbePending = false
-                        stuckReason = "Idle verlassen (-): Richtung umgekehrt"
-                    else
-                        directionProbePending = true
-                        directionKnown = false
-                        stuckReason = "Idle verlassen: Richtung unklar, Test +/-2"
-                    end
+                    directionProbePending = true
+                    directionKnown = false
+                    stuckReason = "Idle-Sprung erkannt: Richtungstest +/-2"
                 end
-            else
-                if observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
-                    local delta = eff - previousSensorEfficiency
-                    if delta > 0 then
-                        directionKnown = true
-                        directionProbePending = false
-                        stuckReason = "Messsprung (+): Richtung bestätigt"
-                    elseif delta < 0 then
+            elseif observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
+                if directionKnown then
+                    -- Ein Sprung wird mit dem 4t-Sensor anhand seines Vorzeichens
+                    -- ausgewertet. Positiv: bisherige Richtung halten; negativ:
+                    -- Richtung umkehren. Große Sprünge lösen nicht pauschal TEST +/-2 aus.
+                    directionProbePending = false
+                    if eff > previousSensorEfficiency then
+                        stuckReason = "Sprung (+): Richtung aus Sensor bestätigt"
+                    elseif eff < previousSensorEfficiency then
                         controlDirection = -controlDirection
-                        directionKnown = true
-                        directionProbePending = false
-                        stuckReason = "Messsprung (-): Richtung umgekehrt"
+                        stuckReason = "Sprung (-): Richtung aus Sensor umgekehrt"
                     else
+                        -- Sicherheits-Fallback: falls trotz Sprung keine Richtung ableitbar ist.
                         directionProbePending = true
                         directionKnown = false
-                        stuckReason = "Sprung unklar: Test +/-2 ausstehend"
+                        stuckReason = "Sprung uneindeutig: Richtungstest +/-2"
                     end
+                else
+                    -- Nur wenn die bisherige Richtung unbekannt ist, wird getestet.
+                    directionProbePending = true
+                    stuckReason = "Sprung: Richtung unbekannt, Test +/-2"
                 end
             end
 
-            if eff >= IDLE_THRESHOLD and not directionProbePending then
+            -- Nur außerhalb einer laufenden Nachmessung in den Idle-Merker wechseln.
+            -- Die Aktion, die gerade die 95%-Grenze erreicht, wird zuerst ausgewertet.
+            if eff >= IDLE_THRESHOLD and not directionProbePending and pendingAction == nil then
                 waitingForIdleJump = true
             end
 
@@ -613,7 +616,7 @@ local function backgroundSensorLoop()
             elseif directionProbePending then
                 stuckReason = directionKnown and "Sprung: Testschritt +/-2 ausstehend" or "Richtung unklar: Test +/-2 ausstehend"
             elseif waitingForIdleJump then
-                stuckReason = string.format("Idle >= %.1f%%: warte auf Unterschreitung", IDLE_THRESHOLD)
+                stuckReason = string.format("Idle >= %.1f%%: warte auf Sprung", IDLE_THRESHOLD)
             elseif eff >= IDLE_THRESHOLD then
                 stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
             else
@@ -728,7 +731,7 @@ local function executionLoop()
                 elseif directionProbePending then
                     stuckReason = "Richtungstest +/-2 ausstehend"
                 elseif waitingForIdleJump then
-                    stuckReason = "Idle: warte auf Unterschreitung"
+                    stuckReason = "Idle: warte auf Sprung"
                 elseif currentEfficiency >= IDLE_THRESHOLD then
                     stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
                 elseif not liveIsRunning or currentEfficiency == 0 then
