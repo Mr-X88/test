@@ -673,7 +673,7 @@ local function executionLoop()
                     local signChar = (actionDirection == 1) and "+" or "-"
                     local stepText
                     if probeAction then
-                        stepText = "TEST" .. signChar .. "2"
+                        stepText = "Wf" .. signChar .. "2"
                     else
                         local loggedStrength = actualStrength or effectiveStep
                         stepText = signChar .. formatStep(loggedStrength)
