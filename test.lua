@@ -1,5 +1,5 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.911 (Sprung-Probe nach unklarer Richtung)
+-- BETTER FUSION REACTOR CONTROLLER v2.912 (Sprung-Probe nach unklarer Richtung)
 -- Änderungen gegenüber v2.90:
 --   * Syntaxfehler in Zeile der Impulszeilen-Berechnung behoben.
 --   * Stuck-Erkennung korrigiert: `not pendingAction` entfernt,
@@ -11,7 +11,7 @@
 --   * Die Richtung wird nach der Nachmessung bewertet; bei unklarem Ergebnis wird die Gegenrichtung getestet.
 --   * Low-Perf-Schwellenwerte und übrige Features bleiben erhalten.
 -- ============================================================
-local SCRIPT_VERSION = "v2.91"
+local SCRIPT_VERSION = "v2.912"
 
 local reactor = nil
 local monitor = nil
@@ -29,7 +29,7 @@ local pulseStreakCount = 0
 
 local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
-local EFF_TOLERANCE = 0.3            -- Toleranz für Trend-/Erfolgsprüfung
+local EFF_TOLERANCE = 0.1            -- Toleranz für Trend-/Erfolgsprüfung
 local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
 local ACTION_EVAL_DELAY = 1.5        -- Nachmessung nach einer Korrektur (Richtung erst danach bewerten)
 
