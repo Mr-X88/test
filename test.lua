@@ -1,12 +1,13 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.99.1 (Stable Snapshot + English UI)
+-- BETTER FUSION REACTOR CONTROLLER v2.99.2 (Optimized Logs & English UI)
 -- Changes in this version:
---   * All descriptions, comments, and variables translated to English.
+--   * Redesigned monitor cycle logs for better readability and clarity (e.g., #001 | St:+12.5 | Eff:56->49% | Err:24 (0s) | Falling).
+--   * All descriptions, comments, and variables in English.
 --   * Automatic peripheral re-scan and system reboot on persistent SENSOR? errors.
 --   * Removed redstone relay step control fallback and related calculations.
 --   * Redstone relay outputs a signal when the reactor stops or crashes (EF/ER = 0).
 -- ============================================================
-local SCRIPT_VERSION = "v2.99.1"
+local SCRIPT_VERSION = "v2.99.2"
 
 local reactor = nil
 local monitor = nil
@@ -180,7 +181,6 @@ end
 
 local function updateCrashRelay()
     if not relay or wakeupPulseActive then return end
-    -- Output redstone signal if reactor has run before and is now stopped or crashed (EF == 0 or not running)
     local isCrashedOrStopped = hasEverRun and (not liveIsRunning or liveEF == 0)
     local signalValue = isCrashedOrStopped and 15 or 0
     setRelayAll(signalValue, true)
@@ -302,26 +302,26 @@ local function finishPendingAction(postEfficiency, postError)
 
     local action = pendingAction
     local delta = postEfficiency - action.beforeEfficiency
-    local cycleDiag = "Stalled"
+    local cycleDiag = "Stable"
 
     if action.isProbe then
         if delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "TEST OK"
+            cycleDiag = "Test OK"
             stuckReason = "Direction test: direction confirmed"
         elseif delta < 0 then
             controlDirection = -action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "TEST REV"
+            cycleDiag = "Test Rev"
             stuckReason = "Direction test: opposite direction confirmed"
         else
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
-            cycleDiag = "TEST?"
+            cycleDiag = "Test?"
             stuckReason = "Direction unclear: re-probe +/-2 scheduled"
         end
 
@@ -367,18 +367,18 @@ local function finishPendingAction(postEfficiency, postError)
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
-            cycleDiag = "TEST?"
+            cycleDiag = "Test?"
             stuckReason = "No change: direction test +/-2 scheduled"
         end
     end
 
-    if action.usedNudge then cycleDiag = "STUCK" end
+    if action.usedNudge then cycleDiag = "Nudge" end
 
     if ENABLE_MONITOR_LOGS then
         local compactLog = string.format(
-            "#%03d|%s|%.0f>%.0f|ER:%d/%ds|%s",
+            "#%03d | St:%s | Eff:%.0f->%.0f%% | Err:%.0f (%ds) | %s",
             action.id, action.stepText, action.beforeEfficiency, postEfficiency,
-            math.floor(postError + 0.5), action.cycleSeconds, string.sub(cycleDiag, 1, 10)
+            postError, action.cycleSeconds, string.sub(cycleDiag, 1, 12)
         )
         table.insert(logHistory, 1, compactLog)
         local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
