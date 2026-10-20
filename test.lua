@@ -1,14 +1,4 @@
--- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.99.3 (Compact Logs & English UI)
--- Changes in this version:
---   * Removed | separators and excess spaces from monitor cycle logs.
---   * Changed "Test Rev" diagnostic text to "TR Jump".
---   * All descriptions, comments, and variables in English.
---   * Automatic peripheral re-scan and system reboot on persistent SENSOR? errors.
---   * Removed redstone relay step control fallback and related calculations.
---   * Redstone relay outputs a signal when the reactor stops or crashes (EF/ER = 0).
--- ============================================================
-local SCRIPT_VERSION = "v2.99.3"
+local SCRIPT_VERSION = "v3.00"
 
 local reactor = nil
 local monitor = nil
@@ -310,7 +300,7 @@ local function finishPendingAction(postEfficiency, postError)
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "Test OK"
+            cycleDiag = "Wayfinding"
             stuckReason = "Direction test: direction confirmed"
         elseif delta < 0 then
             controlDirection = -action.direction
@@ -602,9 +592,9 @@ local function backgroundSensorLoop()
                     if math.abs(delta) >= JUMP_THRESHOLD then
                         stuckReason = (delta < 0) and "Sensor jump (-)" or "Sensor jump (+)"
                     elseif delta > 0 then
-                        stuckReason = "Rising"
+                        stuckReason = "+"
                     elseif delta < 0 then
-                        stuckReason = "Falling"
+                        stuckReason = "-"
                     else
                         stuckReason = "Stalled"
                     end
