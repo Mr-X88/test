@@ -1,5 +1,9 @@
+-- v2.99 TEST: Nutzt für die Schrittberechnung den zuletzt nach zwei
+-- unveränderten Sensorintervallen bestätigten EF-Snapshot. Wenn EF vor der
+-- Aktion erneut wechselt, wird der Snapshot verworfen und neu stabilisiert.
+-- EXECUTION_COOLDOWN bleibt unverändert.
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.98 TEST (Direkt-API mit Dezimal-Schritten)
+-- BETTER FUSION REACTOR CONTROLLER v2.99 TEST (Direkt-API mit Dezimal-Schritten)
 -- Basis: v2.96; beibehaltene Änderungen:
 --   * Sensor-Sprünge nutzen bei bekannter Richtung die 4t-Messung statt pauschal TEST +/-2.
 --   * TEST +/-2 wird nur verwendet, wenn die Richtung unbekannt ist oder eine Messung unverändert bleibt.
@@ -15,7 +19,7 @@
 --   * Der Redstone-Fallback rundet weiterhin auf eine ganze Signalstärke von 1 bis 15.
 --   * Monitor/Logs formatieren Schrittwerte kompakt, z.B. +0.82 statt +1.
 -- ============================================================
-local SCRIPT_VERSION = "v2.98 TEST"
+local SCRIPT_VERSION = "v2.99 TEST"
 
 local reactor = nil
 local monitor = nil
@@ -33,7 +37,7 @@ local pulseStreakCount = 0
 
 local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
-local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
+local EXECUTION_COOLDOWN = 3.0       -- Unverändert: Mindestpause zwischen Regelschritten
 local ACTION_EVAL_DELAY = 1.5        -- Nachmessung nach einer Korrektur (Richtung erst danach bewerten)
 
 local ENABLE_WAKEUP_PULSE = true
@@ -60,6 +64,10 @@ local secondsSinceLastGo = 0
 local executionGo = false
 local lastPollEF = nil
 local unchangedPollCount = 0
+-- Snapshot des letzten EF-Werts, der nach zwei unveränderten Sensorintervallen
+-- bestätigt wurde. Die Signalstärke wird genau aus diesem Wert berechnet.
+local stableExecutionEfficiency = nil
+local stableExecutionAt = nil
 local lastExecutionTime = -EXECUTION_COOLDOWN
 local pendingAction = nil           -- genau eine Aktion wartet auf ihre Nachmessung
 
@@ -625,11 +633,20 @@ local function backgroundSensorLoop()
             if lastPollEF ~= nil and eff == lastPollEF then
                 unchangedPollCount = unchangedPollCount + 1
                 if unchangedPollCount >= 2 then
+                    -- Zwei unveränderte Intervalle bestätigt: EF genau hier sichern.
+                    -- Bei Multiplikator x1 entspricht jedes Intervall 4 Ticks (0,2 s).
                     executionGo = true
+                    stableExecutionEfficiency = eff
+                    stableExecutionAt = os.clock()
                     unchangedPollCount = 0
                 end
             else
                 unchangedPollCount = 0
+                -- Der gespeicherte Wert ist nicht mehr aktuell: erst erneut Stabilität
+                -- feststellen, statt mit einem alten EF-Wert eine Stärke zu berechnen.
+                executionGo = false
+                stableExecutionEfficiency = nil
+                stableExecutionAt = nil
             end
             lastPollEF = eff
 
@@ -674,6 +691,9 @@ local function backgroundSensorLoop()
         else
             liveDataValid = false
             executionGo = false
+            stableExecutionEfficiency = nil
+            stableExecutionAt = nil
+            unchangedPollCount = 0
             stuckReason = "Sensor-Lesefehler"
         end
 
@@ -686,10 +706,16 @@ local function executionLoop()
     while true do
         local now = os.clock()
 
-        if executionGo and not pendingAction and (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
+        if executionGo and stableExecutionEfficiency ~= nil and
+           stableExecutionEfficiency == liveEF and not pendingAction and
+           (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
             executionGo = false
 
-            local currentEfficiency = liveEF
+            -- Für Formel, Schrittprotokoll und Vorher/Nachher-Vergleich wird derselbe
+            -- letzte stabil bestätigte EF-Wert benutzt, nicht ein späterer Live-Wert.
+            local currentEfficiency = stableExecutionEfficiency
+            stableExecutionEfficiency = nil
+            stableExecutionAt = nil
             local errorLevel = liveER
             local probeAction = directionProbePending
             local normalControlAllowed = currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump
