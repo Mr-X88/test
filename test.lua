@@ -1,10 +1,13 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.95 (Ohne EFF_TOLERANCE)
--- Änderungen gegenüber v2.94:
---   * EFF_TOLERANCE komplett entfernt. Richtungs- und Trendprüfungen
---   * werten nun jede direkte Änderung (> 0 oder < 0) aus.
+-- BETTER FUSION REACTOR CONTROLLER v2.96 (Intelligente Sprung-Erkennung)
+-- Änderungen gegenüber v2.95:
+--   * Sprünge erzwingen nicht mehr blind den Step-2-Modus.
+--   * Das Skript wertet das Vorzeichen des Sprungs (delta) aus:
+--     - Steigt der Wert durch den Sprung (> 0), wird die Richtung beibehalten.
+--     - Sinkt der Wert durch den Sprung (< 0), wird die Richtung direkt umgekehrt.
+--   * Testschritte (+/-2) werden nur noch bei unklarem Delta genutzt.
 -- ============================================================
-local SCRIPT_VERSION = "v2.95"
+local SCRIPT_VERSION = "v2.96"
 
 local reactor = nil
 local monitor = nil
@@ -354,10 +357,19 @@ local function finishPendingAction(postEfficiency, postError)
             end
             stuckReason = string.format("Idle >= %.1f%%: warte auf Unterschreitung", IDLE_THRESHOLD)
         elseif math.abs(delta) >= LOG_JUMP_THRESHOLD then
-            directionProbePending = true
-            directionKnown = false
-            cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
-            stuckReason = "Großer Sprung: Richtungstest +/-2 vorgemerkt"
+            -- Intelligente Auswertung statt blindem Step 2
+            if delta > 0 then
+                directionKnown = true
+                directionProbePending = false
+                cycleDiag = "Sprung (+)"
+                stuckReason = "Großer Sprung (+): Richtung bestätigt"
+            else
+                controlDirection = -controlDirection
+                directionKnown = true
+                directionProbePending = false
+                cycleDiag = "Sprung (-)"
+                stuckReason = "Großer Sprung (-): Richtung umgekehrt"
+            end
         else
             if delta < 0 then
                 controlDirection = -action.direction
@@ -511,15 +523,40 @@ local function backgroundSensorLoop()
             if waitingForIdleJump then
                 if eff < IDLE_THRESHOLD then
                     waitingForIdleJump = false
-                    directionProbePending = true
-                    directionKnown = false
-                    stuckReason = "Idle verlassen (< 95%): Richtungstest +/-2"
+                    local delta = previousSensorEfficiency and (eff - previousSensorEfficiency) or 0
+                    if delta > 0 then
+                        directionKnown = true
+                        directionProbePending = false
+                        stuckReason = "Idle verlassen (+): Richtung bestätigt"
+                    elseif delta < 0 then
+                        controlDirection = -controlDirection
+                        directionKnown = true
+                        directionProbePending = false
+                        stuckReason = "Idle verlassen (-): Richtung umgekehrt"
+                    else
+                        directionProbePending = true
+                        directionKnown = false
+                        stuckReason = "Idle verlassen: Richtung unklar, Test +/-2"
+                    end
                 end
             else
+                -- INTELLIGENTE SPRUNG-AUSWERTUNG ANSTATT BLINDEM STEP 2
                 if observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
-                    directionProbePending = true
-                    directionKnown = false
-                    stuckReason = "Sprung erkannt: Richtungstest +/-2"
+                    local delta = eff - previousSensorEfficiency
+                    if delta > 0 then
+                        directionKnown = true
+                        directionProbePending = false
+                        stuckReason = "Messsprung (+): Richtung bestätigt"
+                    elseif delta < 0 then
+                        controlDirection = -controlDirection
+                        directionKnown = true
+                        directionProbePending = false
+                        stuckReason = "Messsprung (-): Richtung umgekehrt"
+                    else
+                        directionProbePending = true
+                        directionKnown = false
+                        stuckReason = "Sprung unklar: Test +/-2 ausstehend"
+                    end
                 end
             end
 
