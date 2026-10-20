@@ -1,12 +1,10 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v2.94 (Idle-Logik korrigiert)
--- Änderungen gegenüber v2.93:
---   * Das Skript bleibt nun im Idle-Modus (>= 95%) absolut starr 
---     und wacht bei Sprüngen in diesem Bereich NICHT mehr auf.
---   * Erst wenn der EF-Wert wieder unter 95% fällt, wird 
---     waitingForIdleJump aufgehoben und der Testschritt (+/-2) erzwungen.
+-- BETTER FUSION REACTOR CONTROLLER v2.95 (Ohne EFF_TOLERANCE)
+-- Änderungen gegenüber v2.94:
+--   * EFF_TOLERANCE komplett entfernt. Richtungs- und Trendprüfungen
+--   * werten nun jede direkte Änderung (> 0 oder < 0) aus.
 -- ============================================================
-local SCRIPT_VERSION = "v2.94"
+local SCRIPT_VERSION = "v2.95"
 
 local reactor = nil
 local monitor = nil
@@ -24,7 +22,6 @@ local pulseStreakCount = 0
 
 local JUMP_THRESHOLD = 3.0
 local LOG_JUMP_THRESHOLD = 16.0
-local EFF_TOLERANCE = 0.1            -- Toleranz für Trend-/Erfolgsprüfung
 local EXECUTION_COOLDOWN = 3.0       -- Mindestpause zwischen Regelschritten
 local ACTION_EVAL_DELAY = 1.5        -- Nachmessung nach einer Korrektur (Richtung erst danach bewerten)
 
@@ -252,7 +249,6 @@ local function calculateStep(currentEff)
     local difference = 100 - currentEff
     if difference <= 0 then return 1 end
 
-    -- Potenzformel für präzise Schrittstärkenanpassung
     local rawStep = 0.022 * (difference ^ 1.5)
     local calculatedStep = math.floor(rawStep)
     if calculatedStep > 15 then calculatedStep = 15 end
@@ -321,13 +317,13 @@ local function finishPendingAction(postEfficiency, postError)
     local cycleDiag = "Stillstand"
 
     if action.isProbe then
-        if delta > EFF_TOLERANCE then
+        if delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
             cycleDiag = "TEST OK"
             stuckReason = "Richtungstest: Richtung bestätigt"
-        elseif delta < -EFF_TOLERANCE then
+        elseif delta < 0 then
             controlDirection = -action.direction
             directionProbePending = false
             directionKnown = true
@@ -351,9 +347,9 @@ local function finishPendingAction(postEfficiency, postError)
             directionKnown = false
             if math.abs(delta) >= LOG_JUMP_THRESHOLD then
                 cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
-            elseif delta > EFF_TOLERANCE then
+            elseif delta > 0 then
                 cycleDiag = "Steigt"
-            elseif delta < -EFF_TOLERANCE then
+            elseif delta < 0 then
                 cycleDiag = "Sinkt"
             end
             stuckReason = string.format("Idle >= %.1f%%: warte auf Unterschreitung", IDLE_THRESHOLD)
@@ -363,11 +359,11 @@ local function finishPendingAction(postEfficiency, postError)
             cycleDiag = (delta > 0) and "Sprung (+)" or "Sprung (-)"
             stuckReason = "Großer Sprung: Richtungstest +/-2 vorgemerkt"
         else
-            if delta < -EFF_TOLERANCE then
+            if delta < 0 then
                 controlDirection = -action.direction
                 directionKnown = true
                 stuckReason = "Nachmessung: Effizienz gesunken, Richtung umgekehrt"
-            elseif delta > EFF_TOLERANCE then
+            elseif delta > 0 then
                 controlDirection = action.direction
                 directionKnown = true
                 stuckReason = "Nachmessung: Effizienz gestiegen, Richtung gehalten"
@@ -376,9 +372,9 @@ local function finishPendingAction(postEfficiency, postError)
                 stuckReason = "Nachmessung: kaum Änderung, Richtung gehalten"
             end
 
-            if delta > EFF_TOLERANCE then
+            if delta > 0 then
                 cycleDiag = "Steigt"
-            elseif delta < -EFF_TOLERANCE then
+            elseif delta < 0 then
                 cycleDiag = "Sinkt"
             end
         end
@@ -512,9 +508,6 @@ local function backgroundSensorLoop()
             local observedJump = previousSensorEfficiency ~= nil and
                 math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
 
-            -- NEUE IDLE-LOGIK:
-            -- 1. Wenn wir im Idle-Modus sind (>= 95%), WACHEN WIR NICHT AUF, 
-            --    selbst wenn es Sprünge gibt. Erst wenn der Wert UNTER 95% fällt:
             if waitingForIdleJump then
                 if eff < IDLE_THRESHOLD then
                     waitingForIdleJump = false
@@ -523,7 +516,6 @@ local function backgroundSensorLoop()
                     stuckReason = "Idle verlassen (< 95%): Richtungstest +/-2"
                 end
             else
-                -- 2. Normale Sprung-Erkennung nur, wenn WIR NICHT IM IDLE SIND (< 95%):
                 if observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
                     directionProbePending = true
                     directionKnown = false
@@ -531,12 +523,10 @@ local function backgroundSensorLoop()
                 end
             end
 
-            -- Wenn EF >= 95% erreicht, Idle aktivieren (falls nicht gerade ein Test läuft)
             if eff >= IDLE_THRESHOLD and not directionProbePending then
                 waitingForIdleJump = true
             end
 
-            -- Stuck-Erkennung aktiv auch während pendingAction, um Zählen bei Fixwerten zu sichern
             if not stuckNudgeActive and running and
                eff > 0 and eff < IDLE_THRESHOLD and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
@@ -599,9 +589,9 @@ local function backgroundSensorLoop()
                     local delta = eff - lastSensorEF
                     if math.abs(delta) >= JUMP_THRESHOLD then
                         stuckReason = (delta < 0) and "Messsprung (-)" or "Messsprung (+)"
-                    elseif delta > EFF_TOLERANCE then
+                    elseif delta > 0 then
                         stuckReason = "Steigt"
-                    elseif delta < -EFF_TOLERANCE then
+                    elseif delta < 0 then
                         stuckReason = "Sinkt"
                     else
                         stuckReason = "Stillstand"
@@ -881,8 +871,10 @@ local function uiLoop()
                 if ENABLE_MONITOR_LOGS then
                     local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
                     for i = 1, maxPulseLines do
-                        clearLineAt(5 + i)
-                        if pulseLogHistory[i] then monitor.write(pulseLogHistory[i]) end
+                        if pulseLogHistory[i] then
+                            clearLineAt(5 + i)
+                            monitor.write(pulseLogHistory[i])
+                        end
                     end
                 else
                     clearLineAt(7)
