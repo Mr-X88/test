@@ -1,13 +1,13 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.16
--- Changes in v3.16:
---   * Captures EF/ER when the existing EF stability check confirms an unchanged reading.
---   * Does not require EF to reach IDLE_THRESHOLD for snapshot capture.
---   * Keeps the previous settled snapshot through any EF movement, then refreshes it
---     only after the existing stability check confirms the new settled value.
---   * Control logic, cooldown, formula, idle handling, and action timing are otherwise unchanged.
+-- BETTER FUSION REACTOR CONTROLLER v3.17
+-- Changes in v3.17:
+--   * Captures EF/ER after the existing unchanged-EF stability check at any EF level.
+--   * Preserves that snapshot for deferred logs at a detected falling jump,
+--     instead of attaching it on the first EF movement; no 95% capture threshold.
+--   * A measured large delta is labelled Jump even for a direction-probe row.
+--   * Control decisions, cooldown, formula, sensor stability check, and action timing remain unchanged.
 -- ============================================================
-local SCRIPT_VERSION = "v3.16"
+local SCRIPT_VERSION = "v3.17"
 
 local reactor = nil
 local monitor = nil
@@ -57,8 +57,8 @@ local stableExecutionAt = nil
 local lastExecutionTime = -EXECUTION_COOLDOWN
 local pendingAction = nil           -- Exactly one action waiting for re-evaluation
 local deferredCycleLog = nil        -- Previous completed action; emitted on the next action's follow-up reading
--- Cycle-end EF/ER snapshot: captured by the existing unchanged-EF stability check,
--- regardless of IDLE_THRESHOLD. Kept through EF movement until the new value settles.
+-- Settled EF/ER snapshot. Refreshed only after the existing EF stability check succeeds.
+-- Kept until the next idle jump so the deferred log can report the pre-jump cycle end.
 local idleCycleEF = nil
 local idleCycleER = nil
 local idleSnapshotRefreshPending = false
@@ -325,9 +325,7 @@ end
 local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     if not entry or not ENABLE_MONITOR_LOGS then return end
 
-    -- If this action belongs to a cycle that reached a stable idle peak,
-    -- prefer that captured cycle-end EF over a later follow-up measurement.
-    -- This avoids replacing the pre-jump peak with the post-jump value.
+    -- For an idle-jump cycle, use the settled EF/ER captured before the jump.
     if entry.cycleEndEfficiency ~= nil then
         measuredEfficiency = entry.cycleEndEfficiency
         if entry.cycleEndError ~= nil then measuredError = entry.cycleEndError end
@@ -338,10 +336,10 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
 
     if entry.usedNudge then
         displayDiag = "Nudge"
-    elseif entry.isProbe then
-        displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
     elseif math.abs(displayDelta) >= LOG_JUMP_THRESHOLD then
         displayDiag = (displayDelta > 0) and "Jump (+)" or "Jump (-)"
+    elseif entry.isProbe then
+        displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
     elseif displayDelta > 0 then
         displayDiag = "+"
     elseif displayDelta < 0 then
@@ -576,21 +574,25 @@ local function backgroundSensorLoop()
             local previousSensorEfficiency = lastSensorEF
             local observedJump = previousSensorEfficiency ~= nil and
                 math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
-            -- Snapshot movement is any exact EF change, not only a controller-level jump.
-            -- This leaves observedJump / JUMP_THRESHOLD unchanged for control decisions.
             local observedMovement = lastPollEF ~= nil and eff ~= lastPollEF
 
-            -- Snapshot bookkeeping is independent of IDLE_THRESHOLD and JUMP_THRESHOLD.
-            -- Preserve the settled EF/ER for the deferred log before a later stable
-            -- reading replaces it. The existing EF stability check remains unchanged.
+            -- Any EF movement requires a fresh snapshot after the same existing
+            -- stability check succeeds. Do not attach the old snapshot here:
+            -- an ordinary step toward the peak is not the end-of-cycle jump.
             if observedMovement then
+                idleSnapshotRefreshPending = true
+                idleSnapshotMovementSeen = true
+            end
+
+            -- A falling jump marks the end of the previously settled cycle.
+            -- Preserve its last stable snapshot without requiring EF >= 95%.
+            -- Rising jumps must not pin the older, lower value to this log row.
+            if observedJump and previousSensorEfficiency ~= nil and eff < previousSensorEfficiency then
                 if idleCycleEF ~= nil and deferredCycleLog ~= nil and
                    deferredCycleLog.cycleEndEfficiency == nil then
                     deferredCycleLog.cycleEndEfficiency = idleCycleEF
                     deferredCycleLog.cycleEndError = idleCycleER
                 end
-                idleSnapshotRefreshPending = true
-                idleSnapshotMovementSeen = true
             end
 
             if waitingForIdleJump then
@@ -661,10 +663,8 @@ local function backgroundSensorLoop()
                     stableExecutionAt = os.clock()
                     unchangedPollCount = 0
 
-                    -- Store EF/ER after the existing stability check succeeds.
-                    -- The first stable reading initializes the snapshot at any EF.
-                    -- After EF movement, keep the old snapshot until the new
-                    -- reading passes this same stability check.
+                    -- Snapshot follows the existing unchanged-EF stability check;
+                    -- EF does not have to be >= IDLE_THRESHOLD to be saved.
                     if idleCycleEF == nil or
                        (idleSnapshotRefreshPending and idleSnapshotMovementSeen) then
                         idleCycleEF = eff
