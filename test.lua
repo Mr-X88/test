@@ -1,4 +1,4 @@
--- v3.01 SELF-LEARNING CURVE:
+-- v3.02 OVERSHOOT-AWARE LEARNING CURVE:
 --   * Neue Grundformel: etwas kräftiger im niedrigen/mittleren EF-Bereich,
 --     etwas feiner nahe 95%.
 --   * Koeffizienten A/B werden aus zuverlässigen Nachmessungen per gedämpftem Fit angepasst.
@@ -7,12 +7,14 @@
 --     werden nicht zum Lernen verwendet.
 --   * EF-Snapshot, ACTION_EVAL_DELAY, EXECUTION_COOLDOWN und Sensor-Takt bleiben.
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.01 SELF-LEARNING CURVE
+-- BETTER FUSION REACTOR CONTROLLER v3.02 OVERSHOOT-AWARE LEARNING CURVE
 -- Basis: v2.96; beibehaltene Änderungen:
 --   * Sensor-Sprünge nutzen bei bekannter Richtung die 4t-Messung statt pauschal TEST +/-2.
 --   * TEST +/-2 wird nur verwendet, wenn die Richtung unbekannt ist oder eine Messung unverändert bleibt.
 --   * Nach Idle >= 95% wird auf einen echten Sprung gewartet, bevor der Richtungstest erfolgt.
---   * Lernkurve: Step=A*x+B*x^2, x=(100-EF)/100; Formel/Verhaltenskurve auf Monitorseite 3.
+--   * Lernkurve: Step=K*(A*x+B*x^2), x=(100-EF)/100; Kurve auf Monitorseite 3.
+--   * EF-Peaks >100 werden auch nach ACTION_EVAL_DELAY überwacht; bei bestätigtem Rückgang
+--     wird K reduziert statt ein größerer Schritt gelernt. Cooldown bleibt unverändert.
 -- Änderungen in v2.97 TEST:
 --   * Obergrenze 15 bei direkter adjustReactivity()-Steuerung entfernt.
 --   * Redstone-Fallback bleibt korrekt auf 15 begrenzt (CC:Tweaked-Redstone-Limit).
@@ -23,7 +25,7 @@
 --   * Der Redstone-Fallback rundet weiterhin auf eine ganze Signalstärke von 1 bis 15.
 --   * Monitor/Logs formatieren Schrittwerte kompakt, z.B. +0.82 statt +1.
 -- ============================================================
-local SCRIPT_VERSION = "v3.01 LEARNING CURVE"
+local SCRIPT_VERSION = "v3.02 OVERSHOOT-AWARE"
 
 local reactor = nil
 local monitor = nil
@@ -61,6 +63,17 @@ local EXPECTED_GAIN_RATIO = 0.22
 local EXPECTED_GAIN_MIN = 1.0
 local EXPECTED_GAIN_MAX = 12.0
 
+-- Überschwing-Schutz: EF-Spitzen über 100% gelten niemals als Beleg,
+-- dass ein größerer Schritt nötig wäre. Stattdessen wird die Gesamtschrittweite
+-- vorsichtig reduziert. K wird separat gespeichert, damit der normale Fit sie
+-- nicht beim nächsten Lernpunkt sofort wieder hochzieht.
+local OVERSHOOT_TARGET_EF = 100.0
+local OVERSHOOT_SCALE_MIN = 0.35
+local OVERSHOOT_SCALE_DEFAULT = 1.0
+local OVERSHOOT_DROP_CONFIRM = 1.0       -- EF muss mindestens 1 Punkt vom Peak fallen
+local OVERSHOOT_ACTION_WINDOW = 6.0     -- ordnet den Peak einer kürzlich gesendeten Direktkorrektur zu
+local OVERSHOOT_LEARNING_LOCK = 6.0     -- nach Überschwingen vorübergehend keine Lernpunkte aufnehmen
+
 local ENABLE_WAKEUP_PULSE = true
 local WAKEUP_INTERVAL_TICKS = 40     -- Alle 2 Sekunden
 local WAKEUP_PULSE_TICKS = 10        -- 0,5 Sekunden
@@ -75,6 +88,17 @@ local controlDirection = 1           -- 1 = + / erhöhen, -1 = - / senken
 local stepSize = 4
 local coefficientLinear = BASE_LINEAR_COEFF
 local coefficientQuadratic = BASE_QUADRATIC_COEFF
+local overshootScale = OVERSHOOT_SCALE_DEFAULT
+local overshootEvents = 0
+local lastSuccessfulControlAt = nil
+local lastSuccessfulControlBeforeEF = nil
+local lastSuccessfulControlStrength = nil
+local lastActionEligibleForOvershoot = false
+local overshootEpisodeActive = false
+local overshootEpisodePeak = nil
+local overshootEpisodeStartEF = nil
+local overshootEpisodePenaltyApplied = false
+local learningLockUntil = 0
 local learningSamples = {}
 local learningUpdateCount = 0
 local lastLearnStatus = "Startmodell; warte auf gültige Daten"
@@ -279,6 +303,12 @@ local function loadLearningModel()
     if isFiniteNumber(saved.b) then
         coefficientQuadratic = clampNumber(saved.b, QUADRATIC_COEFF_MIN, QUADRATIC_COEFF_MAX)
     end
+    if isFiniteNumber(saved.k) then
+        overshootScale = clampNumber(saved.k, OVERSHOOT_SCALE_MIN, OVERSHOOT_SCALE_DEFAULT)
+    end
+    if type(saved.overshoots) == "number" and saved.overshoots >= 0 then
+        overshootEvents = math.floor(saved.overshoots)
+    end
     if type(saved.updates) == "number" and saved.updates >= 0 then
         learningUpdateCount = math.floor(saved.updates)
     end
@@ -308,6 +338,8 @@ local function saveLearningModel()
         version = 1,
         a = coefficientLinear,
         b = coefficientQuadratic,
+        k = overshootScale,
+        overshoots = overshootEvents,
         updates = learningUpdateCount,
         samples = learningSamples
     }
@@ -321,6 +353,67 @@ local function saveLearningModel()
 end
 
 loadLearningModel()
+
+local function applyOvershootPenalty(peakEF, startEF)
+    local amountAbove100 = math.max(0, peakEF - OVERSHOOT_TARGET_EF)
+    local riseFromStart = (startEF and peakEF - startEF) or 0
+    local penalty = clampNumber(0.92 - 0.015 * amountAbove100, 0.65, 0.92)
+
+    -- Ein sehr großer Gesamtanstieg kann auch stark durch TR verursacht sein.
+    -- In diesem Fall nur vorsichtig dämpfen, nie aus dem Ereignis heraus vergrößern.
+    if riseFromStart >= LOG_JUMP_THRESHOLD then
+        penalty = math.max(penalty, 0.96)
+    end
+
+    local oldScale = overshootScale
+    overshootScale = clampNumber(overshootScale * penalty, OVERSHOOT_SCALE_MIN, OVERSHOOT_SCALE_DEFAULT)
+    overshootEvents = overshootEvents + 1
+    learningUpdateCount = learningUpdateCount + 1
+    learningLockUntil = os.clock() + OVERSHOOT_LEARNING_LOCK
+    lastLearnStatus = string.format(
+        "EF-Peak %.2f%%, dann Rueckgang; K %.3f->%.3f, kein Hochlernen",
+        peakEF, oldScale, overshootScale)
+    saveLearningModel()
+end
+
+local function observeOvershootCycle(eff)
+    local now = os.clock()
+
+    if eff > OVERSHOOT_TARGET_EF then
+        -- Einen Peak nur dann dem Lernmodell zurechnen, wenn zuvor kürzlich eine
+        -- reguläre direkte Korrektur gesendet wurde. Probe-Schritte zählen nicht.
+        if not overshootEpisodeActive then
+            local recentEligibleAction = lastActionEligibleForOvershoot and
+                lastSuccessfulControlAt ~= nil and
+                (now - lastSuccessfulControlAt) <= OVERSHOOT_ACTION_WINDOW
+            if recentEligibleAction then
+                overshootEpisodeActive = true
+                overshootEpisodePeak = eff
+                overshootEpisodeStartEF = lastSuccessfulControlBeforeEF
+                overshootEpisodePenaltyApplied = false
+            end
+        elseif eff > (overshootEpisodePeak or eff) then
+            overshootEpisodePeak = eff
+        end
+    elseif overshootEpisodeActive then
+        if eff > (overshootEpisodePeak or eff) then
+            overshootEpisodePeak = eff
+        end
+        if not overshootEpisodePenaltyApplied and overshootEpisodePeak and
+           eff <= (overshootEpisodePeak - OVERSHOOT_DROP_CONFIRM) then
+            applyOvershootPenalty(overshootEpisodePeak, overshootEpisodeStartEF)
+            overshootEpisodePenaltyApplied = true
+        end
+        -- Eine EF-Phase über 100% wird als eine Episode behandelt. Erst beim
+        -- Rückgang unter IDLE_THRESHOLD kann eine neue Episode gestartet werden.
+        if eff < IDLE_THRESHOLD then
+            overshootEpisodeActive = false
+            overshootEpisodePeak = nil
+            overshootEpisodeStartEF = nil
+            overshootEpisodePenaltyApplied = false
+        end
+    end
+end
 
 local function getReactorData()
     local logicMode = safeRead("getLogicMode", "UNKNOWN")
@@ -356,11 +449,12 @@ end
 
 -- ==================== SELBSTLERNENDE REGELSCHRITT-FORMEL ====================
 local function calculateStep(currentEff)
-    -- Normierte Form: x=(100-EF)/100, Schritt=A*x+B*x^2.
-    -- A=12, B=48 entspricht dem früheren Startmodell 0.12*d + 0.0048*d^2.
-    local difference = math.max(0, 100 - currentEff)
+    -- Normierte Formel: Step = K * (A*x + B*x^2), x=max(0,100-EF)/100.
+    -- Wenn EF über 100% lag, wird das NICHT als Grund für größere Schritte
+    -- interpretiert. Die separate Skala K wird bei erkanntem Überschwingen gesenkt.
+    local difference = math.max(0, OVERSHOOT_TARGET_EF - currentEff)
     local x = difference / 100
-    local rawStep = (coefficientLinear * x) + (coefficientQuadratic * x * x)
+    local rawStep = overshootScale * ((coefficientLinear * x) + (coefficientQuadratic * x * x))
     local calculatedStep = math.floor(rawStep * 100 + 0.5) / 100
     if calculatedStep < 0.01 then calculatedStep = 0.01 end
     return calculatedStep
@@ -420,7 +514,26 @@ local function fitCoefficients()
     return true, "Fit aktualisiert"
 end
 
-local function learnCoefficients(action, delta, postEfficiency)
+local function learnCoefficients(action, delta, postEfficiency, observedPeakEfficiency)
+    -- Überschwingen wird VOR allen Idle-/Positivgewinn-Filtern behandelt.
+    -- Dadurch kann EF >100% niemals in die normale Lernregel "zu wenig Gewinn -> mehr Schritt"
+    -- gelangen. Die Spitze wird während des gesamten Nachmessfensters verfolgt.
+    local peakEF = observedPeakEfficiency or postEfficiency
+    if not isFiniteNumber(peakEF) then peakEF = postEfficiency end
+    local trackedOvershoot = action.directAPI and not action.isProbe and not action.usedNudge
+        and action.beforeEfficiency < IDLE_THRESHOLD and peakEF > OVERSHOOT_TARGET_EF
+    if trackedOvershoot then
+        -- Dieser Aktionsdatensatz wird ausgeschlossen. Der separate Sensor-Wächter
+        -- senkt K erst dann einmalig, wenn er den Rückgang vom >100%-Peak bestätigt.
+        -- So wird ein kurz überschrittener EF-Peak nicht als "zu wenig Wirkung" gelernt.
+        lastLearnStatus = string.format("Peak %.2f%% >100: kein Hochlernen; warte auf Rueckgang", peakEF)
+        return "OVERSHOOT"
+    end
+    if os.clock() < learningLockUntil then
+        lastLearnStatus = "Lernen pausiert nach EF-Ueberschwingen"
+        return "skip"
+    end
+
     -- Nur Daten verwenden, bei denen ein sinnvoller direkter Wirkungshinweis vorliegt.
     -- TR wechselt zufällig; daher Sprünge, Richtungstests, Nudge und Relay-Fallback auslassen.
     if action.isProbe then
@@ -574,9 +687,30 @@ local function finishPendingAction(postEfficiency, postError)
 
     local action = pendingAction
     local delta = postEfficiency - action.beforeEfficiency
+    local peakEfficiency = action.peakEfficiencyDuringAction or math.max(action.beforeEfficiency, postEfficiency)
     local cycleDiag = "Stillstand"
+    local directNonProbe = action.directAPI and not action.isProbe
+    local crossedOver100 = directNonProbe and action.beforeEfficiency < IDLE_THRESHOLD
+        and peakEfficiency > OVERSHOOT_TARGET_EF
 
-    if action.isProbe then
+    if crossedOver100 then
+        -- EF-Spitze über 100% ist ein Überschwingen, kein Signal, stärker nachzulegen.
+        -- Vorsorglich die Richtung umkehren. Bei EF>=95 bleiben wir im Idle-Merker;
+        -- fällt EF bereits darunter, ist zunächst ein kleiner Gegenrichtungstest nötig.
+        controlDirection = -action.direction
+        directionKnown = false
+        if postEfficiency >= IDLE_THRESHOLD then
+            waitingForIdleJump = true
+            directionProbePending = false
+            cycleDiag = "OVER100-IDLE"
+            stuckReason = string.format("Überschwingen: Peak %.1f%%; Schrittmaß reduziert, warte auf Sprung", peakEfficiency)
+        else
+            waitingForIdleJump = false
+            directionProbePending = true
+            cycleDiag = "OVER100-TEST"
+            stuckReason = string.format("Überschwingen: Peak %.1f%%; Schrittmaß reduziert, Gegenprobe +/-2", peakEfficiency)
+        end
+    elseif action.isProbe then
         -- Ein TEST +/-2 ist nur zur Richtungsfindung da.
         if delta > 0 then
             controlDirection = action.direction
@@ -650,8 +784,10 @@ local function finishPendingAction(postEfficiency, postError)
         end
     end
 
-    local fitResult = learnCoefficients(action, delta, postEfficiency)
-    if fitResult == "FIT+" then
+    local fitResult = learnCoefficients(action, delta, postEfficiency, peakEfficiency)
+    if fitResult == "OVERSHOOT" then
+        cycleDiag = "OVER100"
+    elseif fitResult == "FIT+" then
         cycleDiag = "FIT+ " .. cycleDiag
     elseif fitResult == "FIT-" then
         cycleDiag = "FIT- " .. cycleDiag
@@ -783,6 +919,20 @@ local function backgroundSensorLoop()
             liveER = err
             liveIsRunning = running
             liveDataValid = true
+
+            -- Unabhängiger Peak-Wächter: erfasst EF>100 auch noch nach ACTION_EVAL_DELAY,
+            -- ohne Cooldown oder Sensor-Takt zu verändern.
+            observeOvershootCycle(eff)
+
+            -- Während einer Aktion jede EF-Spitze/-Senke im Nachmessfenster verfolgen.
+            -- So geht ein kurzer Peak über 100% auch dann nicht verloren, wenn der
+            -- Wert vor Ablauf von ACTION_EVAL_DELAY wieder gefallen ist.
+            if pendingAction then
+                local previousPeak = pendingAction.peakEfficiencyDuringAction or pendingAction.beforeEfficiency
+                local previousLow = pendingAction.lowEfficiencyDuringAction or pendingAction.beforeEfficiency
+                if eff > previousPeak then pendingAction.peakEfficiencyDuringAction = eff end
+                if eff < previousLow then pendingAction.lowEfficiencyDuringAction = eff end
+            end
 
             if eff > 0 then hasEverRun = true end
 
@@ -987,6 +1137,8 @@ local function executionLoop()
                     lastActionMode = modeOrError
                     logCounter = logCounter + 1
 
+                    local directAction = (type(reactor.adjustReactivity) == "function" and
+                        modeOrError:find("Direkt", 1, true) ~= nil)
                     pendingAction = {
                         id = logCounter,
                         direction = actionDirection,
@@ -998,8 +1150,24 @@ local function executionLoop()
                         usedNudge = nudgeApplied,
                         isProbe = probeAction,
                         requestedStrength = effectiveStep,
-                        directAPI = (type(reactor.adjustReactivity) == "function" and modeOrError:find("Direkt", 1, true) ~= nil)
+                        directAPI = directAction,
+                        peakEfficiencyDuringAction = currentEfficiency,
+                        lowEfficiencyDuringAction = currentEfficiency
                     }
+
+                    -- Context für einen EF-Peak, der erst nach der kurzen Nachmessung auftritt.
+                    -- Richtungstests gelten nicht als Trainings-/Überschwing-Aktion.
+                    if directAction and not probeAction then
+                        lastSuccessfulControlAt = os.clock()
+                        lastSuccessfulControlBeforeEF = currentEfficiency
+                        lastSuccessfulControlStrength = effectiveStep
+                        lastActionEligibleForOvershoot = true
+                    else
+                        lastSuccessfulControlAt = nil
+                        lastSuccessfulControlBeforeEF = nil
+                        lastSuccessfulControlStrength = nil
+                        lastActionEligibleForOvershoot = false
+                    end
 
                     if nudgeApplied then
                         stuckNudgeBonus = 0
@@ -1223,7 +1391,7 @@ local function uiLoop()
                 writeHeader("=== ADAPTIVE FORMULA (3/3) ===")
                 if monitorHeight >= 3 then
                     clearLineAt(3)
-                    monitor.write("Modell: Step = A*x + B*x^2")
+                    monitor.write("Modell: Step = K*(A*x + B*x^2)")
                 end
                 if monitorHeight >= 4 then
                     clearLineAt(4)
@@ -1242,6 +1410,10 @@ local function uiLoop()
                     monitor.setTextColor(colors.cyan)
                     monitor.write("Status: " .. string.sub(lastLearnStatus, 1, math.max(1, monitorHeight > 30 and 50 or 35)))
                     monitor.setTextColor(colors.white)
+                end
+                if monitorHeight >= 8 then
+                    clearLineAt(8)
+                    monitor.write(string.format("K=%.3f | Ueber100: %d", overshootScale, overshootEvents))
                 end
                 if monitorHeight >= 9 then
                     clearLineAt(9)
