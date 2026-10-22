@@ -1,5 +1,7 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.22
+-- BETTER FUSION REACTOR CONTROLLER v3.23
+-- v3.23: Case temperature display value refreshes at most once per second.
+--         Idle/waiting diagnostics use one stable label to prevent text flicker.
 -- v3.22: Monitor rows are redrawn only when their displayed inputs change.
 --         Preserves the 0.25s UI check while avoiding repeat formatting and terminal writes.
 -- v3.21: Defaults monitor logs to OFF and gates monitor/log work on a connected monitor.
@@ -11,7 +13,7 @@
 -- Preserves v3.17 cycle-end EF/ER snapshot behavior and Jump diagnostic labels.
 -- v3.20 pairs TR JUMP Wayfinding only with the immediately adjacent rendered Jump (+) row.
 -- ============================================================
-local SCRIPT_VERSION = "v3.22"
+local SCRIPT_VERSION = "v3.23"
 
 local reactor = nil
 local monitor = nil
@@ -83,6 +85,9 @@ local fullRedraw = true
 local liveEF = 0
 local liveER = 0
 local liveCaseTemp = 0
+-- Monitor-only case-temperature sample; kept stable between one-second refreshes.
+local monitorCaseTemp = 0
+local lastCaseTempMonitorUpdate = nil
 local liveIsRunning = false
 local liveDataValid = false
 local invalidReadCount = 0
@@ -408,7 +413,7 @@ local function finishPendingAction(postEfficiency, postError, logsAllowed)
             waitingForIdleJump = true
             directionProbePending = false
             directionKnown = false
-            stuckReason = "Idle >= 95.0%: waiting for jump"
+            stuckReason = "Idle: waiting for jump"
         elseif delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
@@ -710,9 +715,9 @@ local function backgroundSensorLoop()
             elseif directionProbePending then
                 stuckReason = directionKnown and "Jump: test step +/-2 pending" or "Direction unclear: test +/-2 pending"
             elseif waitingForIdleJump then
-                stuckReason = "Idle >= 95.0%: waiting for jump"
+                stuckReason = "Idle: waiting for jump"
             elseif eff >= 95.0 then
-                stuckReason = "Idle: EF >= 95.0%"
+                stuckReason = "Idle: waiting for jump"
             else
                 if lastSensorEF ~= nil then
                     local delta = eff - lastSensorEF
@@ -857,7 +862,7 @@ local function executionLoop()
                 elseif waitingForIdleJump then
                     stuckReason = "Idle: waiting for jump"
                 elseif currentEfficiency >= 95.0 then
-                    stuckReason = "Idle: EF >= 95.0%"
+                    stuckReason = "Idle: waiting for jump"
                 elseif not liveIsRunning or currentEfficiency == 0 then
                     stuckReason = "No control: standby"
                 end
@@ -953,7 +958,7 @@ local function drawPage1Mode()
 end
 
 local function drawPage1Temperature()
-    monitor.write(string.format("Case: %.1fM K | ER: ", liveCaseTemp / 1000000))
+    monitor.write(string.format("Case: %.1fM K | ER: ", monitorCaseTemp / 1000000))
     if liveER > 50 then monitor.setTextColor(colors.red) end
     monitor.write(string.format("%.1f", liveER))
     monitor.setTextColor(colors.white)
@@ -1086,10 +1091,18 @@ local function uiLoop()
             end
 
             if currentPage == 1 then
+                -- Update the displayed case temperature no more than once per second.
+                -- Sensor sampling remains unchanged; only this monitor-facing value is throttled.
+                local now = os.clock()
+                if lastCaseTempMonitorUpdate == nil or now - lastCaseTempMonitorUpdate >= 1.0 then
+                    monitorCaseTemp = liveCaseTemp
+                    lastCaseTempMonitorUpdate = now
+                end
+
                 renderCachedLine(1, drawPage1Header, nil, SCRIPT_VERSION)
                 renderCachedLine(2, drawPage1Mode, nil,
                     liveDataValid, liveEF, liveIsRunning, hasEverRun)
-                renderCachedLine(3, drawPage1Temperature, nil, liveCaseTemp, liveER)
+                renderCachedLine(3, drawPage1Temperature, nil, monitorCaseTemp, liveER)
                 renderCachedLine(4, drawPage1Step, nil, lastAppliedStepText or false, lastActionMode)
                 renderCachedLine(5, drawPage1Diagnostic, nil, stuckReason, monitorHeight)
                 renderCachedLine(6, drawPage1Sensor, nil, lowPerfMultiplier)
