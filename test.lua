@@ -1,12 +1,11 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.00 (New Efficiency Formula)
--- Changes in this version:
---   * Replaced old step formula with the inverted exact Efficiency formula:
---     Efficiency = min(100, max(0, 22 / ((|TR - CR| / 100) + 0.2) - 10))
---     DeltaR = 100 * (22 / (EF + 10) - 0.2)
---   * Preserved all English UI, automatic re-scan/reboot features, and logs.
+-- BETTER FUSION REACTOR CONTROLLER v3.11 (Strict Idle Hold)
+-- Change in v3.11:
+--   * No control action is allowed while the current EF is >= IDLE_THRESHOLD.
+--   * A queued probe cannot bypass idle; idle releases only on a significant jump below threshold.
+--   * Formula, cooldown, polling, UI, and logging otherwise remain unchanged.
 -- ============================================================
-local SCRIPT_VERSION = "v3.00"
+local SCRIPT_VERSION = "v3.11"
 
 local reactor = nil
 local monitor = nil
@@ -333,8 +332,12 @@ local function finishPendingAction(postEfficiency, postError)
             stuckReason = "Direction unclear: re-probe +/-2 scheduled"
         end
 
-        if not directionProbePending and postEfficiency >= IDLE_THRESHOLD then
+        -- Strict idle latch: even an ambiguous probe must return to idle
+        -- if its completed measurement is at or above the threshold.
+        if postEfficiency >= IDLE_THRESHOLD then
             waitingForIdleJump = true
+            directionProbePending = false
+            directionKnown = false
         end
     else
         if postEfficiency >= IDLE_THRESHOLD then
@@ -512,11 +515,13 @@ local function backgroundSensorLoop()
                 math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
 
             if waitingForIdleJump then
-                if observedJump then
+                -- Keep idle while EF remains >= threshold. Only a noticeable
+                -- jump observed below the threshold can release the idle hold.
+                if observedJump and eff < IDLE_THRESHOLD and running and eff > 0 then
                     waitingForIdleJump = false
                     directionProbePending = true
                     directionKnown = false
-                    stuckReason = "Idle jump detected: direction test +/-2"
+                    stuckReason = "Idle exited below threshold: direction test +/-2"
                 end
             elseif observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
                 if directionKnown then
@@ -537,8 +542,12 @@ local function backgroundSensorLoop()
                 end
             end
 
-            if eff >= IDLE_THRESHOLD and not directionProbePending and pendingAction == nil then
+            -- Latch idle whenever a live sensor sample reaches the threshold,
+            -- even if a probe was queued or an action is still being evaluated.
+            if eff >= IDLE_THRESHOLD then
                 waitingForIdleJump = true
+                directionProbePending = false
+                directionKnown = false
             end
 
             if not stuckNudgeActive and running and
@@ -665,7 +674,9 @@ local function executionLoop()
             local errorLevel = liveER
             local probeAction = directionProbePending
             local normalControlAllowed = currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump
+            -- Hard safety gate for idle: a queued direction probe may not bypass it.
             local canControl = liveDataValid and liveIsRunning and currentEfficiency > 0 and
+                currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump and
                 errorLevel < 100 and (probeAction or normalControlAllowed)
 
             if canControl then
