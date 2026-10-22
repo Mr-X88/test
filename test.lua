@@ -1,11 +1,11 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.12
--- Changes in v3.12:
---   * Strict EXECUTION_COOLDOWN enforcement (cannot be bypassed by unchangedPollCount/executionGo).
---   * High-precision EF measurement (rounded to 3 decimal places internally) to catch minor reactivity steps.
---   * UI updated to show EF with 2 decimal places for better precision monitoring.
+-- BETTER FUSION REACTOR CONTROLLER v3.14
+-- Changes in v3.14:
+--   * Cycle logs are emitted one completed action later.
+--   * The displayed second EF value (and ER) comes from the current follow-up measurement.
+--   * Control logic, cooldown, formula, idle handling, and action timing are otherwise unchanged.
 -- ============================================================
-local SCRIPT_VERSION = "v3.12"
+local SCRIPT_VERSION = "v3.14"
 
 local reactor = nil
 local monitor = nil
@@ -54,6 +54,7 @@ local stableExecutionEfficiency = nil
 local stableExecutionAt = nil
 local lastExecutionTime = -EXECUTION_COOLDOWN
 local pendingAction = nil           -- Exactly one action waiting for re-evaluation
+local deferredCycleLog = nil        -- Previous completed action; emitted on the next action's follow-up reading
 
 -- Direction finding for unknown effect and after Idle >= 95%.
 local directionProbePending = false
@@ -311,6 +312,38 @@ local function applyControlAction(direction, strength, separateNudge, nudgeInclu
     return false, "Reactor API unavailable / adjustReactivity failed", false, nil
 end
 
+-- Emit the previous action's log using the current cycle's follow-up EF/ER.
+-- This intentionally shifts visible log output by one completed action.
+local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
+    if not entry or not ENABLE_MONITOR_LOGS then return end
+
+    local displayDelta = measuredEfficiency - entry.beforeEfficiency
+    local displayDiag
+
+    if entry.usedNudge then
+        displayDiag = "Nudge"
+    elseif entry.isProbe then
+        displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
+    elseif math.abs(displayDelta) >= LOG_JUMP_THRESHOLD then
+        displayDiag = (displayDelta > 0) and "Jump (+)" or "Jump (-)"
+    elseif displayDelta > 0 then
+        displayDiag = "+"
+    elseif displayDelta < 0 then
+        displayDiag = "Falling"
+    else
+        displayDiag = "Stable"
+    end
+
+    local compactLog = string.format(
+        "#%03d St:%s Eff:%.2f->%.2f%% Err:%.0f(%ds) %s",
+        entry.id, entry.stepText, entry.beforeEfficiency, measuredEfficiency,
+        measuredError, entry.cycleSeconds, string.sub(displayDiag, 1, 12)
+    )
+    table.insert(logHistory, 1, compactLog)
+    local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
+    while #logHistory > maxLogLines do table.remove(logHistory) end
+end
+
 local function finishPendingAction(postEfficiency, postError)
     if not pendingAction then return end
     if os.clock() < pendingAction.evaluateAt then return end
@@ -391,15 +424,23 @@ local function finishPendingAction(postEfficiency, postError)
 
     if action.usedNudge then cycleDiag = "Nudge" end
 
+    -- The displayed cycle log is one action behind by design:
+    -- emit the previously saved row with this current follow-up measurement,
+    -- then save this action for display when the next action has a follow-up reading.
     if ENABLE_MONITOR_LOGS then
-        local compactLog = string.format(
-            "#%03d St:%s Eff:%.1f->%.1f%% Err:%.0f(%ds) %s",
-            action.id, action.stepText, action.beforeEfficiency, postEfficiency,
-            postError, action.cycleSeconds, string.sub(cycleDiag, 1, 12)
-        )
-        table.insert(logHistory, 1, compactLog)
-        local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
-        while #logHistory > maxLogLines do table.remove(logHistory) end
+        if deferredCycleLog then
+            emitDeferredCycleLog(deferredCycleLog, postEfficiency, postError)
+        end
+        deferredCycleLog = {
+            id = action.id,
+            stepText = action.stepText,
+            beforeEfficiency = action.beforeEfficiency,
+            cycleSeconds = action.cycleSeconds,
+            usedNudge = action.usedNudge,
+            isProbe = action.isProbe
+        }
+    else
+        deferredCycleLog = nil
     end
 
     pendingAction = nil
