@@ -1,5 +1,10 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.00 (New Formula Updated)
+-- BETTER FUSION REACTOR CONTROLLER v3.00 (New Efficiency Formula)
+-- Changes in this version:
+--   * Replaced old step formula with the inverted exact Efficiency formula:
+--     Efficiency = min(100, max(0, 22 / ((|TR - CR| / 100) + 0.2) - 10))
+--     DeltaR = 100 * (22 / (EF + 10) - 0.2)
+--   * Preserved all English UI, automatic re-scan/reboot features, and logs.
 -- ============================================================
 local SCRIPT_VERSION = "v3.00"
 
@@ -249,11 +254,19 @@ local function getReactorData()
 end
 
 -- ==================== CALCULATE CONTROL STEP ====================
+-- Direct formula: Efficiency = min(100, max(0, 22 / ((|TR - CR| / 100) + 0.2) - 10))
+local function calculateEfficiencyFromDelta(deltaReactivity)
+    local absDelta = math.abs(deltaReactivity)
+    local rawEff = (22 / ((absDelta / 100) + 0.2)) - 10
+    return math.min(100, math.max(0, rawEff))
+end
+
+-- Inverted formula: Solves for DeltaR given current Efficiency (currentEff -> 100% target)
+-- DeltaR = 100 * (22 / (EF + 10) - 0.2)
 local function calculateStep(currentEff)
-    local difference = math.max(0, 100 - currentEff)
-    -- Angepasste Formel zur Schrittberechnung
-    local rawStep = (0.284 * difference) + (0.0072 * (difference ^ 2))
-    local calculatedStep = math.floor(rawStep * 100 + 0.5) / 100
+    currentEff = math.min(100, math.max(0, currentEff))
+    local requiredDelta = 100 * ((22 / (currentEff + 10)) - 0.2)
+    local calculatedStep = math.floor(math.max(0, requiredDelta) * 100 + 0.5) / 100
 
     if calculatedStep < 0.01 then calculatedStep = 0.01 end
     return calculatedStep
