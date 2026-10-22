@@ -1,45 +1,30 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.17
--- Changes in v3.17:
---   * Captures EF/ER after the existing unchanged-EF stability check at any EF level.
---   * Preserves that snapshot for deferred logs at a detected falling jump,
---     instead of attaching it on the first EF movement; no 95% capture threshold.
---   * A measured large delta is labelled Jump even for a direction-probe row.
---   * Control decisions, cooldown, formula, sensor stability check, and action timing remain unchanged.
+-- BETTER FUSION REACTOR CONTROLLER v3.19
+-- Changes in v3.18:
+--   * Removes unused calculation helper and dead state/log fields.
+--   * Inlines immutable settings except SCRIPT_VERSION and ENABLE_MONITOR_LOGS.
+--   * Retains the one-time fixed relay-side list; removes redundant local state.
+--   * Keeps control decisions, sensor timing, stability checks, and log behavior unchanged.
+-- Preserves v3.17 cycle-end EF/ER snapshot behavior and Jump diagnostic labels.
 -- ============================================================
-local SCRIPT_VERSION = "v3.17"
+local SCRIPT_VERSION = "v3.19"
 
 local reactor = nil
 local monitor = nil
 local relay = nil
 local monitorHeight = 25
+local sides = {"top", "bottom", "left", "right", "front", "back"}
 
 -- ==================== SETTINGS ====================
-local IDLE_THRESHOLD = 95.0          -- No further control steps beyond this point (shutdown limit)
 
-local ENABLE_LOW_PERF_MODE = true
-local POLL_INTERVAL_TICKS = 4        -- Base: 4 ticks = 0.2 seconds
 local lowPerfMultiplier = 1
 local pulseTargetMultiplier = 1
 local pulseStreakCount = 0
 
-local JUMP_THRESHOLD = 3.0
-local LOG_JUMP_THRESHOLD = 16.0
-local EXECUTION_COOLDOWN = 3.0       -- Minimum pause between control steps
-local ACTION_EVAL_DELAY = 1.5        -- Re-evaluation delay after correction
-
-local ENABLE_WAKEUP_PULSE = true
-local WAKEUP_INTERVAL_TICKS = 40     -- Every 2 seconds
-local WAKEUP_PULSE_TICKS = 10        -- 0.5 seconds
-local WAKEUP_STRENGTH = 15
-
 local ENABLE_MONITOR_LOGS = true
-
-local sides = {"top", "bottom", "left", "right", "front", "back"}
 
 -- ==================== CONTROL VARIABLES ====================
 local controlDirection = 1           -- 1 = + / increase, -1 = - / decrease
-local stepSize = 4
 local hasEverRun = false
 local logCounter = 0
 local logHistory = {}
@@ -53,16 +38,15 @@ local executionGo = false
 local lastPollEF = nil
 local unchangedPollCount = 0
 local stableExecutionEfficiency = nil
-local stableExecutionAt = nil
-local lastExecutionTime = -EXECUTION_COOLDOWN
+local lastExecutionTime = -3.0
 local pendingAction = nil           -- Exactly one action waiting for re-evaluation
 local deferredCycleLog = nil        -- Previous completed action; emitted on the next action's follow-up reading
+local lastJumpStartEfficiency = nil -- Start EF of the most recently logged Jump (+), used to pair the following TR JUMP Wayfinding row
 -- Settled EF/ER snapshot. Refreshed only after the existing EF stability check succeeds.
 -- Kept until the next idle jump so the deferred log can report the pre-jump cycle end.
 local idleCycleEF = nil
 local idleCycleER = nil
 local idleSnapshotRefreshPending = false
-local idleSnapshotMovementSeen = false
 
 -- Direction finding for unknown effect and after Idle >= 95%.
 local directionProbePending = false
@@ -204,13 +188,13 @@ local function sendWakeupPulseStart()
         stuckReason = "Wakeup pulse: no relay"
         return false
     end
-    local ok = setRelayAll(WAKEUP_STRENGTH, true)
+    local ok = setRelayAll(15, true)
     if not ok then
         stuckReason = "Wakeup pulse: relay error"
         return false
     end
     wakeupPulseActive = true
-    wakeupPulseEndsAt = os.clock() + (WAKEUP_PULSE_TICKS * 0.05)
+    wakeupPulseEndsAt = os.clock() + (10 * 0.05)
     return true
 end
 
@@ -271,12 +255,6 @@ local function getReactorData()
 end
 
 -- ==================== CALCULATE CONTROL STEP ====================
-local function calculateEfficiencyFromDelta(deltaReactivity)
-    local absDelta = math.abs(deltaReactivity)
-    local rawEff = (22 / ((absDelta / 100) + 0.2)) - 10
-    return math.min(100, math.max(0, rawEff))
-end
-
 -- Inverted formula: Solves for DeltaR given current Efficiency (currentEff -> 100% target)
 -- DeltaR = 100 * (22 / (EF + 10) - 0.2)
 local function calculateStep(currentEff)
@@ -336,7 +314,7 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
 
     if entry.usedNudge then
         displayDiag = "Nudge"
-    elseif math.abs(displayDelta) >= LOG_JUMP_THRESHOLD then
+    elseif math.abs(displayDelta) >= 16.0 then
         displayDiag = (displayDelta > 0) and "Jump (+)" or "Jump (-)"
     elseif entry.isProbe then
         displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
@@ -346,6 +324,15 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
         displayDiag = "Falling"
     else
         displayDiag = "Stable"
+    end
+
+    -- Preserve the existing diagnostic decision, but pair a TR JUMP Wayfinding
+    -- row's second EF with the first EF of the associated Jump (+) row.
+    -- This is log-only; it does not affect sensor values or control decisions.
+    if displayDiag == "Jump (+)" then
+        lastJumpStartEfficiency = entry.beforeEfficiency
+    elseif displayDiag == "TR JUMP Wayfinding" and lastJumpStartEfficiency ~= nil then
+        measuredEfficiency = lastJumpStartEfficiency
     end
 
     local compactLog = string.format(
@@ -364,79 +351,61 @@ local function finishPendingAction(postEfficiency, postError)
 
     local action = pendingAction
     local delta = postEfficiency - action.beforeEfficiency
-    local cycleDiag = "Stable"
 
     if action.isProbe then
         if delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "TR JUMP Wayfinding"
             stuckReason = "Direction test: direction confirmed"
         elseif delta < 0 then
             controlDirection = -action.direction
             directionProbePending = false
             directionKnown = true
-            cycleDiag = "TR JUMP Wayfinding"
             stuckReason = "Direction test: opposite direction confirmed"
         else
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
-            cycleDiag = "Test?"
             stuckReason = "Direction unclear: re-probe +/-2 scheduled"
         end
 
-        if postEfficiency >= IDLE_THRESHOLD then
+        if postEfficiency >= 95.0 then
             waitingForIdleJump = true
             directionProbePending = false
             directionKnown = false
         end
     else
-        if postEfficiency >= IDLE_THRESHOLD then
+        if postEfficiency >= 95.0 then
             waitingForIdleJump = true
             directionProbePending = false
             directionKnown = false
-            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
-                cycleDiag = (delta > 0) and "Jump (+)" or "Jump (-)"
-            elseif delta > 0 then
-                cycleDiag = "+"
-            elseif delta < 0 then
-                cycleDiag = "Falling"
-            end
-            stuckReason = string.format("Idle >= %.1f%%: waiting for jump", IDLE_THRESHOLD)
+            stuckReason = string.format("Idle >= %.1f%%: waiting for jump", 95.0)
         elseif delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
             directionKnown = true
-            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
-                cycleDiag = "Jump (+)"
+            if math.abs(delta) >= 16.0 then
                 stuckReason = "Large jump (+): direction maintained"
             else
-                cycleDiag = "+"
                 stuckReason = "Re-evaluation: efficiency increased, direction kept"
             end
         elseif delta < 0 then
             controlDirection = -action.direction
             directionProbePending = false
             directionKnown = true
-            if math.abs(delta) >= LOG_JUMP_THRESHOLD then
-                cycleDiag = "Jump (-)"
+            if math.abs(delta) >= 16.0 then
                 stuckReason = "Large jump (-): direction reversed"
             else
-                cycleDiag = "Falling"
                 stuckReason = "Re-evaluation: efficiency decreased, direction reversed"
             end
         else
             controlDirection = -action.direction
             directionProbePending = true
             directionKnown = false
-            cycleDiag = "Test?"
             stuckReason = "No change: direction test +/-2 scheduled"
         end
     end
-
-    if action.usedNudge then cycleDiag = "Nudge" end
 
     -- The displayed cycle log is one action behind by design:
     -- emit the previously saved row with this current follow-up measurement,
@@ -478,7 +447,7 @@ local function pulseListenerLoop()
             local desiredMultiplier = lowPerfMultiplier
             local validInterval = deltaT >= 0.05 and deltaT <= 30.0
 
-            if ENABLE_LOW_PERF_MODE and validInterval then
+            if validInterval then
                 if deltaT >= 8.0 then
                     desiredMultiplier = 8
                 elseif deltaT >= 4.0 then
@@ -554,8 +523,8 @@ local function backgroundSensorLoop()
     while true do
         stopWakeupPulseIfDue()
 
-        local multiplier = ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1
-        local effectiveTicks = POLL_INTERVAL_TICKS * multiplier
+        local multiplier = lowPerfMultiplier
+        local effectiveTicks = 4 * multiplier
         local pollSeconds = effectiveTicks / 20
 
         local _, caseT, eff, err, running, valid = getReactorData()
@@ -573,7 +542,7 @@ local function backgroundSensorLoop()
 
             local previousSensorEfficiency = lastSensorEF
             local observedJump = previousSensorEfficiency ~= nil and
-                math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
+                math.abs(eff - previousSensorEfficiency) >= 3.0
             local observedMovement = lastPollEF ~= nil and eff ~= lastPollEF
 
             -- Any EF movement requires a fresh snapshot after the same existing
@@ -581,7 +550,6 @@ local function backgroundSensorLoop()
             -- an ordinary step toward the peak is not the end-of-cycle jump.
             if observedMovement then
                 idleSnapshotRefreshPending = true
-                idleSnapshotMovementSeen = true
             end
 
             -- A falling jump marks the end of the previously settled cycle.
@@ -596,13 +564,13 @@ local function backgroundSensorLoop()
             end
 
             if waitingForIdleJump then
-                if observedJump and eff < IDLE_THRESHOLD and running and eff > 0 then
+                if observedJump and eff < 95.0 and running and eff > 0 then
                     waitingForIdleJump = false
                     directionProbePending = true
                     directionKnown = false
                     stuckReason = "Idle exited below threshold: direction test +/-2"
                 end
-            elseif observedJump and pendingAction == nil and running and eff > 0 and eff < IDLE_THRESHOLD then
+            elseif observedJump and pendingAction == nil and running and eff > 0 and eff < 95.0 then
                 if directionKnown then
                     directionProbePending = false
                     if eff > previousSensorEfficiency then
@@ -621,14 +589,14 @@ local function backgroundSensorLoop()
                 end
             end
 
-            if eff >= IDLE_THRESHOLD then
+            if eff >= 95.0 then
                 waitingForIdleJump = true
                 directionProbePending = false
                 directionKnown = false
             end
 
             if not stuckNudgeActive and running and
-               eff > 0 and eff < IDLE_THRESHOLD and
+               eff > 0 and eff < 95.0 and
                lastSensorEFForStuck ~= nil and eff == lastSensorEFForStuck then
                 stuckPollCount = stuckPollCount + 1
                 if stuckPollCount >= 10 then
@@ -660,31 +628,28 @@ local function backgroundSensorLoop()
                 if unchangedPollCount >= 2 then
                     executionGo = true
                     stableExecutionEfficiency = eff
-                    stableExecutionAt = os.clock()
                     unchangedPollCount = 0
 
                     -- Snapshot follows the existing unchanged-EF stability check;
-                    -- EF does not have to be >= IDLE_THRESHOLD to be saved.
+                    -- EF does not have to be >= 95.0 to be saved.
                     if idleCycleEF == nil or
-                       (idleSnapshotRefreshPending and idleSnapshotMovementSeen) then
+                       idleSnapshotRefreshPending then
                         idleCycleEF = eff
                         idleCycleER = err
                         idleSnapshotRefreshPending = false
-                        idleSnapshotMovementSeen = false
                     end
                 end
             else
                 unchangedPollCount = 0
                 executionGo = false
                 stableExecutionEfficiency = nil
-                stableExecutionAt = nil
             end
             lastPollEF = eff
 
-            if ENABLE_WAKEUP_PULSE and eff == 0 and err == 0 then
+            if eff == 0 and err == 0 then
                 wakeupTickCounter = wakeupTickCounter + effectiveTicks
-                if wakeupTickCounter >= WAKEUP_INTERVAL_TICKS and not wakeupPulseActive then
-                    wakeupTickCounter = wakeupTickCounter - WAKEUP_INTERVAL_TICKS
+                if wakeupTickCounter >= 40 and not wakeupPulseActive then
+                    wakeupTickCounter = wakeupTickCounter - 40
                     sendWakeupPulseStart()
                 end
             else
@@ -696,13 +661,13 @@ local function backgroundSensorLoop()
             elseif directionProbePending then
                 stuckReason = directionKnown and "Jump: test step +/-2 pending" or "Direction unclear: test +/-2 pending"
             elseif waitingForIdleJump then
-                stuckReason = string.format("Idle >= %.1f%%: waiting for jump", IDLE_THRESHOLD)
-            elseif eff >= IDLE_THRESHOLD then
-                stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
+                stuckReason = string.format("Idle >= %.1f%%: waiting for jump", 95.0)
+            elseif eff >= 95.0 then
+                stuckReason = string.format("Idle: EF >= %.1f%%", 95.0)
             else
                 if lastSensorEF ~= nil then
                     local delta = eff - lastSensorEF
-                    if math.abs(delta) >= JUMP_THRESHOLD then
+                    if math.abs(delta) >= 3.0 then
                         stuckReason = (delta < 0) and "Sensor jump (-)" or "Sensor jump (+)"
                     elseif delta > 0 then
                         stuckReason = "+"
@@ -723,7 +688,6 @@ local function backgroundSensorLoop()
             liveDataValid = false
             executionGo = false
             stableExecutionEfficiency = nil
-            stableExecutionAt = nil
             unchangedPollCount = 0
             invalidReadCount = invalidReadCount + 1
             stuckReason = "Sensor read error (" .. invalidReadCount .. ")"
@@ -749,29 +713,25 @@ end
 local function executionLoop()
     while true do
         local now = os.clock()
-        local timeSinceLastExecution = now - lastExecutionTime
-
-        -- POINT A FIX: Strictly enforce EXECUTION_COOLDOWN regardless of executionGo
+        -- POINT A FIX: Strictly enforce 3.0 regardless of executionGo
         if executionGo and stableExecutionEfficiency ~= nil and
            stableExecutionEfficiency == liveEF and not pendingAction and
-           timeSinceLastExecution >= EXECUTION_COOLDOWN then
+           now - lastExecutionTime >= 3.0 then
 
             executionGo = false
 
             local currentEfficiency = stableExecutionEfficiency
             stableExecutionEfficiency = nil
-            stableExecutionAt = nil
             local errorLevel = liveER
             local probeAction = directionProbePending
-            local normalControlAllowed = currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump
-            
             local canControl = liveDataValid and liveIsRunning and currentEfficiency > 0 and
-                currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump and
-                errorLevel < 100 and (probeAction or normalControlAllowed)
+                currentEfficiency < 95.0 and not waitingForIdleJump and
+                errorLevel < 100
 
             if canControl then
                 lastExecutionTime = now
 
+                local stepSize
                 if probeAction then
                     stepSize = 2
                 else
@@ -807,8 +767,7 @@ local function executionLoop()
                         direction = actionDirection,
                         stepText = stepText,
                         beforeEfficiency = currentEfficiency,
-                        appliedAt = os.clock(),
-                        evaluateAt = os.clock() + ACTION_EVAL_DELAY,
+                        evaluateAt = os.clock() + 1.5,
                         cycleSeconds = secondsSinceLastGo,
                         usedNudge = nudgeApplied,
                         isProbe = probeAction
@@ -837,8 +796,8 @@ local function executionLoop()
                     stuckReason = "Direction test +/-2 pending"
                 elseif waitingForIdleJump then
                     stuckReason = "Idle: waiting for jump"
-                elseif currentEfficiency >= IDLE_THRESHOLD then
-                    stuckReason = string.format("Idle: EF >= %.1f%%", IDLE_THRESHOLD)
+                elseif currentEfficiency >= 95.0 then
+                    stuckReason = string.format("Idle: EF >= %.1f%%", 95.0)
                 elseif not liveIsRunning or currentEfficiency == 0 then
                     stuckReason = "No control: standby"
                 end
@@ -896,7 +855,7 @@ local function uiLoop()
                 if not liveDataValid then
                     monitor.setTextColor(colors.red)
                     monitor.write("SENSOR? ")
-                elseif liveEF >= IDLE_THRESHOLD then
+                elseif liveEF >= 95.0 then
                     monitor.setTextColor(colors.cyan)
                     monitor.write("IDLE ")
                 elseif liveIsRunning and liveEF > 0 then
@@ -931,11 +890,11 @@ local function uiLoop()
                 monitor.setTextColor(colors.white)
 
                 clearLineAt(6)
-                local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
+                local currentTicks = 4 * lowPerfMultiplier
                 monitor.write(string.format("Sensor: %dt / %.2fs | Factor x%d%s",
                     currentTicks, currentTicks / 20,
-                    ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
-                    ENABLE_LOW_PERF_MODE and " AUTO" or " FIX"))
+                    lowPerfMultiplier,
+                    " AUTO"))
 
                 clearLineAt(7)
                 monitor.setTextColor(colors.lightGray)
@@ -989,9 +948,9 @@ local function uiLoop()
                 local dtText = lastDeltaT and string.format("%.3fs", lastDeltaT) or "--"
                 monitor.write(string.format("| Pulse: %d | Dt: %s", pulseCountTotal, dtText))
                 clearLineAt(4)
-                local currentTicks = POLL_INTERVAL_TICKS * (ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1)
+                local currentTicks = 4 * lowPerfMultiplier
                 monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
-                    lastDesiredMultiplier, ENABLE_LOW_PERF_MODE and lowPerfMultiplier or 1,
+                    lastDesiredMultiplier, lowPerfMultiplier,
                     currentTicks, currentTicks / 20))
 
                 clearLineAt(5)
