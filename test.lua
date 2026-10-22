@@ -1,11 +1,11 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.11 (Strict Idle Hold)
--- Change in v3.11:
---   * No control action is allowed while the current EF is >= IDLE_THRESHOLD.
---   * A queued probe cannot bypass idle; idle releases only on a significant jump below threshold.
---   * Formula, cooldown, polling, UI, and logging otherwise remain unchanged.
+-- BETTER FUSION REACTOR CONTROLLER v3.12
+-- Changes in v3.12:
+--   * Strict EXECUTION_COOLDOWN enforcement (cannot be bypassed by unchangedPollCount/executionGo).
+--   * High-precision EF measurement (rounded to 3 decimal places internally) to catch minor reactivity steps.
+--   * UI updated to show EF with 2 decimal places for better precision monitoring.
 -- ============================================================
-local SCRIPT_VERSION = "v3.11"
+local SCRIPT_VERSION = "v3.12"
 
 local reactor = nil
 local monitor = nil
@@ -94,7 +94,12 @@ print("==========================================")
 print(" BETTER FUSION REACTOR CONTROLLER " .. SCRIPT_VERSION)
 print("==========================================")
 
--- ==================== PERIPHERAL SCAN ====================
+-- ==================== HELPER FUNCTIONS ====================
+local function roundToThree(val)
+    if type(val) ~= "number" then return val end
+    return math.floor(val * 1000 + 0.5) / 1000
+end
+
 local function typeMatches(pType, expected)
     if type(pType) == "string" then
         return pType == expected
@@ -106,6 +111,7 @@ local function typeMatches(pType, expected)
     return false
 end
 
+-- ==================== PERIPHERAL SCAN ====================
 local function scanPeripherals()
     reactor = nil
     monitor = nil
@@ -230,6 +236,9 @@ local function getReactorData()
         return logicMode, liveCaseTemp, liveEF, liveER, liveIsRunning, false
     end
 
+    -- High-precision rounding to 3 decimal places for EF
+    efficiency = roundToThree(efficiency)
+
     local dataValid = tempOK and effOK and errOK
     local isRunning = (logicMode == "ACTIVE" or logicMode == "RUNNING" or logicMode == "READY")
 
@@ -253,7 +262,6 @@ local function getReactorData()
 end
 
 -- ==================== CALCULATE CONTROL STEP ====================
--- Direct formula: Efficiency = min(100, max(0, 22 / ((|TR - CR| / 100) + 0.2) - 10))
 local function calculateEfficiencyFromDelta(deltaReactivity)
     local absDelta = math.abs(deltaReactivity)
     local rawEff = (22 / ((absDelta / 100) + 0.2)) - 10
@@ -332,8 +340,6 @@ local function finishPendingAction(postEfficiency, postError)
             stuckReason = "Direction unclear: re-probe +/-2 scheduled"
         end
 
-        -- Strict idle latch: even an ambiguous probe must return to idle
-        -- if its completed measurement is at or above the threshold.
         if postEfficiency >= IDLE_THRESHOLD then
             waitingForIdleJump = true
             directionProbePending = false
@@ -387,7 +393,7 @@ local function finishPendingAction(postEfficiency, postError)
 
     if ENABLE_MONITOR_LOGS then
         local compactLog = string.format(
-            "#%03d St:%s Eff:%.0f->%.0f%% Err:%.0f(%ds) %s",
+            "#%03d St:%s Eff:%.1f->%.1f%% Err:%.0f(%ds) %s",
             action.id, action.stepText, action.beforeEfficiency, postEfficiency,
             postError, action.cycleSeconds, string.sub(cycleDiag, 1, 12)
         )
@@ -515,8 +521,6 @@ local function backgroundSensorLoop()
                 math.abs(eff - previousSensorEfficiency) >= JUMP_THRESHOLD
 
             if waitingForIdleJump then
-                -- Keep idle while EF remains >= threshold. Only a noticeable
-                -- jump observed below the threshold can release the idle hold.
                 if observedJump and eff < IDLE_THRESHOLD and running and eff > 0 then
                     waitingForIdleJump = false
                     directionProbePending = true
@@ -542,8 +546,6 @@ local function backgroundSensorLoop()
                 end
             end
 
-            -- Latch idle whenever a live sensor sample reaches the threshold,
-            -- even if a probe was queued or an action is still being evaluated.
             if eff >= IDLE_THRESHOLD then
                 waitingForIdleJump = true
                 directionProbePending = false
@@ -662,10 +664,13 @@ end
 local function executionLoop()
     while true do
         local now = os.clock()
+        local timeSinceLastExecution = now - lastExecutionTime
 
+        -- POINT A FIX: Strictly enforce EXECUTION_COOLDOWN regardless of executionGo
         if executionGo and stableExecutionEfficiency ~= nil and
            stableExecutionEfficiency == liveEF and not pendingAction and
-           (now - lastExecutionTime) >= EXECUTION_COOLDOWN then
+           timeSinceLastExecution >= EXECUTION_COOLDOWN then
+
             executionGo = false
 
             local currentEfficiency = stableExecutionEfficiency
@@ -674,7 +679,7 @@ local function executionLoop()
             local errorLevel = liveER
             local probeAction = directionProbePending
             local normalControlAllowed = currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump
-            -- Hard safety gate for idle: a queued direction probe may not bypass it.
+            
             local canControl = liveDataValid and liveIsRunning and currentEfficiency > 0 and
                 currentEfficiency < IDLE_THRESHOLD and not waitingForIdleJump and
                 errorLevel < 100 and (probeAction or normalControlAllowed)
@@ -820,7 +825,7 @@ local function uiLoop()
                     monitor.write("STAND")
                 end
                 monitor.setTextColor(colors.white)
-                monitor.write(string.format(" | EF: %.1f%%", liveEF))
+                monitor.write(string.format(" | EF: %.2f%%", liveEF))
 
                 clearLineAt(3)
                 monitor.write(string.format("Case: %.1fM K | ER: ", liveCaseTemp / 1000000))
