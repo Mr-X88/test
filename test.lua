@@ -1,16 +1,21 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.19
+-- BETTER FUSION REACTOR CONTROLLER v3.22
+-- v3.22: Monitor rows are redrawn only when their displayed inputs change.
+--         Preserves the 0.25s UI check while avoiding repeat formatting and terminal writes.
+-- v3.21: Defaults monitor logs to OFF and gates monitor/log work on a connected monitor.
 -- Changes in v3.18:
 --   * Removes unused calculation helper and dead state/log fields.
 --   * Inlines immutable settings except SCRIPT_VERSION and ENABLE_MONITOR_LOGS.
 --   * Retains the one-time fixed relay-side list; removes redundant local state.
 --   * Keeps control decisions, sensor timing, stability checks, and log behavior unchanged.
 -- Preserves v3.17 cycle-end EF/ER snapshot behavior and Jump diagnostic labels.
+-- v3.20 pairs TR JUMP Wayfinding only with the immediately adjacent rendered Jump (+) row.
 -- ============================================================
-local SCRIPT_VERSION = "v3.19"
+local SCRIPT_VERSION = "v3.22"
 
 local reactor = nil
 local monitor = nil
+local monitorName = nil
 local relay = nil
 local monitorHeight = 25
 local sides = {"top", "bottom", "left", "right", "front", "back"}
@@ -21,7 +26,7 @@ local lowPerfMultiplier = 1
 local pulseTargetMultiplier = 1
 local pulseStreakCount = 0
 
-local ENABLE_MONITOR_LOGS = true
+local ENABLE_MONITOR_LOGS = false
 
 -- ==================== CONTROL VARIABLES ====================
 local controlDirection = 1           -- 1 = + / increase, -1 = - / decrease
@@ -41,7 +46,8 @@ local stableExecutionEfficiency = nil
 local lastExecutionTime = -3.0
 local pendingAction = nil           -- Exactly one action waiting for re-evaluation
 local deferredCycleLog = nil        -- Previous completed action; emitted on the next action's follow-up reading
-local lastJumpStartEfficiency = nil -- Start EF of the most recently logged Jump (+), used to pair the following TR JUMP Wayfinding row
+local lastEmittedLogDiag = nil       -- Diagnostic of the row currently directly below the next inserted row
+local lastEmittedLogStartEF = nil     -- Start EF of that row, used only for exact TR/Jump log pairing
 -- Settled EF/ER snapshot. Refreshed only after the existing EF stability check succeeds.
 -- Kept until the next idle jump so the deferred log can report the pre-jump cycle end.
 local idleCycleEF = nil
@@ -70,6 +76,8 @@ local pulseLogHistory = {}
 
 local currentPage = 1
 local lastRenderedPage = nil
+local renderedLines = {}
+local fullRedraw = true
 
 -- Current shared sensor values
 local liveEF = 0
@@ -108,6 +116,7 @@ end
 local function scanPeripherals()
     reactor = nil
     monitor = nil
+    monitorName = nil
     relay = nil
 
     print("--- Scanning Peripherals ---")
@@ -123,6 +132,7 @@ local function scanPeripherals()
             local okColor, isColor = pcall(function() return wrapped.isColor() end)
             if okColor and isColor then
                 monitor = wrapped
+                monitorName = name
                 pcall(function() monitor.setTextScale(0.5) end)
                 local okSize, _, height = pcall(function() return monitor.getSize() end)
                 if okSize and type(height) == "number" then monitorHeight = height end
@@ -144,6 +154,16 @@ local function scanPeripherals()
     print("------------------------")
 end
 
+-- A wrapped monitor can remain as a stale Lua object after it is unplugged.
+-- Check presence before doing monitor-only work or attempting to render.
+local function monitorConnected()
+    return monitor ~= nil and monitorName ~= nil and peripheral.isPresent(monitorName)
+end
+
+local function monitorLogsEnabled()
+    return ENABLE_MONITOR_LOGS and monitorConnected()
+end
+
 scanPeripherals()
 
 if not reactor then
@@ -152,7 +172,7 @@ if not reactor then
     pcall(os.reboot)
 end
 
-if monitor then pcall(function() monitor.clear() end) end
+if monitorConnected() then pcall(function() monitor.clear() end) end
 
 -- ==================== RELAY HELPER FUNCTIONS ====================
 local function setRelayAll(value, allowDigital)
@@ -301,7 +321,7 @@ end
 -- Emit the previous action's log using the current cycle's follow-up EF/ER.
 -- This intentionally shifts visible log output by one completed action.
 local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
-    if not entry or not ENABLE_MONITOR_LOGS then return end
+    if not entry or not monitorLogsEnabled() then return end
 
     -- For an idle-jump cycle, use the settled EF/ER captured before the jump.
     if entry.cycleEndEfficiency ~= nil then
@@ -326,26 +346,34 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
         displayDiag = "Stable"
     end
 
-    -- Preserve the existing diagnostic decision, but pair a TR JUMP Wayfinding
-    -- row's second EF with the first EF of the associated Jump (+) row.
-    -- This is log-only; it does not affect sensor values or control decisions.
-    if displayDiag == "Jump (+)" then
-        lastJumpStartEfficiency = entry.beforeEfficiency
-    elseif displayDiag == "TR JUMP Wayfinding" and lastJumpStartEfficiency ~= nil then
-        measuredEfficiency = lastJumpStartEfficiency
+    -- Logs are inserted at the top of logHistory. Therefore the previously
+    -- emitted row becomes the row directly below this new row. Pair a TR JUMP
+    -- Wayfinding row only with that immediately adjacent Jump (+) row; never
+    -- reuse a stale Jump value from several rows earlier.
+    -- This changes only the displayed second EF, not sensor/control values.
+    local logEfficiency = measuredEfficiency
+    if displayDiag == "TR JUMP Wayfinding"
+        and lastEmittedLogDiag == "Jump (+)"
+        and lastEmittedLogStartEF ~= nil then
+        logEfficiency = lastEmittedLogStartEF
     end
 
     local compactLog = string.format(
         "#%03d St:%s Eff:%.2f->%.2f%% Err:%.0f(%ds) %s",
-        entry.id, entry.stepText, entry.beforeEfficiency, measuredEfficiency,
+        entry.id, entry.stepText, entry.beforeEfficiency, logEfficiency,
         measuredError, entry.cycleSeconds, string.sub(displayDiag, 1, 12)
     )
     table.insert(logHistory, 1, compactLog)
+
+    -- Track only the row just inserted. Reset the EF for every other row so
+    -- an unrelated Jump (+) cannot be incorrectly reused later.
+    lastEmittedLogDiag = displayDiag
+    lastEmittedLogStartEF = (displayDiag == "Jump (+)") and entry.beforeEfficiency or nil
     local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
     while #logHistory > maxLogLines do table.remove(logHistory) end
 end
 
-local function finishPendingAction(postEfficiency, postError)
+local function finishPendingAction(postEfficiency, postError, logsAllowed)
     if not pendingAction then return end
     if os.clock() < pendingAction.evaluateAt then return end
 
@@ -380,7 +408,7 @@ local function finishPendingAction(postEfficiency, postError)
             waitingForIdleJump = true
             directionProbePending = false
             directionKnown = false
-            stuckReason = string.format("Idle >= %.1f%%: waiting for jump", 95.0)
+            stuckReason = "Idle >= 95.0%: waiting for jump"
         elseif delta > 0 then
             controlDirection = action.direction
             directionProbePending = false
@@ -410,7 +438,7 @@ local function finishPendingAction(postEfficiency, postError)
     -- The displayed cycle log is one action behind by design:
     -- emit the previously saved row with this current follow-up measurement,
     -- then save this action for display when the next action has a follow-up reading.
-    if ENABLE_MONITOR_LOGS then
+    if action.monitorLogsEnabled and logsAllowed then
         if deferredCycleLog then
             emitDeferredCycleLog(deferredCycleLog, postEfficiency, postError)
         end
@@ -424,6 +452,8 @@ local function finishPendingAction(postEfficiency, postError)
         }
     else
         deferredCycleLog = nil
+        lastEmittedLogDiag = nil
+        lastEmittedLogStartEF = nil
     end
 
     pendingAction = nil
@@ -441,8 +471,12 @@ local function pulseListenerLoop()
             local now = os.clock()
             local deltaT = now - lastPulseTime
             lastPulseTime = now
-            lastDeltaT = deltaT
-            pulseCountTotal = pulseCountTotal + 1
+            local hasMonitor = monitorConnected()
+            local writePulseLogs = hasMonitor and ENABLE_MONITOR_LOGS
+            if hasMonitor then
+                lastDeltaT = deltaT
+                pulseCountTotal = pulseCountTotal + 1
+            end
 
             local desiredMultiplier = lowPerfMultiplier
             local validInterval = deltaT >= 0.05 and deltaT <= 30.0
@@ -458,7 +492,9 @@ local function pulseListenerLoop()
                     desiredMultiplier = 1
                 end
 
-                lastDesiredMultiplier = desiredMultiplier
+                if hasMonitor then
+                    lastDesiredMultiplier = desiredMultiplier
+                end
 
                 if desiredMultiplier ~= lowPerfMultiplier then
                     if desiredMultiplier == pulseTargetMultiplier then
@@ -477,19 +513,21 @@ local function pulseListenerLoop()
                 end
             end
 
-            local intervalText
-            if validInterval then
-                intervalText = string.format("Dt:%.3fs", deltaT)
-            else
-                intervalText = string.format("Dt:%.3f(out)", deltaT)
+            if writePulseLogs then
+                local intervalText
+                if validInterval then
+                    intervalText = string.format("Dt:%.3fs", deltaT)
+                else
+                    intervalText = string.format("Dt:%.3f(out)", deltaT)
+                end
+                local pulseLine = string.format(
+                    "#%03d %s Fac:%d Act:%d",
+                    pulseCountTotal, intervalText, lastDesiredMultiplier, lowPerfMultiplier
+                )
+                table.insert(pulseLogHistory, 1, pulseLine)
+                local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
+                while #pulseLogHistory > maxPulseLines do table.remove(pulseLogHistory) end
             end
-            local pulseLine = string.format(
-                "#%03d %s Fac:%d Act:%d",
-                pulseCountTotal, intervalText, lastDesiredMultiplier, lowPerfMultiplier
-            )
-            table.insert(pulseLogHistory, 1, pulseLine)
-            local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
-            while #pulseLogHistory > maxPulseLines do table.remove(pulseLogHistory) end
         end
 
         lastBottomState = bottomNow
@@ -500,17 +538,19 @@ end
 local function touchListenerLoop()
     while true do
         local _, _, x, y = os.pullEvent("monitor_touch")
-        if currentPage == 1 then
-            if y == monitorHeight then
-                currentPage = 2
-            elseif y == 7 then
-                ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
-            end
-        elseif currentPage == 2 then
-            if y == monitorHeight then
-                currentPage = 1
-            elseif y == 5 then
-                ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
+        if monitorConnected() and x and y then
+            if currentPage == 1 then
+                if y == monitorHeight then
+                    currentPage = 2
+                elseif y == 7 then
+                    ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
+                end
+            elseif currentPage == 2 then
+                if y == monitorHeight then
+                    currentPage = 1
+                elseif y == 5 then
+                    ENABLE_MONITOR_LOGS = not ENABLE_MONITOR_LOGS
+                end
             end
         end
     end
@@ -617,10 +657,19 @@ local function backgroundSensorLoop()
                 stuckNudgeActive = false
             end
 
-            secondCounter = secondCounter + effectiveTicks
-            while secondCounter >= 20 do
-                secondCounter = secondCounter - 20
-                secondsSinceLastGo = secondsSinceLastGo + 1
+            local logsAllowed = monitorLogsEnabled()
+            if logsAllowed then
+                secondCounter = secondCounter + effectiveTicks
+                while secondCounter >= 20 do
+                    secondCounter = secondCounter - 20
+                    secondsSinceLastGo = secondsSinceLastGo + 1
+                end
+            else
+                secondCounter = 0
+                secondsSinceLastGo = 0
+                deferredCycleLog = nil
+                lastEmittedLogDiag = nil
+                lastEmittedLogStartEF = nil
             end
 
             if lastPollEF ~= nil and eff == lastPollEF then
@@ -661,9 +710,9 @@ local function backgroundSensorLoop()
             elseif directionProbePending then
                 stuckReason = directionKnown and "Jump: test step +/-2 pending" or "Direction unclear: test +/-2 pending"
             elseif waitingForIdleJump then
-                stuckReason = string.format("Idle >= %.1f%%: waiting for jump", 95.0)
+                stuckReason = "Idle >= 95.0%: waiting for jump"
             elseif eff >= 95.0 then
-                stuckReason = string.format("Idle: EF >= %.1f%%", 95.0)
+                stuckReason = "Idle: EF >= 95.0%"
             else
                 if lastSensorEF ~= nil then
                     local delta = eff - lastSensorEF
@@ -683,7 +732,7 @@ local function backgroundSensorLoop()
 
             if eff > 0 then lastSensorEF = eff end
 
-            finishPendingAction(eff, err)
+            finishPendingAction(eff, err, logsAllowed)
         else
             liveDataValid = false
             executionGo = false
@@ -748,27 +797,38 @@ local function executionLoop()
                 )
 
                 if success then
-                    local signChar = (actionDirection == 1) and "+" or "-"
+                    local hasMonitor = monitorConnected()
+                    local actionLogsEnabled = hasMonitor and ENABLE_MONITOR_LOGS
                     local stepText
-                    if probeAction then
-                        stepText = "Wf" .. signChar .. "2"
-                    else
-                        local loggedStrength = actualStrength or effectiveStep
-                        stepText = signChar .. formatStep(loggedStrength)
-                        if separateNudge and nudgeApplied then stepText = stepText .. "+1" end
+                    if hasMonitor then
+                        local signChar = (actionDirection == 1) and "+" or "-"
+                        if probeAction then
+                            stepText = "Wf" .. signChar .. "2"
+                        else
+                            local loggedStrength = actualStrength or effectiveStep
+                            stepText = signChar .. formatStep(loggedStrength)
+                            if separateNudge and nudgeApplied then stepText = stepText .. "+1" end
+                        end
+                        lastAppliedStepText = stepText
+                        lastActionMode = modeOrError
                     end
 
-                    lastAppliedStepText = stepText
-                    lastActionMode = modeOrError
-                    logCounter = logCounter + 1
+                    local actionLogId = nil
+                    local actionCycleSeconds = nil
+                    if actionLogsEnabled then
+                        logCounter = logCounter + 1
+                        actionLogId = logCounter
+                        actionCycleSeconds = secondsSinceLastGo
+                    end
 
                     pendingAction = {
-                        id = logCounter,
+                        id = actionLogId,
                         direction = actionDirection,
                         stepText = stepText,
                         beforeEfficiency = currentEfficiency,
                         evaluateAt = os.clock() + 1.5,
-                        cycleSeconds = secondsSinceLastGo,
+                        cycleSeconds = actionCycleSeconds,
+                        monitorLogsEnabled = actionLogsEnabled,
                         usedNudge = nudgeApplied,
                         isProbe = probeAction
                     }
@@ -797,7 +857,7 @@ local function executionLoop()
                 elseif waitingForIdleJump then
                     stuckReason = "Idle: waiting for jump"
                 elseif currentEfficiency >= 95.0 then
-                    stuckReason = string.format("Idle: EF >= %.1f%%", 95.0)
+                    stuckReason = "Idle: EF >= 95.0%"
                 elseif not liveIsRunning or currentEfficiency == 0 then
                     stuckReason = "No control: standby"
                 end
@@ -830,166 +890,241 @@ local function clearLineAt(y)
     monitor.clearLine()
 end
 
-local function writeHeader(text)
-    monitor.setCursorPos(1, 1)
+-- Compares the values that determine a row's visible content. Formatting and
+-- monitor API calls happen only when at least one of these values changes.
+-- Painter functions are defined once (not created in the 0.25s loop) to avoid
+-- per-refresh closure allocations.
+local function renderCachedLine(y, painter, painterArg, ...)
+    local cached = renderedLines[y]
+    local count = select("#", ...)
+    local changed = not cached or cached.count ~= count
+
+    if not changed then
+        for i = 1, count do
+            if cached.values[i] ~= select(i, ...) then
+                changed = true
+                break
+            end
+        end
+    end
+
+    if not changed then return end
+
+    local values = {}
+    for i = 1, count do values[i] = select(i, ...) end
+    renderedLines[y] = { count = count, values = values }
+
+    if fullRedraw then
+        monitor.setCursorPos(1, y)
+    else
+        clearLineAt(y)
+    end
+    painter(painterArg)
+end
+
+local function drawPage1Header()
     monitor.setBackgroundColor(colors.blue)
     monitor.setTextColor(colors.white)
-    monitor.clearLine()
-    monitor.write(text)
+    monitor.write(string.format("=== FUSION CONTROL %s (1/2) ===", SCRIPT_VERSION))
     monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+end
+
+local function drawPage1Mode()
+    monitor.write("Mode: ")
+    if not liveDataValid then
+        monitor.setTextColor(colors.red)
+        monitor.write("SENSOR? ")
+    elseif liveEF >= 95.0 then
+        monitor.setTextColor(colors.cyan)
+        monitor.write("IDLE ")
+    elseif liveIsRunning and liveEF > 0 then
+        monitor.setTextColor(colors.green)
+        monitor.write("RUN  ")
+    elseif hasEverRun and liveEF == 0 then
+        monitor.setTextColor(colors.red)
+        monitor.write("CRASH")
+    else
+        monitor.setTextColor(colors.orange)
+        monitor.write("STAND")
+    end
+    monitor.setTextColor(colors.white)
+    monitor.write(string.format(" | EF: %.2f%%", liveEF))
+end
+
+local function drawPage1Temperature()
+    monitor.write(string.format("Case: %.1fM K | ER: ", liveCaseTemp / 1000000))
+    if liveER > 50 then monitor.setTextColor(colors.red) end
+    monitor.write(string.format("%.1f", liveER))
+    monitor.setTextColor(colors.white)
+end
+
+local function drawPage1Step()
+    if lastAppliedStepText then
+        monitor.write(string.format("Step: %s | Action: %s", lastAppliedStepText, lastActionMode))
+    else
+        monitor.write("Step: -- | No action yet")
+    end
+end
+
+local function drawPage1Diagnostic()
+    monitor.setTextColor(colors.cyan)
+    monitor.write("Diag: " .. string.sub(stuckReason, 1, math.max(1, monitorHeight > 30 and 35 or 28)))
+    monitor.setTextColor(colors.white)
+end
+
+local function drawPage1Sensor()
+    local currentTicks = 4 * lowPerfMultiplier
+    monitor.write(string.format("Sensor: %dt / %.2fs | Factor x%d%s",
+        currentTicks, currentTicks / 20, lowPerfMultiplier, " AUTO"))
+end
+
+local function drawPage1LogTitle()
+    monitor.setTextColor(colors.lightGray)
+    monitor.write("--- CYCLE LOGS [")
+    if ENABLE_MONITOR_LOGS then
+        monitor.setTextColor(colors.green)
+        monitor.write("ON")
+    else
+        monitor.setTextColor(colors.red)
+        monitor.write("OFF")
+    end
+    monitor.setTextColor(colors.lightGray)
+    monitor.write("] ---")
+    monitor.setTextColor(colors.white)
+end
+
+local function drawPage1LogRow(index)
+    if ENABLE_MONITOR_LOGS then
+        local line = logHistory[index]
+        if line then monitor.write(line) end
+    elseif index == 1 then
+        monitor.setTextColor(colors.gray)
+        monitor.write("  (Logs are disabled)")
+        monitor.setTextColor(colors.white)
+    end
+end
+
+local function drawPage1Footer()
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.yellow)
+    monitor.write("[ Click for Page 2: Redstone Log ]")
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+end
+
+local function drawPage2Header()
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write("=== REDSTONE INPUT LOG (2/2) ===")
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+end
+
+local function drawPage2PulseSummary()
+    monitor.write("Computer-bottom: ")
+    if lastBottomState then
+        monitor.setTextColor(colors.green)
+        monitor.write("AN ")
+    else
+        monitor.setTextColor(colors.lightGray)
+        monitor.write("AUS ")
+    end
+    monitor.setTextColor(colors.white)
+    local dtText = lastDeltaT and string.format("%.3fs", lastDeltaT) or "--"
+    monitor.write(string.format("| Pulse: %d | Dt: %s", pulseCountTotal, dtText))
+end
+
+local function drawPage2Multiplier()
+    local currentTicks = 4 * lowPerfMultiplier
+    monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
+        lastDesiredMultiplier, lowPerfMultiplier, currentTicks, currentTicks / 20))
+end
+
+local function drawPage2LogTitle()
+    monitor.setTextColor(colors.lightGray)
+    monitor.write("--- EINGANGSIMPULSE [")
+    if ENABLE_MONITOR_LOGS then
+        monitor.setTextColor(colors.green)
+        monitor.write("AN")
+    else
+        monitor.setTextColor(colors.red)
+        monitor.write("AUS")
+    end
+    monitor.setTextColor(colors.lightGray)
+    monitor.write("] ---")
+    monitor.setTextColor(colors.white)
+end
+
+local function drawPage2LogRow(index)
+    if ENABLE_MONITOR_LOGS then
+        local line = pulseLogHistory[index]
+        if line then monitor.write(line) end
+    elseif index == 1 then
+        monitor.setTextColor(colors.gray)
+        monitor.write("  (Logs sind deaktiviert)")
+        monitor.setTextColor(colors.white)
+    end
+end
+
+local function drawPage2Footer()
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.yellow)
+    monitor.write("[ Klick für Seite 1: Haupt-UI ]")
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
 end
 
 local function uiLoop()
     while true do
-        if monitor then
+        if monitorConnected() then
             if lastRenderedPage ~= currentPage then
                 pcall(function() monitor.clear() end)
                 lastRenderedPage = currentPage
+                renderedLines = {}
+                fullRedraw = true
             end
 
             if currentPage == 1 then
-                writeHeader(string.format("=== FUSION CONTROL %s (1/2) ===", SCRIPT_VERSION))
+                renderCachedLine(1, drawPage1Header, nil, SCRIPT_VERSION)
+                renderCachedLine(2, drawPage1Mode, nil,
+                    liveDataValid, liveEF, liveIsRunning, hasEverRun)
+                renderCachedLine(3, drawPage1Temperature, nil, liveCaseTemp, liveER)
+                renderCachedLine(4, drawPage1Step, nil, lastAppliedStepText or false, lastActionMode)
+                renderCachedLine(5, drawPage1Diagnostic, nil, stuckReason, monitorHeight)
+                renderCachedLine(6, drawPage1Sensor, nil, lowPerfMultiplier)
+                renderCachedLine(7, drawPage1LogTitle, nil, ENABLE_MONITOR_LOGS)
 
-                clearLineAt(2)
-                monitor.write("Mode: ")
-                if not liveDataValid then
-                    monitor.setTextColor(colors.red)
-                    monitor.write("SENSOR? ")
-                elseif liveEF >= 95.0 then
-                    monitor.setTextColor(colors.cyan)
-                    monitor.write("IDLE ")
-                elseif liveIsRunning and liveEF > 0 then
-                    monitor.setTextColor(colors.green)
-                    monitor.write("RUN  ")
-                elseif hasEverRun and liveEF == 0 then
-                    monitor.setTextColor(colors.red)
-                    monitor.write("CRASH")
-                else
-                    monitor.setTextColor(colors.orange)
-                    monitor.write("STAND")
-                end
-                monitor.setTextColor(colors.white)
-                monitor.write(string.format(" | EF: %.2f%%", liveEF))
-
-                clearLineAt(3)
-                monitor.write(string.format("Case: %.1fM K | ER: ", liveCaseTemp / 1000000))
-                if liveER > 50 then monitor.setTextColor(colors.red) end
-                monitor.write(string.format("%.1f", liveER))
-                monitor.setTextColor(colors.white)
-
-                clearLineAt(4)
-                if lastAppliedStepText then
-                    monitor.write(string.format("Step: %s | Action: %s", lastAppliedStepText, lastActionMode))
-                else
-                    monitor.write("Step: -- | No action yet")
+                local maxLogLines = math.max(1, monitorHeight - 9)
+                for i = 1, maxLogLines do
+                    renderCachedLine(7 + i, drawPage1LogRow, i,
+                        ENABLE_MONITOR_LOGS, logHistory[i] or false)
                 end
 
-                clearLineAt(5)
-                monitor.setTextColor(colors.cyan)
-                monitor.write("Diag: " .. string.sub(stuckReason, 1, math.max(1, monitorHeight > 30 and 35 or 28)))
-                monitor.setTextColor(colors.white)
-
-                clearLineAt(6)
-                local currentTicks = 4 * lowPerfMultiplier
-                monitor.write(string.format("Sensor: %dt / %.2fs | Factor x%d%s",
-                    currentTicks, currentTicks / 20,
-                    lowPerfMultiplier,
-                    " AUTO"))
-
-                clearLineAt(7)
-                monitor.setTextColor(colors.lightGray)
-                monitor.write("--- CYCLE LOGS [")
-                if ENABLE_MONITOR_LOGS then
-                    monitor.setTextColor(colors.green)
-                    monitor.write("ON")
-                else
-                    monitor.setTextColor(colors.red)
-                    monitor.write("OFF")
-                end
-                monitor.setTextColor(colors.lightGray)
-                monitor.write("] ---")
-                monitor.setTextColor(colors.white)
-
-                if ENABLE_MONITOR_LOGS then
-                    local maxLogLines = math.max(1, monitorHeight - 9)
-                    for i = 1, maxLogLines do
-                        clearLineAt(7 + i)
-                        if logHistory[i] then monitor.write(logHistory[i]) end
-                    end
-                else
-                    clearLineAt(8)
-                    monitor.setTextColor(colors.gray)
-                    monitor.write("  (Logs are disabled)")
-                    monitor.setTextColor(colors.white)
-                end
-
-                if monitorHeight >= 1 then
-                    clearLineAt(monitorHeight)
-                    monitor.setBackgroundColor(colors.gray)
-                    monitor.setTextColor(colors.yellow)
-                    monitor.write("[ Click for Page 2: Redstone Log ]")
-                    monitor.setBackgroundColor(colors.black)
-                    monitor.setTextColor(colors.white)
-                end
+                renderCachedLine(monitorHeight, drawPage1Footer, nil, monitorHeight)
             else
-                writeHeader("=== REDSTONE INPUT LOG (2/2) ===")
+                renderCachedLine(1, drawPage2Header, nil, SCRIPT_VERSION)
+                renderCachedLine(3, drawPage2PulseSummary, nil,
+                    lastBottomState, pulseCountTotal, lastDeltaT or false)
+                renderCachedLine(4, drawPage2Multiplier, nil,
+                    lastDesiredMultiplier, lowPerfMultiplier)
+                renderCachedLine(5, drawPage2LogTitle, nil, ENABLE_MONITOR_LOGS)
 
-                clearLineAt(3)
-                local bottomState = redstone.getInput("bottom")
-                monitor.write("Computer-bottom: ")
-                if bottomState then
-                    monitor.setTextColor(colors.green)
-                    monitor.write("AN ")
-                else
-                    monitor.setTextColor(colors.lightGray)
-                    monitor.write("AUS ")
-                end
-                monitor.setTextColor(colors.white)
-                local dtText = lastDeltaT and string.format("%.3fs", lastDeltaT) or "--"
-                monitor.write(string.format("| Pulse: %d | Dt: %s", pulseCountTotal, dtText))
-                clearLineAt(4)
-                local currentTicks = 4 * lowPerfMultiplier
-                monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
-                    lastDesiredMultiplier, lowPerfMultiplier,
-                    currentTicks, currentTicks / 20))
-
-                clearLineAt(5)
-                monitor.setTextColor(colors.lightGray)
-                monitor.write("--- EINGANGSIMPULSE [")
-                if ENABLE_MONITOR_LOGS then
-                    monitor.setTextColor(colors.green)
-                    monitor.write("AN")
-                else
-                    monitor.setTextColor(colors.red)
-                    monitor.write("AUS")
-                end
-                monitor.setTextColor(colors.lightGray)
-                monitor.write("] ---")
-                monitor.setTextColor(colors.white)
-
-                if ENABLE_MONITOR_LOGS then
-                    local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
-                    for i = 1, maxPulseLines do
-                        if pulseLogHistory[i] then
-                            clearLineAt(5 + i)
-                            monitor.write(pulseLogHistory[i])
-                        end
-                    end
-                else
-                    clearLineAt(7)
-                    monitor.setTextColor(colors.gray)
-                    monitor.write("  (Logs sind deaktiviert)")
-                    monitor.setTextColor(colors.white)
+                local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
+                for i = 1, maxPulseLines do
+                    renderCachedLine(5 + i, drawPage2LogRow, i,
+                        ENABLE_MONITOR_LOGS, pulseLogHistory[i] or false)
                 end
 
-                if monitorHeight >= 1 then
-                    clearLineAt(monitorHeight)
-                    monitor.setBackgroundColor(colors.gray)
-                    monitor.setTextColor(colors.yellow)
-                    monitor.write("[ Klick für Seite 1: Haupt-UI ]")
-                    monitor.setBackgroundColor(colors.black)
-                    monitor.setTextColor(colors.white)
-                end
+                renderCachedLine(monitorHeight, drawPage2Footer, nil, monitorHeight)
+            end
+            fullRedraw = false
+        else
+            -- Force a clean redraw if the monitor is disconnected and later returns.
+            if lastRenderedPage ~= nil then
+                lastRenderedPage = nil
+                renderedLines = {}
+                fullRedraw = true
             end
         end
         sleep(0.25)
