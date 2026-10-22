@@ -1,21 +1,4 @@
--- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.25
--- v3.25: TR JUMP Wayfinding captures the next action's start EF at action launch,
---         then uses that exact stored value in the deferred log row.
--- v3.23: Case temperature display value refreshes at most once per second.
---         Idle/waiting diagnostics use one stable label to prevent text flicker.
--- v3.22: Monitor rows are redrawn only when their displayed inputs change.
---         Preserves the 0.25s UI check while avoiding repeat formatting and terminal writes.
--- v3.21: Defaults monitor logs to OFF and gates monitor/log work on a connected monitor.
--- Changes in v3.18:
---   * Removes unused calculation helper and dead state/log fields.
---   * Inlines immutable settings except SCRIPT_VERSION and ENABLE_MONITOR_LOGS.
---   * Retains the one-time fixed relay-side list; removes redundant local state.
---   * Keeps control decisions, sensor timing, stability checks, and log behavior unchanged.
--- Preserves v3.17 cycle-end EF/ER snapshot behavior and Jump diagnostic labels.
--- v3.20 pairs TR JUMP Wayfinding only with the immediately adjacent rendered Jump (+) row.
--- ============================================================
-local SCRIPT_VERSION = "v3.25"
+local SCRIPT_VERSION = "v3.36"
 
 local reactor = nil
 local monitor = nil
@@ -344,7 +327,7 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     elseif entry.isProbe then
         displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
     elseif displayDelta > 0 then
-        displayDiag = "+"
+        displayDiag = "Jump (?)"
     elseif displayDelta < 0 then
         displayDiag = "Falling"
     else
@@ -716,9 +699,9 @@ local function backgroundSensorLoop()
                     if math.abs(delta) >= 3.0 then
                         stuckReason = (delta < 0) and "Sensor jump (-)" or "Sensor jump (+)"
                     elseif delta > 0 then
-                        stuckReason = "+"
+                        stuckReason = "+?1"
                     elseif delta < 0 then
-                        stuckReason = "-"
+                        stuckReason = "-?1"
                     else
                         stuckReason = "Stalled"
                     end
@@ -798,7 +781,7 @@ local function executionLoop()
                     local actionLogsEnabled = hasMonitor and ENABLE_MONITOR_LOGS
                     local stepText
                     if hasMonitor then
-                        local signChar = (actionDirection == 1) and "+" or "-"
+                        local signChar = (actionDirection == 1) and "+?2" or "-?2"
                         if probeAction then
                             stepText = "Wf" .. signChar .. "2"
                         else
