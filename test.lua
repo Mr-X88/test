@@ -1,7 +1,7 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.24
--- v3.24: TR JUMP Wayfinding uses the start EF of the next completed Jump (+) action,
---         rather than the start EF of the previously emitted (older) Jump (+) row.
+-- BETTER FUSION REACTOR CONTROLLER v3.25
+-- v3.25: TR JUMP Wayfinding captures the next action's start EF at action launch,
+--         then uses that exact stored value in the deferred log row.
 -- v3.23: Case temperature display value refreshes at most once per second.
 --         Idle/waiting diagnostics use one stable label to prevent text flicker.
 -- v3.22: Monitor rows are redrawn only when their displayed inputs change.
@@ -15,7 +15,7 @@
 -- Preserves v3.17 cycle-end EF/ER snapshot behavior and Jump diagnostic labels.
 -- v3.20 pairs TR JUMP Wayfinding only with the immediately adjacent rendered Jump (+) row.
 -- ============================================================
-local SCRIPT_VERSION = "v3.24"
+local SCRIPT_VERSION = "v3.25"
 
 local reactor = nil
 local monitor = nil
@@ -325,8 +325,7 @@ end
 
 -- Emit the previous action's log using the current cycle's follow-up EF/ER.
 -- This intentionally shifts visible log output by one completed action.
-local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError,
-                                     followingActionStartEF, followingActionIsJumpPlus)
+local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     if not entry or not monitorLogsEnabled() then return end
 
     -- For an idle-jump cycle, use the settled EF/ER captured before the jump.
@@ -352,17 +351,14 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError,
         displayDiag = "Stable"
     end
 
-    -- This row is emitted one action late. Pair a TR JUMP Wayfinding row with
-    -- the START EF of the action that has just completed, but only when that
-    -- current/following action is itself a Jump (+). Do not use the previously
-    -- emitted row: that is an older action and causes the off-by-one pairing
-    -- seen in logs such as 30.63->57.32 instead of 30.63->32.19.
+    -- TR JUMP Wayfinding must show the starting EF of the immediately following
+    -- control cycle. Capture that value when the following action is launched;
+    -- do not infer it later from a post-action sensor reading or another log row.
     -- This changes only the displayed second EF, not sensor/control values.
     local logEfficiency = measuredEfficiency
     if displayDiag == "TR JUMP Wayfinding"
-        and followingActionIsJumpPlus == true
-        and isFiniteNumber(followingActionStartEF) then
-        logEfficiency = followingActionStartEF
+        and isFiniteNumber(entry.followingCycleStartEfficiency) then
+        logEfficiency = entry.followingCycleStartEfficiency
     end
 
     local compactLog = string.format(
@@ -443,14 +439,9 @@ local function finishPendingAction(postEfficiency, postError, logsAllowed)
     -- then save this action for display when the next action has a follow-up reading.
     if action.monitorLogsEnabled and logsAllowed then
         if deferredCycleLog then
-            -- The deferred row is logged now, one action later. Use this
-            -- just-completed action as the look-ahead for Wayfinding pairing.
-            local followingDelta = postEfficiency - action.beforeEfficiency
-            local followingActionIsJumpPlus = not action.usedNudge and followingDelta >= 16.0
-            emitDeferredCycleLog(
-                deferredCycleLog, postEfficiency, postError,
-                action.beforeEfficiency, followingActionIsJumpPlus
-            )
+            -- The previous row already stores the next action's start EF, captured
+            -- at launch. Keep the delayed log emission from guessing that value.
+            emitDeferredCycleLog(deferredCycleLog, postEfficiency, postError)
         end
         deferredCycleLog = {
             id = action.id,
@@ -825,6 +816,15 @@ local function executionLoop()
                         logCounter = logCounter + 1
                         actionLogId = logCounter
                         actionCycleSeconds = secondsSinceLastGo
+
+                        -- At the exact start of this action, store its starting EF
+                        -- on the previous deferred row. The row may be emitted later,
+                        -- but its second EF must remain this start value (e.g. 32.19),
+                        -- not a later follow-up value (e.g. 57.32).
+                        if deferredCycleLog and
+                           deferredCycleLog.followingCycleStartEfficiency == nil then
+                            deferredCycleLog.followingCycleStartEfficiency = currentEfficiency
+                        end
                     end
 
                     pendingAction = {
