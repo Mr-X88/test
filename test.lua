@@ -1,5 +1,7 @@
 -- ============================================================
--- BETTER FUSION REACTOR CONTROLLER v3.23
+-- BETTER FUSION REACTOR CONTROLLER v3.24
+-- v3.24: TR JUMP Wayfinding uses the start EF of the next completed Jump (+) action,
+--         rather than the start EF of the previously emitted (older) Jump (+) row.
 -- v3.23: Case temperature display value refreshes at most once per second.
 --         Idle/waiting diagnostics use one stable label to prevent text flicker.
 -- v3.22: Monitor rows are redrawn only when their displayed inputs change.
@@ -13,7 +15,7 @@
 -- Preserves v3.17 cycle-end EF/ER snapshot behavior and Jump diagnostic labels.
 -- v3.20 pairs TR JUMP Wayfinding only with the immediately adjacent rendered Jump (+) row.
 -- ============================================================
-local SCRIPT_VERSION = "v3.23"
+local SCRIPT_VERSION = "v3.24"
 
 local reactor = nil
 local monitor = nil
@@ -48,8 +50,6 @@ local stableExecutionEfficiency = nil
 local lastExecutionTime = -3.0
 local pendingAction = nil           -- Exactly one action waiting for re-evaluation
 local deferredCycleLog = nil        -- Previous completed action; emitted on the next action's follow-up reading
-local lastEmittedLogDiag = nil       -- Diagnostic of the row currently directly below the next inserted row
-local lastEmittedLogStartEF = nil     -- Start EF of that row, used only for exact TR/Jump log pairing
 -- Settled EF/ER snapshot. Refreshed only after the existing EF stability check succeeds.
 -- Kept until the next idle jump so the deferred log can report the pre-jump cycle end.
 local idleCycleEF = nil
@@ -325,7 +325,8 @@ end
 
 -- Emit the previous action's log using the current cycle's follow-up EF/ER.
 -- This intentionally shifts visible log output by one completed action.
-local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
+local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError,
+                                     followingActionStartEF, followingActionIsJumpPlus)
     if not entry or not monitorLogsEnabled() then return end
 
     -- For an idle-jump cycle, use the settled EF/ER captured before the jump.
@@ -351,16 +352,17 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
         displayDiag = "Stable"
     end
 
-    -- Logs are inserted at the top of logHistory. Therefore the previously
-    -- emitted row becomes the row directly below this new row. Pair a TR JUMP
-    -- Wayfinding row only with that immediately adjacent Jump (+) row; never
-    -- reuse a stale Jump value from several rows earlier.
+    -- This row is emitted one action late. Pair a TR JUMP Wayfinding row with
+    -- the START EF of the action that has just completed, but only when that
+    -- current/following action is itself a Jump (+). Do not use the previously
+    -- emitted row: that is an older action and causes the off-by-one pairing
+    -- seen in logs such as 30.63->57.32 instead of 30.63->32.19.
     -- This changes only the displayed second EF, not sensor/control values.
     local logEfficiency = measuredEfficiency
     if displayDiag == "TR JUMP Wayfinding"
-        and lastEmittedLogDiag == "Jump (+)"
-        and lastEmittedLogStartEF ~= nil then
-        logEfficiency = lastEmittedLogStartEF
+        and followingActionIsJumpPlus == true
+        and isFiniteNumber(followingActionStartEF) then
+        logEfficiency = followingActionStartEF
     end
 
     local compactLog = string.format(
@@ -370,10 +372,6 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     )
     table.insert(logHistory, 1, compactLog)
 
-    -- Track only the row just inserted. Reset the EF for every other row so
-    -- an unrelated Jump (+) cannot be incorrectly reused later.
-    lastEmittedLogDiag = displayDiag
-    lastEmittedLogStartEF = (displayDiag == "Jump (+)") and entry.beforeEfficiency or nil
     local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
     while #logHistory > maxLogLines do table.remove(logHistory) end
 end
@@ -445,7 +443,14 @@ local function finishPendingAction(postEfficiency, postError, logsAllowed)
     -- then save this action for display when the next action has a follow-up reading.
     if action.monitorLogsEnabled and logsAllowed then
         if deferredCycleLog then
-            emitDeferredCycleLog(deferredCycleLog, postEfficiency, postError)
+            -- The deferred row is logged now, one action later. Use this
+            -- just-completed action as the look-ahead for Wayfinding pairing.
+            local followingDelta = postEfficiency - action.beforeEfficiency
+            local followingActionIsJumpPlus = not action.usedNudge and followingDelta >= 16.0
+            emitDeferredCycleLog(
+                deferredCycleLog, postEfficiency, postError,
+                action.beforeEfficiency, followingActionIsJumpPlus
+            )
         end
         deferredCycleLog = {
             id = action.id,
@@ -457,8 +462,6 @@ local function finishPendingAction(postEfficiency, postError, logsAllowed)
         }
     else
         deferredCycleLog = nil
-        lastEmittedLogDiag = nil
-        lastEmittedLogStartEF = nil
     end
 
     pendingAction = nil
@@ -673,8 +676,6 @@ local function backgroundSensorLoop()
                 secondCounter = 0
                 secondsSinceLastGo = 0
                 deferredCycleLog = nil
-                lastEmittedLogDiag = nil
-                lastEmittedLogStartEF = nil
             end
 
             if lastPollEF ~= nil and eff == lastPollEF then
