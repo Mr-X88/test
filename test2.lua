@@ -325,13 +325,13 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     elseif math.abs(displayDelta) >= 16.0 then
         displayDiag = (displayDelta > 0) and "Move right direction" or "Move wrong direction"
     elseif entry.isProbe then
-        displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
+        displayDiag = (displayDelta == 0) and "Runs into a wall (100 or 0) or the effect is not being read correctly " or "TR JUMP Wayfinding"
     elseif displayDelta > 0 then
         displayDiag = "Move uncertain direction"
     elseif displayDelta < 0 then
         displayDiag = "Move Without checking the direction"
     else
-        displayDiag = "Stable"
+        displayDiag = "Runs into a wall (100 or 0) or the effect is not being read correctly"
     end
 
     local logEfficiency = measuredEfficiency
@@ -903,7 +903,7 @@ local function drawPage1Mode()
     monitor.write("Mode: ")
     if not liveDataValid then
         monitor.setTextColor(colors.red)
-        monitor.write("SENSOR? ")
+        monitor.write("SENSOR No feedback ")
     elseif monitorEF >= 95.0 then
         monitor.setTextColor(colors.cyan)
         monitor.write("IDLE ")
