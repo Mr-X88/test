@@ -1,9 +1,10 @@
-local SCRIPT_VERSION = "v3.42"
+local SCRIPT_VERSION = "v3.43"
 
 local reactor = nil
 local monitor = nil
 local monitorName = nil
 local relay = nil
+local monitorWidth = 8
 local monitorHeight = 25
 local sides = {"top", "bottom", "left", "right", "front", "back"}
 
@@ -126,9 +127,12 @@ local function scanPeripherals()
                 monitor = wrapped
                 monitorName = name
                 pcall(function() monitor.setTextScale(0.5) end)
-                local okSize, _, height = pcall(function() return monitor.getSize() end)
-                if okSize and type(height) == "number" then monitorHeight = height end
-                print(" -> Color Monitor: " .. name .. " (H=" .. monitorHeight .. ")")
+                local okSize, width, height = pcall(function() return monitor.getSize() end)
+                if okSize then
+                    if type(width) == "number" then monitorWidth = width end
+                    if type(height) == "number" then monitorHeight = height end
+                end
+                print(" -> Color Monitor: " .. name .. " (WxH=" .. monitorWidth .. "x" .. monitorHeight .. ")")
             end
         elseif wrapped and (
             typeMatches(pType, "redstoneIntegrator") or
@@ -890,7 +894,7 @@ end
 local function drawPage1Header()
     monitor.setBackgroundColor(colors.blue)
     monitor.setTextColor(colors.white)
-    monitor.write(string.format("=== FUSION CONTROL %s (1/2) ===", SCRIPT_VERSION))
+    monitor.write(string.format("=== FUSION CONTROL %s %dx%d (1/2) ===", SCRIPT_VERSION, monitorWidth, monitorHeight))
     monitor.setBackgroundColor(colors.black)
     monitor.setTextColor(colors.white)
 end
@@ -934,7 +938,7 @@ end
 
 local function drawPage1Diagnostic()
     monitor.setTextColor(colors.cyan)
-    monitor.write("Diag: " .. string.sub(stuckReason, 1, math.max(1, monitorHeight > 30 and 35 or 28)))
+    monitor.write("Diag: " .. string.sub(stuckReason, 1, math.max(1, monitorWidth > 30 and 35 or 28)))
     monitor.setTextColor(colors.white)
 end
 
@@ -981,7 +985,7 @@ end
 local function drawPage2Header()
     monitor.setBackgroundColor(colors.blue)
     monitor.setTextColor(colors.white)
-    monitor.write("=== REDSTONE INPUT LOG (2/2) ===")
+    monitor.write(string.format("=== REDSTONE INPUT LOG %dx%d (2/2) ===", monitorWidth, monitorHeight))
     monitor.setBackgroundColor(colors.black)
     monitor.setTextColor(colors.white)
 end
