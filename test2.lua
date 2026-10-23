@@ -1,4 +1,4 @@
-local SCRIPT_VERSION = "v3.36"
+local SCRIPT_VERSION = "v3.37"
 
 local reactor = nil
 local monitor = nil
