@@ -323,13 +323,13 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     if entry.usedNudge then
         displayDiag = "Nudge"
     elseif math.abs(displayDelta) >= 16.0 then
-        displayDiag = (displayDelta > 0) and "Jump (+)" or "Move wrong direction"
+        displayDiag = (displayDelta > 0) and "Move right direction" or "Move wrong direction"
     elseif entry.isProbe then
         displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
     elseif displayDelta > 0 then
-        displayDiag = "Jump (?)"
+        displayDiag = "Move uncertain direction"
     elseif displayDelta < 0 then
-        displayDiag = "Move wrong direction"
+        displayDiag = "Move Without checking the direction"
     else
         displayDiag = "Stable"
     end
