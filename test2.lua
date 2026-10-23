@@ -323,21 +323,17 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     if entry.usedNudge then
         displayDiag = "Nudge"
     elseif math.abs(displayDelta) >= 16.0 then
-        displayDiag = (displayDelta > 0) and "Move right direction" or "Move in the wrong direction"
+        displayDiag = (displayDelta > 0) and "Jump (+)" or "Move wrong direction"
     elseif entry.isProbe then
         displayDiag = (displayDelta == 0) and "Test?" or "TR JUMP Wayfinding"
     elseif displayDelta > 0 then
-        displayDiag = "Move right direction"
+        displayDiag = "Jump (?)"
     elseif displayDelta < 0 then
-        displayDiag = "Move in the wrong direction"
+        displayDiag = "Move wrong direction"
     else
-        displayDiag = "Stable Value limit"
+        displayDiag = "Stable"
     end
 
-    -- TR JUMP Wayfinding must show the starting EF of the immediately following
-    -- control cycle. Capture that value when the following action is launched;
-    -- do not infer it later from a post-action sensor reading or another log row.
-    -- This changes only the displayed second EF, not sensor/control values.
     local logEfficiency = measuredEfficiency
     if displayDiag == "TR JUMP Wayfinding"
         and isFiniteNumber(entry.followingCycleStartEfficiency) then
@@ -345,9 +341,9 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     end
 
     local compactLog = string.format(
-        "#%03d St:% Eff:%.2f->%.2f%% Err:%.0f(%ds) %s",
-        entry.id, entry.stepText, entry.beforeEfficiency, logEfficiency,
-        measuredError, entry.cycleSeconds, string.sub(displayDiag, 1, 12)
+        "#%03d %ds %s eff:%.2f->%.2f%% Err:%.0f %s",
+        entry.id, entry.cycleSeconds, entry.stepText, entry.beforeEfficiency, logEfficiency,
+        measuredError, string.sub(displayDiag, 1, 16)
     )
     table.insert(logHistory, 1, compactLog)
 
@@ -417,13 +413,8 @@ local function finishPendingAction(postEfficiency, postError, logsAllowed)
         end
     end
 
-    -- The displayed cycle log is one action behind by design:
-    -- emit the previously saved row with this current follow-up measurement,
-    -- then save this action for display when the next action has a follow-up reading.
     if action.monitorLogsEnabled and logsAllowed then
         if deferredCycleLog then
-            -- The previous row already stores the next action's start EF, captured
-            -- at launch. Keep the delayed log emission from guessing that value.
             emitDeferredCycleLog(deferredCycleLog, postEfficiency, postError)
         end
         deferredCycleLog = {
@@ -567,16 +558,10 @@ local function backgroundSensorLoop()
                 math.abs(eff - previousSensorEfficiency) >= 3.0
             local observedMovement = lastPollEF ~= nil and eff ~= lastPollEF
 
-            -- Any EF movement requires a fresh snapshot after the same existing
-            -- stability check succeeds. Do not attach the old snapshot here:
-            -- an ordinary step toward the peak is not the end-of-cycle jump.
             if observedMovement then
                 idleSnapshotRefreshPending = true
             end
 
-            -- A falling jump marks the end of the previously settled cycle.
-            -- Preserve its last stable snapshot without requiring EF >= 95%.
-            -- Rising jumps must not pin the older, lower value to this log row.
             if observedJump and previousSensorEfficiency ~= nil and eff < previousSensorEfficiency then
                 if idleCycleEF ~= nil and deferredCycleLog ~= nil and
                    deferredCycleLog.cycleEndEfficiency == nil then
@@ -601,7 +586,7 @@ local function backgroundSensorLoop()
                         controlDirection = -controlDirection
                         stuckReason = "Corrects It went wrong : direction reversed from sensor"
                     else
-                        directionProbePending = truest
+                        directionProbePending = true
                         directionKnown = false
                         stuckReason = "Jump ambiguous: direction test +/-2"
                     end
@@ -659,8 +644,6 @@ local function backgroundSensorLoop()
                     stableExecutionEfficiency = eff
                     unchangedPollCount = 0
 
-                    -- Snapshot follows the existing unchanged-EF stability check;
-                    -- EF does not have to be >= 95.0 to be saved.
                     if idleCycleEF == nil or
                        idleSnapshotRefreshPending then
                         idleCycleEF = eff
@@ -697,7 +680,7 @@ local function backgroundSensorLoop()
                 if lastSensorEF ~= nil then
                     local delta = eff - lastSensorEF
                     if math.abs(delta) >= 3.0 then
-                        stuckReason = (delta < 0) and "Sensor jump (-)" or "Sensor jump (+)"
+                        stuckReason = (delta < 0) and "Move wrong direction" or "Move right direction"
                     elseif delta > 0 then
                         stuckReason = "eff rising now"
                     elseif delta < 0 then
@@ -742,7 +725,6 @@ end
 local function executionLoop()
     while true do
         local now = os.clock()
-        -- POINT A FIX: Strictly enforce 3.0 regardless of executionGo
         if executionGo and stableExecutionEfficiency ~= nil and
            stableExecutionEfficiency == liveEF and not pendingAction and
            now - lastExecutionTime >= 3.0 then
@@ -800,10 +782,6 @@ local function executionLoop()
                         actionLogId = logCounter
                         actionCycleSeconds = secondsSinceLastGo
 
-                        -- At the exact start of this action, store its starting EF
-                        -- on the previous deferred row. The row may be emitted later,
-                        -- but its second EF must remain this start value (e.g. 32.19),
-                        -- not a later follow-up value (e.g. 57.32).
                         if deferredCycleLog and
                            deferredCycleLog.followingCycleStartEfficiency == nil then
                             deferredCycleLog.followingCycleStartEfficiency = currentEfficiency
@@ -879,10 +857,6 @@ local function clearLineAt(y)
     monitor.clearLine()
 end
 
--- Compares the values that determine a row's visible content. Formatting and
--- monitor API calls happen only when at least one of these values changes.
--- Painter functions are defined once (not created in the 0.25s loop) to avoid
--- per-refresh closure allocations.
 local function renderCachedLine(y, painter, painterArg, ...)
     local cached = renderedLines[y]
     local count = select("#", ...)
@@ -1075,8 +1049,6 @@ local function uiLoop()
             end
 
             if currentPage == 1 then
-                -- Update the displayed case temperature no more than once per second.
-                -- Sensor sampling remains unchanged; only this monitor-facing value is throttled.
                 local now = os.clock()
                 if lastCaseTempMonitorUpdate == nil or now - lastCaseTempMonitorUpdate >= 1.0 then
                     monitorCaseTemp = liveCaseTemp
@@ -1117,7 +1089,6 @@ local function uiLoop()
             end
             fullRedraw = false
         else
-            -- Force a clean redraw if the monitor is disconnected and later returns.
             if lastRenderedPage ~= nil then
                 lastRenderedPage = nil
                 renderedLines = {}
