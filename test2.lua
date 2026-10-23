@@ -345,7 +345,7 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     end
 
     local compactLog = string.format(
-        "#%03d %ds %s eff:%.2f->%.2f%% Err:%.0f %s",
+        "#%03d %ds % eff:%.2f->%.2f%% Err:%.0f %s",
         entry.id, entry.stepText, entry.beforeEfficiency, logEfficiency,
         measuredError, entry.cycleSeconds, string.sub(displayDiag, 1, 12)
     )
