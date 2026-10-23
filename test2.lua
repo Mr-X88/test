@@ -1,4 +1,4 @@
-local SCRIPT_VERSION = "v3.38"
+local SCRIPT_VERSION = "v3.40"
 
 local reactor = nil
 local monitor = nil
@@ -68,9 +68,13 @@ local fullRedraw = true
 local liveEF = 0
 local liveER = 0
 local liveCaseTemp = 0
--- Monitor-only case-temperature sample; kept stable between one-second refreshes.
+-- Monitor-only throttled samples for UI display.
 local monitorCaseTemp = 0
 local lastCaseTempMonitorUpdate = nil
+local monitorEF = 0
+local monitorER = 0
+local lastEffErMonitorUpdate = nil
+
 local liveIsRunning = false
 local liveDataValid = false
 local invalidReadCount = 0
@@ -898,13 +902,13 @@ local function drawPage1Mode()
     if not liveDataValid then
         monitor.setTextColor(colors.red)
         monitor.write("SENSOR? ")
-    elseif liveEF >= 95.0 then
+    elseif monitorEF >= 95.0 then
         monitor.setTextColor(colors.cyan)
         monitor.write("IDLE ")
-    elseif liveIsRunning and liveEF > 0 then
+    elseif liveIsRunning and monitorEF > 0 then
         monitor.setTextColor(colors.green)
         monitor.write("RUN  ")
-    elseif hasEverRun and liveEF == 0 then
+    elseif hasEverRun and monitorEF == 0 then
         monitor.setTextColor(colors.red)
         monitor.write("CRASH")
     else
@@ -912,13 +916,13 @@ local function drawPage1Mode()
         monitor.write("STAND")
     end
     monitor.setTextColor(colors.white)
-    monitor.write(string.format(" | EF: %.2f%%", liveEF))
+    monitor.write(string.format(" | EF: %.2f%%", monitorEF))
 end
 
 local function drawPage1Temperature()
     monitor.write(string.format("Case: %.1fM K | ER: ", monitorCaseTemp / 1000000))
-    if liveER > 50 then monitor.setTextColor(colors.red) end
-    monitor.write(string.format("%.1f", liveER))
+    if monitorER > 50 then monitor.setTextColor(colors.red) end
+    monitor.write(string.format("%.1f", monitorER))
     monitor.setTextColor(colors.white)
 end
 
@@ -1050,15 +1054,22 @@ local function uiLoop()
 
             if currentPage == 1 then
                 local now = os.clock()
-                if lastCaseTempMonitorUpdate == nil or now - lastCaseTempMonitorUpdate >= 1.0 then
+                -- Update Case-Temp every 5 seconds
+                if lastCaseTempMonitorUpdate == nil or now - lastCaseTempMonitorUpdate >= 5.0 then
                     monitorCaseTemp = liveCaseTemp
                     lastCaseTempMonitorUpdate = now
+                end
+                -- Update EF and ER every 1 second
+                if lastEffErMonitorUpdate == nil or now - lastEffErMonitorUpdate >= 1.0 then
+                    monitorEF = liveEF
+                    monitorER = liveER
+                    lastEffErMonitorUpdate = now
                 end
 
                 renderCachedLine(1, drawPage1Header, nil, SCRIPT_VERSION)
                 renderCachedLine(2, drawPage1Mode, nil,
-                    liveDataValid, liveEF, liveIsRunning, hasEverRun)
-                renderCachedLine(3, drawPage1Temperature, nil, monitorCaseTemp, liveER)
+                    liveDataValid, monitorEF, liveIsRunning, hasEverRun)
+                renderCachedLine(3, drawPage1Temperature, nil, monitorCaseTemp, monitorER)
                 renderCachedLine(4, drawPage1Step, nil, lastAppliedStepText or false, lastActionMode)
                 renderCachedLine(5, drawPage1Diagnostic, nil, stuckReason, monitorHeight)
                 renderCachedLine(6, drawPage1Sensor, nil, lowPerfMultiplier)
