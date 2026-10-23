@@ -345,7 +345,7 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     end
 
     local compactLog = string.format(
-        "#%03d St:%s Eff:%.2f->%.2f%% Err:%.0f(%ds) %s",
+        "#%03d %ds %s eff:%.2f->%.2f%% Err:%.0f %s",
         entry.id, entry.stepText, entry.beforeEfficiency, logEfficiency,
         measuredError, entry.cycleSeconds, string.sub(displayDiag, 1, 12)
     )
@@ -596,12 +596,12 @@ local function backgroundSensorLoop()
                 if directionKnown then
                     directionProbePending = false
                     if eff > previousSensorEfficiency then
-                        stuckReason = "Jump (+): direction confirmed from sensor"
+                        stuckReason = "Corrects the eff to 100: direction confirmed from sensor"
                     elseif eff < previousSensorEfficiency then
                         controlDirection = -controlDirection
-                        stuckReason = "Jump (-): direction reversed from sensor"
+                        stuckReason = "Corrects It went wrong : direction reversed from sensor"
                     else
-                        directionProbePending = true
+                        directionProbePending = truest
                         directionKnown = false
                         stuckReason = "Jump ambiguous: direction test +/-2"
                     end
@@ -699,9 +699,9 @@ local function backgroundSensorLoop()
                     if math.abs(delta) >= 3.0 then
                         stuckReason = (delta < 0) and "Sensor jump (-)" or "Sensor jump (+)"
                     elseif delta > 0 then
-                        stuckReason = "+?1"
+                        stuckReason = "eff rising now"
                     elseif delta < 0 then
-                        stuckReason = "-?1"
+                        stuckReason = "eff falling now"
                     else
                         stuckReason = "Stalled"
                     end
@@ -781,7 +781,7 @@ local function executionLoop()
                     local actionLogsEnabled = hasMonitor and ENABLE_MONITOR_LOGS
                     local stepText
                     if hasMonitor then
-                        local signChar = (actionDirection == 1) and "+?2" or "-?2"
+                        local signChar = (actionDirection == 1) and "+" or "-"
                         if probeAction then
                             stepText = "Wf" .. signChar .. "2"
                         else
