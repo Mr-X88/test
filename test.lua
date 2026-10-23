@@ -1,4 +1,4 @@
-local SCRIPT_VERSION = "v3.401"
+local SCRIPT_VERSION = "v3.42"
 
 local reactor = nil
 local monitor = nil
@@ -146,8 +146,6 @@ local function scanPeripherals()
     print("------------------------")
 end
 
--- A wrapped monitor can remain as a stale Lua object after it is unplugged.
--- Check presence before doing monitor-only work or attempting to render.
 local function monitorConnected()
     return monitor ~= nil and monitorName ~= nil and peripheral.isPresent(monitorName)
 end
@@ -241,7 +239,6 @@ local function getReactorData()
         return logicMode, liveCaseTemp, liveEF, liveER, liveIsRunning, false
     end
 
-    -- High-precision rounding to 3 decimal places for EF
     efficiency = roundToThree(efficiency)
 
     local dataValid = tempOK and effOK and errOK
@@ -267,8 +264,6 @@ local function getReactorData()
 end
 
 -- ==================== CALCULATE CONTROL STEP ====================
--- Inverted formula: Solves for DeltaR given current Efficiency (currentEff -> 100% target)
--- DeltaR = 100 * (22 / (EF + 10) - 0.2)
 local function calculateStep(currentEff)
     currentEff = math.min(100, math.max(0, currentEff))
     local requiredDelta = 100 * ((22 / (currentEff + 10)) - 0.2)
@@ -310,12 +305,9 @@ local function applyControlAction(direction, strength, separateNudge, nudgeInclu
     return false, "Reactor API unavailable / adjustReactivity failed", false, nil
 end
 
--- Emit the previous action's log using the current cycle's follow-up EF/ER.
--- This intentionally shifts visible log output by one completed action.
 local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     if not entry or not monitorLogsEnabled() then return end
 
-    -- For an idle-jump cycle, use the settled EF/ER captured before the jump.
     if entry.cycleEndEfficiency ~= nil then
         measuredEfficiency = entry.cycleEndEfficiency
         if entry.cycleEndError ~= nil then measuredError = entry.cycleEndError end
@@ -351,7 +343,7 @@ local function emitDeferredCycleLog(entry, measuredEfficiency, measuredError)
     )
     table.insert(logHistory, 1, compactLog)
 
-    local maxLogLines = math.max(1, math.min(monitorHeight - 9, 18))
+    local maxLogLines = math.max(1, monitorHeight - 8)
     while #logHistory > maxLogLines do table.remove(logHistory) end
 end
 
@@ -453,6 +445,9 @@ local function pulseListenerLoop()
             if hasMonitor then
                 lastDeltaT = deltaT
                 pulseCountTotal = pulseCountTotal + 1
+                if pulseCountTotal > 999 then
+                    pulseCountTotal = 1
+                end
             end
 
             local desiredMultiplier = lowPerfMultiplier
@@ -502,7 +497,7 @@ local function pulseListenerLoop()
                     pulseCountTotal, intervalText, lastDesiredMultiplier, lowPerfMultiplier
                 )
                 table.insert(pulseLogHistory, 1, pulseLine)
-                local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
+                local maxPulseLines = math.max(1, monitorHeight - 6)
                 while #pulseLogHistory > maxPulseLines do table.remove(pulseLogHistory) end
             end
         end
@@ -783,6 +778,9 @@ local function executionLoop()
                     local actionCycleSeconds = nil
                     if actionLogsEnabled then
                         logCounter = logCounter + 1
+                        if logCounter > 999 then
+                            logCounter = 1
+                        end
                         actionLogId = logCounter
                         actionCycleSeconds = secondsSinceLastGo
 
@@ -1054,12 +1052,10 @@ local function uiLoop()
 
             if currentPage == 1 then
                 local now = os.clock()
-                -- Update Case-Temp every 5 seconds
                 if lastCaseTempMonitorUpdate == nil or now - lastCaseTempMonitorUpdate >= 5.0 then
                     monitorCaseTemp = liveCaseTemp
                     lastCaseTempMonitorUpdate = now
                 end
-                -- Update EF and ER every 1 second
                 if lastEffErMonitorUpdate == nil or now - lastEffErMonitorUpdate >= 1.0 then
                     monitorEF = liveEF
                     monitorER = liveER
@@ -1075,7 +1071,7 @@ local function uiLoop()
                 renderCachedLine(6, drawPage1Sensor, nil, lowPerfMultiplier)
                 renderCachedLine(7, drawPage1LogTitle, nil, ENABLE_MONITOR_LOGS)
 
-                local maxLogLines = math.max(1, monitorHeight - 9)
+                local maxLogLines = monitorHeight - 8
                 for i = 1, maxLogLines do
                     renderCachedLine(7 + i, drawPage1LogRow, i,
                         ENABLE_MONITOR_LOGS, logHistory[i] or false)
@@ -1090,7 +1086,7 @@ local function uiLoop()
                     lastDesiredMultiplier, lowPerfMultiplier)
                 renderCachedLine(5, drawPage2LogTitle, nil, ENABLE_MONITOR_LOGS)
 
-                local maxPulseLines = math.max(1, math.min(monitorHeight - 7, 18))
+                local maxPulseLines = monitorHeight - 6
                 for i = 1, maxPulseLines do
                     renderCachedLine(5 + i, drawPage2LogRow, i,
                         ENABLE_MONITOR_LOGS, pulseLogHistory[i] or false)
