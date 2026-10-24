@@ -17,7 +17,7 @@ local RELAY_PULSE_INTERVAL_TICKS = 2   -- Total repetition interval in ticks
 
 
 -- =====================================================================
--- =Just ignore it  INTERNAL SCRIPT VARIABLES & STATES   Just ignore it=
+-- = INTERNAL SCRIPT VARIABLES & STATES                                =
 -- =====================================================================
 
 -- [Subcategory: Peripherals & Hardware Mapping]
@@ -569,7 +569,7 @@ local lastSensorEF = nil
 
 local function backgroundSensorLoop()
     while true do
-        local multiplier = lowPerfMultiplier
+        local multiplier = lowPerfMultiplier or 1
         local effectiveTicks = 4 * multiplier
         local pollSeconds = effectiveTicks / 20
 
@@ -947,9 +947,9 @@ local function drawPage1Diagnostic()
 end
 
 local function drawPage1Sensor()
-    local currentTicks = 4 * lowPerfMultiplier
+    local currentTicks = 4 * (lowPerfMultiplier or 1)
     monitor.write(string.format("Sensor: %dt / %.2fs | Factor x%d%s",
-        currentTicks, currentTicks / 20, lowPerfMultiplier, " AUTO"))
+        currentTicks, currentTicks / 20, (lowPerfMultiplier or 1), " AUTO"))
 end
 
 local function drawPage1LogTitle()
@@ -1009,9 +1009,10 @@ local function drawPage2PulseSummary()
 end
 
 local function drawPage2Multiplier()
-    local currentTicks = 4 * lowPerfMultiplier
+    local currentMultiplier = lowPerfMultiplier or 1
+    local currentTicks = 4 * currentMultiplier
     monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
-        lastDesiredMultiplier, lowPerfMultiplier, currentTicks, currentTicks / 20))
+        lastDesiredMultiplier, currentMultiplier, currentTicks, currentTicks / 20))
 end
 
 local function drawPage2LogTitle()
