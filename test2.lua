@@ -1,4 +1,4 @@
-local SCRIPT_VERSION = "v3.49"
+local SCRIPT_VERSION = "v3.50"
 
 -- =====================================================================
 -- = USER CONFIGURATION SETTINGS                                       =
@@ -9,11 +9,11 @@ local ENABLE_MONITOR_LOGS = false
 
 -- [Subcategory: Redstone Relay Pulse]
 -- Modular loop rate (in ticks: 1 tick = 0.05s)
-local LOOP_TICK_RATE = 20    -- How often the loop sleeps (e.g., 1 = 0.05s, 2 = 0.1s, 20 = 1s)
+local LOOP_TICK_RATE = 20    -- Master clock: How many ticks per loop cycle (e.g., 20 ticks = 1 second per cycle)
 
--- Pulse settings in LOOP_TICK_RATE ticks
-local RELAY_PULSE_DURATION_TICKS = 1   -- ON-time of the pulse in ticks
-local RELAY_PULSE_INTERVAL_TICKS = 2   -- Total repetition interval in ticks
+-- Pulse settings in loop cycles (based on LOOP_TICK_RATE)
+local RELAY_PULSE_DURATION_TICKS = 1   -- ON-time in loop cycles (e.g., 1 cycle = 1s if LOOP_TICK_RATE=20)
+local RELAY_PULSE_INTERVAL_TICKS = 2   -- Total repetition interval in loop cycles (e.g., 2 cycles = 2s total period)
 
 
 -- =====================================================================
@@ -70,7 +70,7 @@ local stuckNudgeBonus = 0
 
 -- [Subcategory: Redstone Relay & Wakeup Pulse Control]
 local wakeupPulseActive = false
-local tickAccumulator = 0             -- Accurately tracks accumulated ticks
+local pulseCycleCounter = 0           -- Counts completed master clock loop cycles
 
 -- [Subcategory: Redstone Input Log Protocol]
 local lastBottomState = false
@@ -220,14 +220,13 @@ end
 
 local function wakeupPulseTimerLoop()
     while true do
-        local isZeroState = liveDataValid and liveEF == 0 and liveER <= 10
+        local isZeroState = liveDataValid and liveEF == 0 and liveER == 0 and hasEverRun
 
         if isZeroState and relay then
-            tickAccumulator = tickAccumulator + LOOP_TICK_RATE
+            pulseCycleCounter = pulseCycleCounter + 1
+            local currentPhase = (pulseCycleCounter - 1) % RELAY_PULSE_INTERVAL_TICKS
 
-            local currentPhaseTicks = tickAccumulator % RELAY_PULSE_INTERVAL_TICKS
-
-            if currentPhaseTicks < RELAY_PULSE_DURATION_TICKS then
+            if currentPhase < RELAY_PULSE_DURATION_TICKS then
                 if not wakeupPulseActive then
                     setRelayAll(15, true)
                     wakeupPulseActive = true
@@ -243,7 +242,7 @@ local function wakeupPulseTimerLoop()
                 setRelayAll(0, true)
                 wakeupPulseActive = false
             end
-            tickAccumulator = 0
+            pulseCycleCounter = 0
             updateCrashRelay()
         end
 
