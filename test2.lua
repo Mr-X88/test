@@ -1,5 +1,26 @@
-local SCRIPT_VERSION = "v3.43"
+local SCRIPT_VERSION = "v3.499"
 
+-- =====================================================================
+-- = USER CONFIGURATION SETTINGS                                       =
+-- =====================================================================
+
+-- [Subcategory: General Logs]
+local ENABLE_MONITOR_LOGS = false
+
+-- [Subcategory: Redstone Relay Pulse]
+-- Modular loop rate (in ticks: 1 tick = 0.05s)
+local LOOP_TICK_RATE = 20    -- How often the loop sleeps (e.g., 1 = 0.05s, 2 = 0.1s, 20 = 1s)
+
+-- Pulse settings in LOOP_TICK_RATE ticks
+local RELAY_PULSE_DURATION_TICKS = 1   -- ON-time of the pulse in ticks
+local RELAY_PULSE_INTERVAL_TICKS = 2   -- Total repetition interval in ticks
+
+
+-- =====================================================================
+-- = INTERNAL SCRIPT VARIABLES & STATES                                =
+-- =====================================================================
+
+-- [Subcategory: Peripherals & Hardware Mapping]
 local reactor = nil
 local monitor = nil
 local monitorName = nil
@@ -8,51 +29,50 @@ local monitorWidth = 8
 local monitorHeight = 25
 local sides = {"top", "bottom", "left", "right", "front", "back"}
 
--- ==================== SETTINGS ====================
+-- [Subcategory: Live Sensor Data & Throttled UI Cache]
+local liveEF = 0
+local liveER = 0
+local liveCaseTemp = 0
+local monitorCaseTemp = 0
+local lastCaseTempMonitorUpdate = nil
+local monitorEF = 0
+local monitorER = 0
+local lastEffErMonitorUpdate = nil
+local liveIsRunning = false
+local liveDataValid = false
+local invalidReadCount = 0
 
-local lowPerfMultiplier = 1
-local pulseTargetMultiplier = 1
-local pulseStreakCount = 0
-
-local ENABLE_MONITOR_LOGS = false
-
--- ==================== CONTROL VARIABLES ====================
-local controlDirection = 1           -- 1 = + / increase, -1 = - / decrease
+-- [Subcategory: Reactor Control & Execution States]
+local controlDirection = 1            -- 1 = + / increase, -1 = - / decrease
 local hasEverRun = false
-local logCounter = 0
-local logHistory = {}
-local wakeupTickCounter = 0
-local wakeupPulseActive = false
-local wakeupPulseEndsAt = 0
-
-local secondCounter = 0
-local secondsSinceLastGo = 0
 local executionGo = false
 local lastPollEF = nil
 local unchangedPollCount = 0
 local stableExecutionEfficiency = nil
 local lastExecutionTime = -3.0
-local pendingAction = nil           -- Exactly one action waiting for re-evaluation
-local deferredCycleLog = nil        -- Previous completed action; emitted on the next action's follow-up reading
--- Settled EF/ER snapshot. Refreshed only after the existing EF stability check succeeds.
--- Kept until the next idle jump so the deferred log can report the pre-jump cycle end.
+local pendingAction = nil             -- Exactly one action waiting for re-evaluation
+local deferredCycleLog = nil          -- Previous completed action; emitted on the next action's follow-up reading
 local idleCycleEF = nil
 local idleCycleER = nil
 local idleSnapshotRefreshPending = false
 
--- Direction finding for unknown effect and after Idle >= 95%.
+-- [Subcategory: Wayfinding & Direction Finding]
 local directionProbePending = false
 local directionKnown = false          -- Confirmed only after an evaluable measurement
 local waitingForIdleJump = false
 
--- Deadlock-Nudge & Log Flag
+-- [Subcategory: Deadlock & Nudge System]
 local stuckPollCount = 0
 local lastSensorEFForStuck = nil
 local stuckNudgeActive = false
 local stuckNudgeCounter = 0
 local stuckNudgeBonus = 0
 
--- Redstone Input Log Protocol
+-- [Subcategory: Redstone Relay & Wakeup Pulse Control]
+local wakeupPulseActive = false
+local tickAccumulator = 0             -- Accurately tracks accumulated ticks
+
+-- [Subcategory: Redstone Input Log Protocol]
 local lastBottomState = false
 local lastPulseTime = os.clock()
 local lastDeltaT = nil
@@ -60,29 +80,30 @@ local lastDesiredMultiplier = 1
 local pulseCountTotal = 0
 local pulseLogHistory = {}
 
+-- [Subcategory: Monitor UI Rendering & Caching]
 local currentPage = 1
 local lastRenderedPage = nil
 local renderedLines = {}
 local fullRedraw = true
 
--- Current shared sensor values
-local liveEF = 0
-local liveER = 0
-local liveCaseTemp = 0
--- Monitor-only throttled samples for UI display.
-local monitorCaseTemp = 0
-local lastCaseTempMonitorUpdate = nil
-local monitorEF = 0
-local monitorER = 0
-local lastEffErMonitorUpdate = nil
-
-local liveIsRunning = false
-local liveDataValid = false
-local invalidReadCount = 0
-
+-- [Subcategory: UI Logging & Diagnostics]
+local logCounter = 0
+local logHistory = {}
+local secondCounter = 0
+local secondsSinceLastGo = 0
 local lastAppliedStepText = nil
 local lastActionMode = "No action yet"
 local stuckReason = "Waiting for reactor..."
+
+
+-- =====================================================================
+-- = PERFORMANCE & PRE-CALCULATIONS (Optimized Constants)              =
+-- =====================================================================
+
+-- [Subcategory: Timing & Loop Optimization]
+-- Pre-calculated values to avoid runtime mathematical operations inside loops
+local LOOP_SLEEP_SECONDS = LOOP_TICK_RATE * 0.05
+
 
 print("==========================================")
 print(" BETTER FUSION REACTOR CONTROLLER " .. SCRIPT_VERSION)
@@ -192,30 +213,41 @@ end
 
 local function updateCrashRelay()
     if not relay or wakeupPulseActive then return end
-    local isCrashedOrStopped = hasEverRun and (not liveIsRunning or liveEF == 0)
+    local isCrashedOrStopped = hasEverRun and (not liveIsRunning or liveEF == 0) and not (liveEF == 0 and liveER == 0)
     local signalValue = isCrashedOrStopped and 15 or 0
     setRelayAll(signalValue, true)
 end
 
-local function sendWakeupPulseStart()
-    if not relay then
-        stuckReason = "Wakeup pulse: no relay"
-        return false
-    end
-    local ok = setRelayAll(15, true)
-    if not ok then
-        stuckReason = "Wakeup pulse: relay error"
-        return false
-    end
-    wakeupPulseActive = true
-    wakeupPulseEndsAt = os.clock() + (10 * 0.05)
-    return true
-end
+local function wakeupPulseTimerLoop()
+    while true do
+        local isZeroState = liveDataValid and liveEF == 0 and liveER == 0 and hasEverRun
 
-local function stopWakeupPulseIfDue()
-    if wakeupPulseActive and os.clock() >= wakeupPulseEndsAt then
-        wakeupPulseActive = false
-        updateCrashRelay()
+        if isZeroState and relay then
+            tickAccumulator = tickAccumulator + LOOP_TICK_RATE
+
+            local currentPhaseTicks = tickAccumulator % RELAY_PULSE_INTERVAL_TICKS
+
+            if currentPhaseTicks < RELAY_PULSE_DURATION_TICKS then
+                if not wakeupPulseActive then
+                    setRelayAll(15, true)
+                    wakeupPulseActive = true
+                end
+            else
+                if wakeupPulseActive then
+                    setRelayAll(0, true)
+                    wakeupPulseActive = false
+                end
+            end
+        else
+            if wakeupPulseActive then
+                setRelayAll(0, true)
+                wakeupPulseActive = false
+            end
+            tickAccumulator = 0
+            updateCrashRelay()
+        end
+
+        sleep(LOOP_SLEEP_SECONDS)
     end
 end
 
@@ -537,9 +569,7 @@ local lastSensorEF = nil
 
 local function backgroundSensorLoop()
     while true do
-        stopWakeupPulseIfDue()
-
-        local multiplier = lowPerfMultiplier
+        local multiplier = lowPerfMultiplier or 1
         local effectiveTicks = 4 * multiplier
         local pollSeconds = effectiveTicks / 20
 
@@ -578,24 +608,24 @@ local function backgroundSensorLoop()
                     waitingForIdleJump = false
                     directionProbePending = true
                     directionKnown = false
-                    stuckReason = "Idle exited below threshold: direction test +/-2"
+                    stuckReason = "Idle exited below threshold Wayfinding two-step"
                 end
             elseif observedJump and pendingAction == nil and running and eff > 0 and eff < 95.0 then
                 if directionKnown then
                     directionProbePending = false
                     if eff > previousSensorEfficiency then
-                        stuckReason = "Corrects the eff to 100: direction confirmed from sensor"
+                        stuckReason = "Corrects the eff to 100 direction confirmed from sensor"
                     elseif eff < previousSensorEfficiency then
                         controlDirection = -controlDirection
-                        stuckReason = "Corrects It went wrong : direction reversed from sensor"
+                        stuckReason = "Corrects It went wrong  direction reversed from sensor"
                     else
                         directionProbePending = true
                         directionKnown = false
-                        stuckReason = "Jump ambiguous: direction test +/-2"
+                        stuckReason = "TR JUMP ambiguous start Wayfinding two-step"
                     end
                 else
                     directionProbePending = true
-                    stuckReason = "Jump: direction unknown, test +/-2"
+                    stuckReason = "TR JUMP start Wayfinding two-step"
                 end
             end
 
@@ -661,24 +691,14 @@ local function backgroundSensorLoop()
             end
             lastPollEF = eff
 
-            if eff == 0 and err == 0 then
-                wakeupTickCounter = wakeupTickCounter + effectiveTicks
-                if wakeupTickCounter >= 40 and not wakeupPulseActive then
-                    wakeupTickCounter = wakeupTickCounter - 40
-                    sendWakeupPulseStart()
-                end
-            else
-                wakeupTickCounter = 0
-            end
-
             if not running or eff == 0 then
                 stuckReason = (hasEverRun and eff == 0) and "CRASH detected!" or "Standby"
             elseif directionProbePending then
-                stuckReason = directionKnown and "Jump: test step +/-2 pending" or "Direction unclear: test +/-2 pending"
+                stuckReason = directionKnown and "TR JUMP Wayfinding two-step pending " or "Direction unclear Wayfinding two-step pending"
             elseif waitingForIdleJump then
-                stuckReason = "Idle: waiting for jump"
+                stuckReason = "Idle waiting for TR JUMP"
             elseif eff >= 95.0 then
-                stuckReason = "Idle: waiting for jump"
+                stuckReason = "Idle waiting for TR JUMP"
             else
                 if lastSensorEF ~= nil then
                     local delta = eff - lastSensorEF
@@ -828,32 +848,16 @@ local function executionLoop()
                 elseif directionProbePending then
                     stuckReason = "Direction test +/-2 pending"
                 elseif waitingForIdleJump then
-                    stuckReason = "Idle: waiting for jump"
+                    stuckReason = "Idle waiting for TR JUMP"
                 elseif currentEfficiency >= 95.0 then
-                    stuckReason = "Idle: waiting for jump"
+                    stuckReason = "Idle waiting for TR JUMP"
                 elseif not liveIsRunning or currentEfficiency == 0 then
-                    stuckReason = "No control: standby"
+                    stuckReason = "No control standby"
                 end
             end
         end
 
         sleep(0.05)
-    end
-end
-
--- ==================== WAKEUP PULSE TIMER ====================
-local function wakeupPulseTimerLoop()
-    while true do
-        if wakeupPulseActive then
-            local remaining = wakeupPulseEndsAt - os.clock()
-            if remaining > 0 then
-                sleep(remaining)
-            else
-                stopWakeupPulseIfDue()
-            end
-        else
-            sleep(0.05)
-        end
     end
 end
 
@@ -943,9 +947,9 @@ local function drawPage1Diagnostic()
 end
 
 local function drawPage1Sensor()
-    local currentTicks = 4 * lowPerfMultiplier
+    local currentTicks = 4 * (lowPerfMultiplier or 1)
     monitor.write(string.format("Sensor: %dt / %.2fs | Factor x%d%s",
-        currentTicks, currentTicks / 20, lowPerfMultiplier, " AUTO"))
+        currentTicks, currentTicks / 20, (lowPerfMultiplier or 1), " AUTO"))
 end
 
 local function drawPage1LogTitle()
@@ -1005,9 +1009,10 @@ local function drawPage2PulseSummary()
 end
 
 local function drawPage2Multiplier()
-    local currentTicks = 4 * lowPerfMultiplier
+    local currentMultiplier = lowPerfMultiplier or 1
+    local currentTicks = 4 * currentMultiplier
     monitor.write(string.format("Zieltakt: x%d | aktiv: x%d (%dt / %.2fs)",
-        lastDesiredMultiplier, lowPerfMultiplier, currentTicks, currentTicks / 20))
+        lastDesiredMultiplier, currentMultiplier, currentTicks, currentTicks / 20))
 end
 
 local function drawPage2LogTitle()
@@ -1039,7 +1044,7 @@ end
 local function drawPage2Footer()
     monitor.setBackgroundColor(colors.gray)
     monitor.setTextColor(colors.yellow)
-    monitor.write("[ Klick für Seite 1: Haupt-UI ]")
+    monitor.write("[ Click for Page 2: Main-UI ]")
     monitor.setBackgroundColor(colors.black)
     monitor.setTextColor(colors.white)
 end
