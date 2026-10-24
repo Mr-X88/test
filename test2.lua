@@ -220,7 +220,7 @@ end
 
 local function wakeupPulseTimerLoop()
     while true do
-        local isZeroState = liveDataValid and liveEF == 0 and liveER == 0 and hasEverRun
+        local isZeroState = liveDataValid and liveEF == 0 and liveER <= 10
 
         if isZeroState and relay then
             pulseCycleCounter = pulseCycleCounter + 1
