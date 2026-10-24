@@ -1,4 +1,4 @@
-local SCRIPT_VERSION = "v3.49"
+local SCRIPT_VERSION = "v3.499"
 
 -- =====================================================================
 -- = USER CONFIGURATION SETTINGS                                       =
